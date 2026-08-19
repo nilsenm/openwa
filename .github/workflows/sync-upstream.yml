@@ -1,0 +1,29 @@
+﻿name: Sync Upstream
+
+# Trae los cambios del codigo abierto (rmyndharis/OpenWA) y los mergea a tu fork (lesotur).
+on:
+  schedule:
+    - cron: '0 6 * * *'   # diario 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+          ref: lesotur
+      - name: Merge upstream/main
+        run: |
+          git config user.name "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/rmyndharis/OpenWA.git || \
+            git remote set-url upstream https://github.com/rmyndharis/OpenWA.git
+          git fetch upstream
+          git merge upstream/main --no-edit
+          git push origin lesotur

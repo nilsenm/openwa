@@ -1,0 +1,18 @@
+﻿name: Deploy VPS
+
+# Despliega automaticamente en tu VPS via self-hosted runner.
+# Requiere: GitHub Actions runner instalado en el VPS apuntando a este repo,
+# con Docker disponible y ubicado de forma que pueda hacer `git pull` en /opt/openwa.
+on:
+  push:
+    branches: [lesotur]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Pull y desplegar
+        working-directory: /opt/openwa
+        run: |
+          git pull origin lesotur
+          docker compose up -d --build
