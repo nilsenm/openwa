@@ -17,6 +17,8 @@ INSTALL_DIR="/opt/openwa"
 
 # API key fuerte (>=32 chars, exigible en produccion). Se imprime al final: GUARDALA.
 API_MASTER_KEY="$(openssl rand -hex 24)"
+# Clave fuerte para el Postgres integrado (exigible en produccion).
+DATABASE_PASSWORD="$(openssl rand -hex 24)"
 
 echo "== 1/8 Actualizando sistema =="
 apt-get update -y
@@ -47,11 +49,24 @@ echo "API_MASTER_KEY=$API_MASTER_KEY" >> .env
 echo "ALLOW_DEV_API_KEY=false" >> .env
 echo "CORS_ORIGINS=https://$DOMAIN" >> .env
 echo "ENGINE_TYPE=baileys" >> .env
-echo "DATABASE_TYPE=sqlite" >> .env
+echo "DATABASE_TYPE=postgres" >> .env
+echo "POSTGRES_BUILTIN=true" >> .env
+echo "DATABASE_NAME=openwa" >> .env
+echo "DATABASE_USERNAME=openwa" >> .env
+echo "DATABASE_PASSWORD=$DATABASE_PASSWORD" >> .env
+echo "DATABASE_SYNCHRONIZE=false" >> .env
 echo "TRUSTED_PROXIES=127.0.0.1" >> .env
 
-echo "== 5/8 Levantando OpenWA =="
-docker compose up -d
+# --- Rate limiting anti-ban (OTP) ---
+echo "SEND_PACING_ENABLED=true" >> .env
+echo "SEND_PACING_WARMUP_SCHEDULE=20,40,80,160,320,640,1000" >> .env
+echo "SEND_PACING_COLD_DAILY_CAP=5,10,20,40,60,80,100" >> .env
+echo "SEND_PACING_BREAKER_THRESHOLD=5" >> .env
+echo "SEND_PACING_BREAKER_COOLDOWN_MS=900000" >> .env
+echo "BAILEYS_MARK_ONLINE_ON_CONNECT=false" >> .env
+
+echo "== 5/8 Levantando OpenWA (con Postgres integrado) =="
+docker compose --profile postgres up -d
 sleep 5
 docker compose ps
 
