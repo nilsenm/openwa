@@ -202,7 +202,10 @@ COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832
 # msgpackr-extract) are optional=true with runtime fallbacks. The patchers that DO
 # need to run are the explicit fatal invocations below; baileys' preinstall is only
 # a node-version check that the engines field enforces anyway.
+# sharp trae su binario en un paquete opcional por plataforma que npm resuelve en su install
+# script; con --ignore-scripts no llega, y el contenedor arranca sin poder procesar imagenes.
 RUN npm ci --omit=dev --ignore-scripts \
+    && npm install @img/sharp-linux-x64@$(node -p "require('sharp/package.json').version") --omit=dev --ignore-scripts \
     && node scripts/patch-wwebjs-201832.js \
     && node scripts/patch-wwebjs-newsletter-preview.js \
     && node scripts/patch-wwebjs-status.js \
