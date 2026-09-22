@@ -24,7 +24,7 @@ func (s *ChatsService) List(ctx context.Context, sessionID string, query *ListCh
 // The subscription belongs to the connection and does NOT survive a restart or an automatic
 // reconnect, so re-issue it when the session comes back. Subscribe per chat: WhatsApp emits an
 // update on every transition, so a broad subscription is a firehose. whatsapp-web.js answers 501.
-func (s *ChatsService) SubscribePresence(ctx context.Context, sessionID string, body MarkChatRequest) (*SuccessResult, error) {
+func (s *ChatsService) SubscribePresence(ctx context.Context, sessionID string, body SubscribePresenceRequest) (*SuccessResult, error) {
 	var out SuccessResult
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/presence/subscribe", nil, body, &out)
 	return &out, err

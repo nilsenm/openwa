@@ -34,6 +34,12 @@ describe('MarkChatReadDto messageIds validation', () => {
     expect(messageIdErrors(['3EB0C767D26B8A3F1A2B', '3EB0C767D26B8A3F1A2C'])).toBe(0);
   });
 
+  it('rejects an explicit null instead of letting it reach the engine', () => {
+    // @IsOptional() skips every validator for null as well as undefined, so `"messageIds": null`
+    // used to pass validation and then dereference in the adapter as a 500.
+    expect(messageIdErrors(null)).toBeGreaterThan(0);
+  });
+
   it('rejects an empty list rather than reading it as "the newest message"', () => {
     // The engine treats a missing list as "acknowledge the newest message". A caller that computed
     // its unread set and got none back must not land in that branch.

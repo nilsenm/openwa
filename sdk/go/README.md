@@ -97,7 +97,9 @@ case err != nil:
 Sentinels: `ErrUnauthorized` (401), `ErrForbidden` (403), `ErrNotFound` (404),
 `ErrConflict` (409), `ErrRateLimited` (429), `ErrNotImplemented` (501),
 `ErrServiceUnavailable` (503 — the only retryable one). A timeout
-surfaces as `*openwa.TimeoutError`.
+surfaces as `*openwa.TimeoutError`. In a routed deployment only 503 proves
+the request was never carried out: a forward that fails after the request
+reached the owner node answers 502 or 504.
 
 ## Retries
 
@@ -186,10 +188,10 @@ subdirectory rather than at the repository root:
 
 ```bash
 # Correct — `sdk/go/` prefix, matching `module github.com/rmyndharis/OpenWA/sdk/go`
-git tag sdk/go/v0.4.0 && git push origin sdk/go/v0.4.0
+git tag sdk/go/v0.5.0 && git push origin sdk/go/v0.5.0
 ```
 
-A bare `v0.4.0` tag is the _app_ version and does nothing for this module.
+A bare `v0.5.0` tag is the _app_ version and does nothing for this module.
 Without a prefixed tag, `go get` resolves a pseudo-version
 (`v0.0.0-<date>-<commit>`) — usable, but callers cannot pin a release.
 

@@ -11,6 +11,13 @@ type ChatSummary struct {
 	LastMessage string   `json:"lastMessage,omitempty"`
 	Timestamp   int64    `json:"timestamp"`
 	Kind        ChatKind `json:"kind"`
+	Archived    bool     `json:"archived"`
+	Pinned      bool     `json:"pinned"`
+	// Muted reports whether the chat is muted right now, not the expiry behind it.
+	Muted bool `json:"muted"`
+	// MuteExpiration is the epoch milliseconds the mute ends, present only when muted; 0 means
+	// indefinitely. A pointer so an absent expiry and a 0 (indefinite) stay distinct on the wire.
+	MuteExpiration *int64 `json:"muteExpiration,omitempty"`
 }
 
 // SetOwnPresenceRequest is the body for SessionsService.SetOnlinePresence. Available reports
@@ -19,8 +26,13 @@ type SetOwnPresenceRequest struct {
 	Available bool `json:"available"`
 }
 
-// MarkChatRequest marks a chat unread, or subscribes to its presence.
+// MarkChatRequest marks a chat unread.
 type MarkChatRequest struct {
+	ChatID string `json:"chatId"`
+}
+
+// SubscribePresenceRequest subscribes to a chat's presence.
+type SubscribePresenceRequest struct {
 	ChatID string `json:"chatId"`
 }
 
@@ -30,7 +42,13 @@ type MarkChatReadRequest struct {
 	// MessageIDs are the messages to acknowledge (at most 100; an empty list is refused). Baileys
 	// acknowledges individual messages, so without this only the newest message the engine still
 	// holds in memory gets a receipt. Ignored by whatsapp-web.js, whose own sendSeen is chat-level.
-	MessageIDs []string `json:"messageIds,omitempty"`
+	//
+	// A POINTER because the three states differ on the wire and a plain slice cannot tell two of
+	// them apart: nil omits the key (acknowledge the newest), &[]string{} sends [] (the server
+	// refuses it with a 400), and a populated slice names the messages. With `[]string` plus
+	// omitempty an empty slice was dropped, so a caller asking for nothing to be acknowledged
+	// silently acknowledged the newest message instead.
+	MessageIDs *[]string `json:"messageIds,omitempty"`
 }
 
 // ChatState is the typing indicator a chat shows.

@@ -55,7 +55,9 @@ A non-2xx response throws a typed `OpenWA\Exceptions\OpenWAApiException` subclas
 `OpenWAConflictException` (409), `OpenWARateLimitException` (429),
 `OpenWANotImplementedException` (501), `OpenWAServiceUnavailableException` (503 — the only
 retryable one) — each exposing `getStatus()` and the parsed `getBody()`.
-A timeout throws `OpenWATimeoutException`.
+A timeout throws `OpenWATimeoutException`. In a routed deployment only 503 proves the request
+was never carried out: a forward that fails after the request reached the owner node answers
+502 or 504.
 
 ```php
 use OpenWA\Exceptions\OpenWANotFoundException;
@@ -100,7 +102,7 @@ Cutting a release:
 1. If the minor line changes, update `extra.branch-alias.dev-main` in
    `composer.json` (e.g. `0.1.x-dev` → `0.2.x-dev`) and land it on `main`. The
    release workflow refuses to publish when the alias does not match the tag.
-2. Tag that commit `php-sdk-v<version>` (e.g. `php-sdk-v0.4.0`) and push the
+2. Tag that commit `php-sdk-v<version>` (e.g. `php-sdk-v0.5.0`) and push the
    tag. The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK release.
 3. The workflow runs the test suite, then tags the mirror `<version>` (no `v`

@@ -9,10 +9,22 @@
 #   (d) the cp fallback writes a CONSISTENCY-WARNING marker into the archive, restore warns
 #       but continues, and restore --strict refuses
 #   (e) the archive min-content check rejects (and deletes) an archive missing a required DB
+#   (f) data/.env.generated supplies paths the environment does not
+#   (g) PLUGIN_STATE_DIR plugin state is archived and restored at the configured root
+#   (h) restore refuses a live target without --force, before touching anything
+#   (i) the data-store half of that guard refuses on its own
+#   (j) a probe that fails or prints no usable count leaves the target counted as live
+#   (k) an operator's sqlite3 rc file changes neither answer of the guard (skipped without sqlite3)
 #
 # Usage: ./scripts/smoke-test-backup-restore.sh
-# Requires: bash, tar, node (restore.sh path resolution). sqlite3 is optional (see (c)).
+# Requires: bash, tar, node (restore.sh path resolution). sqlite3 is optional (see (c) and (k)).
 set -euo pipefail
+
+# backup.sh and restore.sh take these from the environment before anything else. An exported value
+# would aim a case at a real install, and restore replaces the state directories wholesale, so every
+# case starts from none of them and sets exactly the paths it uses.
+unset OPENWA_DATA_DIR BACKUP_DIR DATABASE_TYPE MAIN_DATABASE_NAME DATABASE_NAME SESSION_DATA_PATH \
+  BAILEYS_AUTH_DIR STORAGE_LOCAL_PATH PLUGINS_DIR PLUGIN_STATE_DIR
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP="$REPO_ROOT/scripts/backup.sh"
@@ -44,7 +56,7 @@ db_fingerprint() {
   if [ "$HAS_SQLITE3" -eq 1 ]; then
     sqlite3 "$1" "SELECT payload FROM sentinel;"
   else
-    cat "$1"
+    sed 's/^sentinel://' "$1"
   fi
 }
 
@@ -292,6 +304,201 @@ if [ "$(db_fingerprint "$F/extract2/main.sqlite")" != "STALE-main" ]; then
   fail "(f) an explicit environment path lost to data/.env.generated — precedence is inverted"
 fi
 pass "(f) data/.env.generated resolves paths for both scripts, and the environment still wins"
+
+echo ""
+echo "==> (g) PLUGIN_STATE_DIR moves the registry and ctx.storage, and both scripts follow it"
+# The knob names the ROOT; the app keeps plugin state at <root>/plugins. Both scripts hardcoded
+# $OPENWA_DATA_DIR/plugins, so with the knob set the archive carried neither the registry nor any
+# plugin's persisted storage, and the restore put nothing back. Silent both ways: an empty source
+# directory simply produces no plugin-state entry.
+G="$WORK/g"
+mkdir -p "$G/state" "$G/elsewhere/plugins/chatwoot" "$G/extract" "$G/restore/state"
+make_fixture "$G/state/main.sqlite" "golf-main"
+make_fixture "$G/state/openwa.sqlite" "golf-data"
+printf '{"plugins":[{"id":"chatwoot"}]}' >"$G/elsewhere/plugins/registry.json"
+printf 'mapped-conversation' >"$G/elsewhere/plugins/chatwoot/key-Zm9v.json"
+(
+  cd "$G"
+  OPENWA_DATA_DIR="$G/state" PLUGIN_STATE_DIR="$G/elsewhere" BACKUP_DIR="$G/out" \
+    MAIN_DATABASE_NAME="$G/state/main.sqlite" DATABASE_NAME="$G/state/openwa.sqlite" "$BACKUP" >/dev/null
+)
+ARCHIVE_G="$(ls "$G"/out/openwa-backup-*.tar.gz)"
+tar -xzf "$ARCHIVE_G" -C "$G/extract"
+if [ ! -f "$G/extract/plugin-state/registry.json" ]; then
+  fail "(g) backup ignored PLUGIN_STATE_DIR: the plugin registry is missing from the archive"
+fi
+if [ ! -f "$G/extract/plugin-state/chatwoot/key-Zm9v.json" ]; then
+  fail "(g) backup ignored PLUGIN_STATE_DIR: a plugin's persisted ctx.storage is missing"
+fi
+# And the restore has to put them back where the knob points, not under the default data dir.
+(
+  cd "$G"
+  OPENWA_DATA_DIR="$G/restore/state" PLUGIN_STATE_DIR="$G/restored-elsewhere" \
+    MAIN_DATABASE_NAME="$G/restore/state/main.sqlite" DATABASE_NAME="$G/restore/state/openwa.sqlite" \
+    "$RESTORE" "$ARCHIVE_G" --force >/dev/null
+)
+if [ ! -f "$G/restored-elsewhere/plugins/registry.json" ]; then
+  fail "(g) restore ignored PLUGIN_STATE_DIR: the registry did not land under the configured root"
+fi
+pass "(g) PLUGIN_STATE_DIR is honoured by backup and by restore"
+
+echo ""
+echo "==> (h) restore refuses a live target without --force, before touching anything"
+# The data-loss guard: both target databases hold a working install's data, so a plain restore
+# must refuse (non-zero, clear message) before ANY state changes, and --force must be the exact
+# switch that changes the answer.
+H="$WORK/h"
+mkdir -p "$H/src/data" "$H/live" "$H/out"
+make_fixture "$H/src/data/main.sqlite" "hotel-archive-main"
+make_fixture "$H/src/data/openwa.sqlite" "hotel-archive-data"
+(
+  cd "$H/src"
+  BACKUP_DIR="$H/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_H="$(ls "$H"/out/openwa-backup-*.tar.gz)"
+make_fixture "$H/live/main.sqlite" "hotel-live-main"
+make_fixture "$H/live/openwa.sqlite" "hotel-live-data"
+set +e
+OUT_H="$(cd "$H" && MAIN_DATABASE_NAME="$H/live/main.sqlite" \
+  DATABASE_NAME="$H/live/openwa.sqlite" OPENWA_DATA_DIR="$H/live" \
+  "$RESTORE" "$ARCHIVE_H" 2>&1)"
+RC_H=$?
+set -e
+if [ "$RC_H" -eq 0 ]; then
+  fail "(h) restore exited 0 on a live target without --force"
+fi
+# ASCII anchors only: the second refusal line carries a UTF-8 dash that must not be grep'd.
+if ! printf '%s' "$OUT_H" | grep -q 'appear live'; then
+  fail "(h) refusal message does not say the target appears live"
+fi
+if ! printf '%s' "$OUT_H" | grep -q -- '--force'; then
+  fail "(h) refusal message does not point at --force"
+fi
+if ! printf '%s' "$OUT_H" | grep -qF "$H/live/main.sqlite"; then
+  fail "(h) refusal message does not name the live target"
+fi
+if [ "$(db_fingerprint "$H/live/main.sqlite")" != "hotel-live-main" ]; then
+  fail "(h) the refused restore modified the live main DB"
+fi
+if [ "$(db_fingerprint "$H/live/openwa.sqlite")" != "hotel-live-data" ]; then
+  fail "(h) the refused restore modified the live data DB"
+fi
+# $H/live is non-empty, so an execution that reached the safety-snapshot step would have left a
+# $H/live.pre-restore-* sibling; its absence proves the guard fired before any state was touched.
+if [ -n "$(ls -d "$H"/live.pre-restore-* 2>/dev/null || true)" ]; then
+  fail "(h) the refused restore left a pre-restore snapshot behind"
+fi
+(
+  cd "$H"
+  MAIN_DATABASE_NAME="$H/live/main.sqlite" DATABASE_NAME="$H/live/openwa.sqlite" \
+    OPENWA_DATA_DIR="$H/live" "$RESTORE" "$ARCHIVE_H" --force >/dev/null
+)
+if [ "$(db_fingerprint "$H/live/main.sqlite")" != "hotel-archive-main" ]; then
+  fail "(h) --force did not overwrite the live main DB after the refusal"
+fi
+if [ "$(db_fingerprint "$H/live/openwa.sqlite")" != "hotel-archive-data" ]; then
+  fail "(h) --force did not overwrite the live data DB after the refusal"
+fi
+pass "(h) live target refused before any state was touched; --force overwrites"
+
+echo ""
+echo "==> (i) the data-store half of the guard refuses on its own"
+# (h) makes both databases live, so its main-DB check alone satisfies every assertion there. Here the
+# data store is the only database present.
+I="$WORK/i"
+mkdir -p "$I/bin" "$I/live"
+make_fixture "$I/live/openwa.sqlite" "india-live-data"
+
+# guarded_restore <target dir>: restore ARCHIVE_H without --force over <dir>/main.sqlite and
+# <dir>/openwa.sqlite, with $I/bin first on PATH. Output lands in OUT, the exit code in RC.
+guarded_restore() {
+  set +e
+  OUT="$(cd "$WORK" && PATH="$I/bin:$PATH" MAIN_DATABASE_NAME="$1/main.sqlite" \
+    DATABASE_NAME="$1/openwa.sqlite" OPENWA_DATA_DIR="$1" "$RESTORE" "$ARCHIVE_H" 2>&1)"
+  RC=$?
+  set -e
+}
+
+# expect_refused <label>: a restore over $I/live must refuse, name its data store, and leave it intact.
+expect_refused() {
+  guarded_restore "$I/live"
+  if [ "$RC" -eq 0 ]; then
+    fail "($1) restore exited 0 over a live data store without --force"
+  fi
+  if ! printf '%s' "$OUT" | grep -qF "$I/live/openwa.sqlite"; then
+    fail "($1) refusal message does not name the live data store"
+  fi
+  if [ "$(db_fingerprint "$I/live/openwa.sqlite")" != "india-live-data" ]; then
+    fail "($1) the refused restore modified the live data store"
+  fi
+}
+
+expect_refused i
+pass "(i) a live data store is refused with the main DB target absent"
+
+echo ""
+echo "==> (j) a probe that fails or prints no usable count leaves the target counted as live"
+# A locked, corrupt or unreadable database makes sqlite3 exit non-zero, and output that is not a bare
+# count did not answer the question. Neither may be read as an empty database.
+for probe in 'exit 26' 'exit 0' 'printf "count(*)\n1\n"'; do
+  printf '#!/usr/bin/env bash\n%s\n' "$probe" >"$I/bin/sqlite3"
+  chmod +x "$I/bin/sqlite3"
+  expect_refused "j: $probe"
+done
+rm -f "$I/bin/sqlite3"
+pass "(j) a failed, empty or non-numeric probe refuses"
+
+echo ""
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  echo "==> (k) an operator's sqlite3 rc file changes neither answer of the guard"
+  # sqlite3 applies the user's rc file to a one-shot query too, and headers or csv mode turn the count
+  # into text. It finds that file through the passwd entry, not $HOME, so a test cannot plant one by
+  # moving HOME. The wrapper loads one with -init instead; an explicit -init later on the command line
+  # replaces it, exactly as it replaces ~/.sqliterc.
+  printf '.headers on\n.mode csv\n' >"$I/sqliterc"
+  printf '#!/usr/bin/env bash\nexec %q -init %q "$@"\n' "$(command -v sqlite3)" "$I/sqliterc" >"$I/bin/sqlite3"
+  chmod +x "$I/bin/sqlite3"
+  expect_refused k
+  # And a database with no tables yet is still safe to restore over without --force.
+  mkdir -p "$I/fresh"
+  : >"$I/fresh/openwa.sqlite"
+  guarded_restore "$I/fresh"
+  if [ "$RC" -ne 0 ]; then
+    fail "(k) the rc file made a database with no tables look live"
+  fi
+  pass "(k) with an rc file, a live target is still refused and an empty one still restores"
+else
+  echo "SKIP: (k) sqlite3 not found on this host, so there is no rc file to load"
+fi
+
+echo ""
+echo "==> (l) an unwritable BACKUP_DIR fails before anything is staged"
+# The shipped container mounts its root read-only, so the default ./backups cannot be created. The
+# run must stop up front, not after copying every database and media file into /tmp.
+if [ "$(id -u)" -ne 0 ]; then
+  L="$WORK/l"
+  mkdir -p "$L/data" "$L/ro"
+  make_fixture "$L/data/main.sqlite" "l-main"
+  make_fixture "$L/data/openwa.sqlite" "l-data"
+  chmod a-w "$L/ro"
+  set +e
+  OUT_L="$(cd "$L" && BACKUP_DIR="$L/ro/out" "$BACKUP" 2>&1)"
+  RC_L=$?
+  set -e
+  chmod u+w "$L/ro"
+  if [ "$RC_L" -eq 0 ]; then
+    fail "(l) backup.sh exited 0 with an unwritable BACKUP_DIR"
+  fi
+  if ! printf '%s' "$OUT_L" | grep -q 'BACKUP_DIR=.* is not writable'; then
+    fail "(l) error message does not name the unwritable BACKUP_DIR"
+  fi
+  if printf '%s' "$OUT_L" | grep -q 'Backing up'; then
+    fail "(l) state was staged before the BACKUP_DIR check"
+  fi
+  pass "(l) unwritable BACKUP_DIR -> non-zero exit before staging, clear message"
+else
+  echo "SKIP: (l) running as root, which ignores the permission bits this case relies on"
+fi
 
 echo ""
 echo "All smoke tests passed!"

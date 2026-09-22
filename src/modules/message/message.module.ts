@@ -13,7 +13,7 @@ import { Message } from './entities/message.entity';
 import { Session } from '../session/entities/session.entity';
 import { SendPacingService } from './send-pacing.service';
 import { MessageBatch } from './entities/message-batch.entity';
-import { PLUGIN_MESSAGE_PORT, type PluginMessagePort } from '../../core/plugins/plugin-host-ports';
+import { PLUGIN_MESSAGE_PORT } from '../../core/plugins/plugin-host-ports';
 
 @Module({
   imports: [
@@ -33,11 +33,8 @@ import { PLUGIN_MESSAGE_PORT, type PluginMessagePort } from '../../core/plugins/
     // Binds the core-owned plugin capability port to this module's service. The plugin runtime
     // resolves the token lazily via ModuleRef (PluginHostServices), which keeps its provider cycle
     // broken; this adapter is how core reaches the service without importing it.
-    {
-      provide: PLUGIN_MESSAGE_PORT,
-      useFactory: (message: MessageService): PluginMessagePort => message,
-      inject: [MessageService],
-    },
+    // An alias, not a factory, so lifecycle hooks are not dispatched twice on the same instance.
+    { provide: PLUGIN_MESSAGE_PORT, useExisting: MessageService },
   ],
   exports: [MessageService, BulkMessageService, SendPacingService],
 })

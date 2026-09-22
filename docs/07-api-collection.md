@@ -118,6 +118,26 @@ curl -X POST "$BASE/api/sessions" \
   -d '{ "name": "my-bot", "proxyUrl": "http://user:pass@your-real-proxy.host:8080", "proxyType": "http" }'
 ```
 
+#### GET /api/sessions/:sessionId/proxy
+
+Read a session's masked proxy configuration (credentials never returned).
+
+```bash
+curl "$BASE/api/sessions/$SESSION_ID/proxy" \
+  -H "X-API-Key: $API_KEY"
+```
+
+#### PATCH /api/sessions/:sessionId/proxy
+
+Update per-session proxy settings (OPERATOR). No restart — changes apply on the next start. Send `"proxyUrl": null` to clear.
+
+```bash
+curl -X PATCH "$BASE/api/sessions/$SESSION_ID/proxy" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "proxyUrl": "http://user:pass@your-real-proxy.host:8080" }'
+```
+
 #### POST /api/sessions/:sessionId/start
 
 Start a session and initialize the connection (OPERATOR).
@@ -689,7 +709,7 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/groups/120363021234567890@g.us" \
 
 #### GET /api/sessions/:sessionId/groups/:groupId/invite-code
 
-Get the group invite code and full invite link.
+Get the group invite code and full invite link (OPERATOR).
 
 ```bash
 curl -X GET "$BASE/api/sessions/$SESSION_ID/groups/120363021234567890@g.us/invite-code" \
@@ -1136,11 +1156,12 @@ curl -X POST "$BASE/api/sessions/$SESSION_ID/webhooks" \
   -d '{
     "url": "https://your-server.com/webhook",
     "events": ["message.received", "session.status"],
-    "secret": "your-secret-key",
+    "secret": "your-webhook-signing-secret",
     "headers": { "X-Custom-Header": "value" },
     "filters": {
       "conditions": [
         { "field": "sender", "operator": "is", "value": ["1234567890@c.us"] },
+        { "field": "chatId", "operator": "is", "value": ["120363000000000000@g.us"] },
         { "field": "body", "operator": "contains", "value": "invoice" }
       ]
     },
@@ -1184,7 +1205,7 @@ curl -X DELETE "$BASE/api/sessions/$SESSION_ID/webhooks/f1e2d3c4-b5a6-7890-1234-
 
 ### 07.11 API Keys
 
-All `/api/auth/api-keys` routes require an **ADMIN** key. `POST /api/auth/validate` accepts any valid key. The plaintext key is returned only by the create call.
+All `/api/auth/api-keys` routes require an unscoped **ADMIN** key: one with `allowedSessions` or `allowedChats` set is refused with `403`. `POST /api/auth/validate` accepts any valid key except one restricted with `allowedChats`, which gets `403`. The plaintext key is returned only by the create call.
 
 #### GET /api/auth/api-keys
 
@@ -1268,10 +1289,13 @@ curl -X POST "$BASE/api/auth/validate" \
 
 #### GET /api/health
 
-Basic health check (status, timestamp, version). Public.
+Basic health check (status, timestamp). Public. The running `version` is added only when the request carries a valid API key, so an unauthenticated probe gets `status` and `timestamp` alone.
 
 ```bash
 curl "$BASE/api/health"
+
+# With the version field:
+curl -H "X-API-Key: $API_KEY" "$BASE/api/health"
 ```
 
 #### GET /api/health/live
@@ -1434,7 +1458,7 @@ curl "$BASE/api/infra/export-data" \
 
 #### POST /api/infra/import-data
 
-Replace all Data DB rows with a prior export (destructive, all-or-nothing). Every one of the 14 migration tables is emptied first, so a key you omit restores **empty** rather than untouched — send a body produced by `GET /api/infra/export-data`, not a hand-built subset. All 14 keys are shown below for that reason.
+Replace all Data DB rows with a prior export (destructive, all-or-nothing). Every one of the 16 migration tables is emptied first, so a key you omit restores **empty** rather than untouched — send a body produced by `GET /api/infra/export-data`, not a hand-built subset. All 16 keys are shown below for that reason.
 
 ```bash
 curl -X POST "$BASE/api/infra/import-data" \
@@ -1444,8 +1468,9 @@ curl -X POST "$BASE/api/infra/import-data" \
     "tables": {
       "sessions": [ { "id": "s1", "name": "main", "status": "ready", "phone": "15551234567", "pushName": "Me", "config": {}, "proxyUrl": null, "proxyType": null, "connectedAt": "2026-06-25T00:00:00.000Z", "lastActiveAt": "2026-06-25T00:00:00.000Z", "createdAt": "2026-06-25T00:00:00.000Z", "updatedAt": "2026-06-25T00:00:00.000Z" } ],
       "webhooks": [], "messages": [], "messageBatches": [], "templates": [], "baileysStoredMessages": [],
-      "lidMappings": [], "pluginInstances": [], "conversationMappings": [], "ingressEvents": [],
-      "webhookDeliveryFailures": [], "integrationDeliveryFailures": [], "statusUpdates": [], "automationRules": []
+      "lidMappings": [], "chatStates": [], "pluginInstances": [], "conversationMappings": [], "ingressEvents": [],
+      "webhookDeliveryFailures": [], "webhookOutboxEvents": [], "integrationDeliveryFailures": [], "statusUpdates": [],
+      "automationRules": []
     }
   }'
 ```

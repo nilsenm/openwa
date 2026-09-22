@@ -18,7 +18,7 @@
  *    `[blocklist] trying to block a pn contact without a chat`. Blocking requires an identity that
  *    owns a chat.
  * 3. Individual chats are keyed by LID now, while whatsapp-web.js folds every identity back to a
- *    phone number: `getContactById('148004841455867@lid')` answers `id: 6281770008896@c.us`. So the
+ *    phone number: `getContactById('100000000000000@lid')` answers `id: 628123456789@c.us`. So the
  *    id `Contact.block()` had in hand was precisely the one WhatsApp refuses.
  *
  * The fix therefore resolves the contact to the identity that actually owns the chat, and calls the
@@ -100,6 +100,21 @@ const GROUPS = [
   },
 ];
 
+/**
+ * Both groups' stand-down branch as one predicate, for the startup guard
+ * (engine-patch-status.ts). A half-patched tree is a reachable, supported state here, and it reads
+ * as NOT applied: whichever half is missing still answers an opaque 500 on every id.
+ * Unreadable reads as applied, since a tree we cannot inspect is not evidence of a broken one.
+ */
+function isApplied(wwjsDir = DEFAULT_WWJS) {
+  try {
+    const source = fs.readFileSync(path.join(wwjsDir, CONTACT_PATH), 'utf8');
+    return GROUPS.every((group) => source.includes(group.replace));
+  } catch {
+    return true;
+  }
+}
+
 function applyBlockPatches({ wwjsDir = DEFAULT_WWJS } = {}) {
   const contactFile = path.join(wwjsDir, CONTACT_PATH);
   if (!fs.existsSync(contactFile)) {
@@ -148,4 +163,4 @@ function run() {
 
 if (require.main === module) run();
 
-module.exports = { applyBlockPatches, GROUPS, findFor, replaceFor, CONTACT_PATH };
+module.exports = { applyBlockPatches, isApplied, GROUPS, findFor, replaceFor, CONTACT_PATH };

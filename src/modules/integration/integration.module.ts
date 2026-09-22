@@ -16,7 +16,7 @@ import { IntegrationRetentionService } from './integration-retention.service';
 import { IntegrationInstanceController } from './integration-instance.controller';
 import { ScopeBindingService } from './scope-binding.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
-import { PLUGIN_INSTANCE_PORT, type PluginInstancePort } from '../../core/plugins/plugin-host-ports';
+import { PLUGIN_INSTANCE_PORT } from '../../core/plugins/plugin-host-ports';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { Session } from '../session/entities/session.entity';
 import { createLogger } from '../../common/services/logger.service';
@@ -58,11 +58,8 @@ if (process.env.QUEUE_ENABLED === 'true') {
     IntegrationRetentionService,
     // Binds the core-owned plugin capability port to this module's service; resolved lazily by the
     // plugin runtime (PluginHostServices) so its provider cycle stays broken.
-    {
-      provide: PLUGIN_INSTANCE_PORT,
-      useFactory: (instances: PluginInstanceService): PluginInstancePort => instances,
-      inject: [PluginInstanceService],
-    },
+    // An alias, not a factory, so lifecycle hooks are not dispatched twice on the same instance.
+    { provide: PLUGIN_INSTANCE_PORT, useExisting: PluginInstanceService },
     {
       provide: IngressService,
       inject: [

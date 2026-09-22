@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { HttpException, PayloadTooLargeException } from '@nestjs/common';
+import { BadRequestException, HttpException, PayloadTooLargeException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { In, Not } from 'typeorm';
 import {
@@ -267,7 +267,11 @@ describe('BulkMessageService.processBatch', () => {
     }) as unknown as MessageBatch;
 
   beforeEach(async () => {
-    engine = { sendTextMessage: jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 }) };
+    engine = {
+      sendTextMessage: jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 }),
+      sendImageMessage: jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 }),
+      sendAudioMessage: jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 }),
+    };
     engines = new EngineRegistry();
     engines.set('s1', engine as unknown as IWhatsAppEngine);
     messageService = { saveOutgoingMessage: jest.fn().mockResolvedValue(undefined) };
@@ -395,6 +399,50 @@ describe('BulkMessageService.processBatch', () => {
     expect(finalPartial.results[0].status).not.toBe(BatchMessageStatus.FAILED);
   });
 
+  // The engines fetch only http(s) URLs and decode any other string as base64, so a media url is
+  // checked for its scheme; after rendering, because `variables` may supply the whole URL.
+  const imageBatch = (url: string, variables?: Record<string, string>): MessageBatch => ({
+    ...makeBatch(1),
+    messages: [{ chatId: 'c0@c.us', type: 'image', content: { image: { url } }, variables }],
+  });
+
+  it('sends a rendered media url whose variable holds a space', async () => {
+    repo.findOne.mockResolvedValue(imageBatch('https://cdn.example.com/{{name}}.jpg', { name: 'John Doe' }));
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).toHaveBeenCalledWith(
+      'c0@c.us',
+      expect.objectContaining({ data: 'https://cdn.example.com/John Doe.jpg' }),
+    );
+  });
+
+  it('sends a media url that variables fill in whole', async () => {
+    repo.findOne.mockResolvedValue(imageBatch('{{imageUrl}}', { imageUrl: 'https://cdn.example.com/a.jpg' }));
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).toHaveBeenCalledWith(
+      'c0@c.us',
+      expect.objectContaining({ data: 'https://cdn.example.com/a.jpg' }),
+    );
+  });
+
+  it.each([
+    ['a rendered ftp url', '{{u}}', { u: 'ftp://example.com/a.jpg' }],
+    ['an unfilled placeholder', '{{u}}', undefined],
+    ['a scheme-less url', 'example.com/a.jpg', undefined],
+  ])('fails an item with %s instead of sending it', async (_label, url, variables) => {
+    repo.findOne.mockResolvedValue(imageBatch(url, variables));
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).not.toHaveBeenCalled();
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toMatch(/absolute http\(s\) URL/);
+  });
+
   it('fails an item whose rendered text exceeds the cap instead of sending it', async () => {
     // Comfortably over the 64 KiB default the un-configured service falls back to.
     const huge = 'x'.repeat(70 * 1024);
@@ -449,6 +497,50 @@ describe('BulkMessageService.processBatch', () => {
     expect(sendArgs[1]).toBe('hello world');
   });
 
+  // A restart or reconnect registers a fresh adapter mid-batch; the retired one is not ready, so a
+  // batch holding it would fail every remaining item while the session is READY again.
+  it('sends each item through the engine registered at that moment, not the one the batch started with', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(2));
+    const replacement = { sendTextMessage: jest.fn().mockResolvedValue({ id: 'wa2', timestamp: 222 }) };
+    engine.sendTextMessage.mockImplementationOnce(() => {
+      engines.set('s1', replacement as unknown as IWhatsAppEngine);
+      return Promise.resolve({ id: 'wa1', timestamp: 111 });
+    });
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(replacement.sendTextMessage).toHaveBeenCalledWith('c1@c.us', 'hi');
+  });
+
+  it('fails only the item whose engine is gone mid-batch, without feeding the send breaker', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(2));
+    engine.sendTextMessage.mockImplementationOnce(() => {
+      engines.delete('s1');
+      return Promise.resolve({ id: 'wa1', timestamp: 111 });
+    });
+
+    await runProcessBatch();
+
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results.map(r => r.status)).toEqual([BatchMessageStatus.SENT, BatchMessageStatus.FAILED]);
+    expect(finalPartial.results[1].error?.message).toMatch(/not connected/i);
+    expect(pacing.recordSendFailure).not.toHaveBeenCalled();
+  });
+
+  // The create-time check sees the raw input; a gate rewrite can still empty an item out.
+  it('fails an item the message:sending gate rewrote into content its type cannot send', async () => {
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    hookManager.execute.mockResolvedValueOnce({ continue: true, data: { input: {} } });
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toMatch(/content\.text/);
+  });
+
   it('releases the in-flight marker when the engine is missing (no processingBatches leak)', async () => {
     repo.findOne.mockResolvedValue(makeBatch(1));
     engines.delete('s1'); // engine-not-found → early-return path
@@ -480,6 +572,40 @@ describe('BulkMessageService.processBatch', () => {
         type: 'text',
         status: MessageStatus.SENT,
       }),
+    );
+  });
+
+  it('persists the media and caption the item type sent, not a stray key on the same item', async () => {
+    engine.sendVideoMessage = jest.fn().mockResolvedValue({ id: 'wa1', timestamp: 111 });
+    const batch = makeBatch(2);
+    batch.messages = [
+      {
+        chatId: 'c0@c.us',
+        type: 'video',
+        content: {
+          text: 'not sent',
+          caption: 'clip',
+          image: { url: 'https://x/y.jpg', mimetype: 'image/jpeg' },
+          video: { base64: 'AAAA', mimetype: 'video/mp4' },
+        },
+      },
+      { chatId: 'c1@c.us', type: 'text', content: { text: 'hi', image: { url: 'https://x/y.jpg' } } },
+    ];
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({
+        chatId: 'c0@c.us',
+        body: 'clip',
+        metadata: { media: { mimetype: 'video/mp4', data: 'AAAA', filename: undefined } },
+      }),
+    );
+    expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ chatId: 'c1@c.us', body: 'hi', metadata: undefined }),
     );
   });
 
@@ -772,6 +898,76 @@ describe('BulkMessageService.processBatch', () => {
     expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'Hi Sam');
   });
 
+  it('tags participants per item, on the text body and on a media caption alike', async () => {
+    // Each item names its own list: a batch fans out to many chats, and a WID is only taggable in a
+    // chat the participant is actually in.
+    const batch = makeBatch(1);
+    batch.messages[0].content = { text: 'Hi @62811', mentions: ['62811@c.us'] };
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'Hi @62811', ['62811@c.us']);
+
+    const media = makeBatch(1);
+    media.messages[0].type = 'image';
+    media.messages[0].content = {
+      image: { base64: 'AAAA', mimetype: 'image/jpeg' },
+      caption: 'look @62811',
+      mentions: ['62811@c.us'],
+    };
+    repo.findOne.mockResolvedValue(media);
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).toHaveBeenCalledWith(
+      'c0@c.us',
+      expect.objectContaining({ caption: 'look @62811', mentions: ['62811@c.us'] }),
+    );
+  });
+
+  it('substitutes variables inside mentions, so a campaign can tag a different participant per item', async () => {
+    // applyVariables walks the whole content tree, so a placeholder in a WID is rendered like one in
+    // the body. That is load-bearing for a personalised batch, and nothing else pins it: a future
+    // rewrite of applyVariables that rebuilt the object field by field would drop mentions silently.
+    const batch = makeBatch(1);
+    batch.messages[0].content = { text: 'Hi @{{num}}', mentions: ['{{num}}@c.us'] };
+    batch.messages[0].variables = { num: '62811' };
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'Hi @62811', ['62811@c.us']);
+  });
+
+  it('tags an audio item too, which has no caption to anchor a visible @token', async () => {
+    // Audio carries no caption, but a mention still tags through contextInfo, which is why the
+    // single-send audio route accepts the field. Skipping it here would accept the list and deliver
+    // an untagged voice note, turning a clear 400 into a silent no-op for one bulk type only.
+    const batch = makeBatch(1);
+    batch.messages[0].type = 'audio';
+    batch.messages[0].content = { audio: { base64: 'AAAA', mimetype: 'audio/mpeg' }, mentions: ['62811@c.us'] };
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendAudioMessage).toHaveBeenCalledWith(
+      'c0@c.us',
+      expect.objectContaining({ mentions: ['62811@c.us'] }),
+    );
+  });
+
+  it('leaves an untagged batch item on its two-argument send', async () => {
+    // Control: without a list the call shape every existing batch makes is untouched.
+    const batch = makeBatch(1);
+    batch.messages[0].content = { text: 'Hi there', mentions: [] };
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'Hi there');
+  });
+
   it('fails an item whose rendered variables grow its base64 media past the cap (no send, explicit failure)', async () => {
     process.env.MEDIA_DOWNLOAD_MAX_BYTES = '16';
     try {
@@ -994,6 +1190,17 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
     }
   });
 
+  it('refuses a non-http(s) media url at batch creation but lets a templated one through', async () => {
+    const create = (url: string) =>
+      service.createBatch('s1', {
+        messages: [{ chatId: 'c0@c.us', type: 'image' as const, content: { image: { url } } }],
+      });
+
+    await expect(create('ftp://example.com/a.jpg')).rejects.toThrow(/absolute http\(s\) URL/);
+    expect(repo.save).not.toHaveBeenCalled();
+    await expect(create('https://{{host}}/a.jpg')).resolves.toBeDefined();
+  });
+
   it('reserves the cap before awaiting persistence so concurrent creates cannot overshoot it', async () => {
     const previous = process.env.BULK_MAX_CONCURRENT_BATCHES;
     process.env.BULK_MAX_CONCURRENT_BATCHES = '1';
@@ -1012,7 +1219,7 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
       return pendingSave;
     });
     const dto = {
-      messages: [{ chatId: 'c0@c.us', type: 'text' as const, content: { text: { body: 'hi' } } }],
+      messages: [{ chatId: 'c0@c.us', type: 'text' as const, content: { text: 'hi' } }],
     } as unknown as SendBulkMessageDto;
 
     try {
@@ -1033,12 +1240,60 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
   it('releases the cap reservation when persistence fails', async () => {
     repo.save.mockRejectedValueOnce(new Error('database unavailable'));
     const dto = {
-      messages: [{ chatId: 'c0@c.us', type: 'text' as const, content: { text: { body: 'hi' } } }],
+      messages: [{ chatId: 'c0@c.us', type: 'text' as const, content: { text: 'hi' } }],
     } as unknown as SendBulkMessageDto;
 
     await expect(service.createBatch('s1', dto)).rejects.toThrow('database unavailable');
 
     expect((service as unknown as { inFlightBatches: number }).inFlightBatches).toBe(0);
+  });
+
+  it.each([
+    ['a text item with no text', { chatId: 'c0@c.us', type: 'text', content: {} }, /content\.text/],
+    ['a text item with empty text', { chatId: 'c0@c.us', type: 'text', content: { text: '' } }, /content\.text/],
+    ['an image item with no media', { chatId: 'c0@c.us', type: 'image', content: {} }, /content\.image\.url/],
+    [
+      'a document item whose media sits under another type',
+      { chatId: 'c0@c.us', type: 'document', content: { image: { url: 'https://example.com/a.jpg' } } },
+      /content\.document\.url/,
+    ],
+  ])('rejects %s with a 400 before persisting the batch', async (_label, item, message) => {
+    const create = service.createBatch('s1', { messages: [item] } as unknown as SendBulkMessageDto);
+
+    await expect(create).rejects.toBeInstanceOf(BadRequestException);
+    await expect(create).rejects.toThrow(message);
+    expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  // Two concurrent creates with one caller-supplied batchId both pass the existence read; the unique
+  // index rejects the second, which must read as the same 400 as the sequential duplicate.
+  it('answers a duplicate batchId that loses the insert race with the same 400', async () => {
+    repo.save.mockRejectedValueOnce(
+      Object.assign(new Error('UNIQUE constraint failed: message_batches.sessionId, message_batches.batchId'), {
+        code: 'SQLITE_CONSTRAINT_UNIQUE',
+      }),
+    );
+    const dto = {
+      batchId: 'campaign-42',
+      messages: [{ chatId: 'c0@c.us', type: 'text' as const, content: { text: 'hi' } }],
+    } as unknown as SendBulkMessageDto;
+
+    const create = service.createBatch('s1', dto);
+
+    await expect(create).rejects.toBeInstanceOf(BadRequestException);
+    await expect(create).rejects.toThrow("Batch ID 'campaign-42' already exists");
+    expect((service as unknown as { inFlightBatches: number }).inFlightBatches).toBe(0);
+  });
+
+  it.each(['.', '..'])('rejects the dot-segment batchId %p, which no URL can address', async batchId => {
+    const create = service.createBatch('s1', {
+      batchId,
+      messages: [{ chatId: 'c0@c.us', type: 'text', content: { text: 'hi' } }],
+    } as unknown as SendBulkMessageDto);
+
+    await expect(create).rejects.toBeInstanceOf(BadRequestException);
+    await expect(create).rejects.toThrow(`Batch ID '${batchId}' is not allowed`);
+    expect(repo.save).not.toHaveBeenCalled();
   });
 
   it('scopes the batchId uniqueness check to the session (no cross-session collision/oracle)', async () => {
@@ -1053,7 +1308,7 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
     // so it neither collides with another tenant's namespace nor leaks that the id is in use elsewhere.
     await expect(
       service.createBatch('s2', {
-        messages: [{ chatId: 'c0@c.us', type: 'text', content: { text: { body: 'hi' } } }],
+        messages: [{ chatId: 'c0@c.us', type: 'text', content: { text: 'hi' } }],
         batchId: 'dup',
       } as unknown as SendBulkMessageDto),
     ).resolves.toBeDefined();

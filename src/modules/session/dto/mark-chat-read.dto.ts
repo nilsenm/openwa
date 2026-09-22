@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ArrayMaxSize, ArrayNotEmpty, IsArray, IsNotEmpty, IsOptional, IsString, Matches } from 'class-validator';
+import { ArrayMaxSize, ArrayNotEmpty, IsArray, IsNotEmpty, IsString, Matches, ValidateIf } from 'class-validator';
 
 /**
  * Ceiling on one request's receipt batch, so a single call cannot hand the engine an unbounded key
@@ -7,6 +7,16 @@ import { ArrayMaxSize, ArrayNotEmpty, IsArray, IsNotEmpty, IsOptional, IsString,
  * than marking a conversation read.
  */
 export const MARK_READ_MESSAGE_IDS_MAX = 100;
+
+/**
+ * The shape of one message id: a single non-whitespace token. Exported for the same reason as the
+ * cap above, so the agent tool holds the rule rather than restating it. Restating it is how the two
+ * surfaces drifted: the tool copied the count and left `['  ']` reaching the engine as a receipt key.
+ */
+export const MARK_READ_MESSAGE_ID_PATTERN = /^\S{1,128}$/;
+
+/** Rejection message for {@link MARK_READ_MESSAGE_ID_PATTERN}, shared so both surfaces answer alike. */
+export const MARK_READ_MESSAGE_ID_MESSAGE = 'each messageIds entry must be a non-empty id with no whitespace';
 
 export class MarkChatReadDto {
   @ApiProperty({
@@ -35,9 +45,15 @@ export class MarkChatReadDto {
     // this the published schema advertises an unbounded array and a caller batching more than the
     // cap discovers the limit as a 400.
     maxItems: MARK_READ_MESSAGE_IDS_MAX,
+    // @ArrayNotEmpty rejects [], so the published schema has to say so too; without minItems the
+    // contract advertised an empty array as valid against a server that answers 400.
+    minItems: 1,
     example: ['3EB0C767D26B8A3F1A2B', '3EB0C767D26B8A3F1A2C'],
   })
-  @IsOptional()
+  // Not @IsOptional: that skips every validator for null as well as undefined, so an explicit
+  // `"messageIds": null` reached the engine unchecked and dereferenced there as a 500. Absent stays
+  // absent; present-but-null falls through to @IsArray and answers 400.
+  @ValidateIf((_object, value) => value !== undefined)
   @IsArray()
   // An empty array asks for nothing to be acknowledged. Rejected rather than accepted, because the
   // engine reads a missing list as "the newest message" and the two must not collapse: a caller that
@@ -46,8 +62,6 @@ export class MarkChatReadDto {
   @ArrayMaxSize(MARK_READ_MESSAGE_IDS_MAX)
   @IsString({ each: true })
   @IsNotEmpty({ each: true })
-  // Engine-neutral structural check: a message id is one non-whitespace token. @IsNotEmpty alone
-  // accepts '   ', which would reach sendNode as a receipt key.
-  @Matches(/^\S{1,128}$/, { each: true, message: 'each messageIds entry must be a non-empty id with no whitespace' })
+  @Matches(MARK_READ_MESSAGE_ID_PATTERN, { each: true, message: MARK_READ_MESSAGE_ID_MESSAGE })
   messageIds?: string[];
 }

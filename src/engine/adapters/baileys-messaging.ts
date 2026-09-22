@@ -1,4 +1,3 @@
-import sharp from 'sharp';
 import type * as BaileysLib from '@whiskeysockets/baileys';
 import type { AnyMessageContent, MiscMessageGenerationOptions, WAMessage, WASocket } from '@whiskeysockets/baileys';
 import { generateSafeLinkPreview } from './safe-link-preview';
@@ -18,8 +17,9 @@ import {
 } from '../interfaces/whatsapp-engine.interface';
 import { toEngineParticipants } from './baileys-groups';
 import { buildVCard } from './vcard';
+import { resolveBaileysButtonClick } from './baileys-message-mapper';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, InternalServerErrorException } from '@nestjs/common';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
 import { type createLogger } from '../../common/services/logger.service';
@@ -32,6 +32,8 @@ import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-dead
  * delegate never touches lifecycle state directly.
  */
 export interface BaileysMessagingHost {
+  /** This session's egress proxy URL (snapshotted at session start), or undefined when direct. */
+  sessionProxyUrl(): string | undefined;
   ensureReady(): void;
   /** Post-ensureReady socket handle — call host.ensureReady() first. */
   getSocket(): WASocket;
@@ -42,11 +44,13 @@ export interface BaileysMessagingHost {
   /** The chat's cached disappearing-messages timer (#473), or undefined when none is known. */
   getEphemeralExpiration(chatId: string): number | undefined;
   /** Baileys timestamps are `number | Long`; normalize to unix seconds. */
-  toUnixSeconds(ts: number | { toNumber(): number } | null | undefined): number;
+  toUnixSeconds(ts: number | string | { toNumber(): number } | null | undefined): number;
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
   loadLib(): Promise<typeof BaileysLib>;
   /** Persist a just-sent message to the store; undefined when no store is configured. */
   putStoredMessage(msg: WAMessage): Promise<void> | undefined;
+  /** Record the id of a message this session just sent, so its library echo is recognised as ours. */
+  rememberOwnSend(id: string | null | undefined): void;
   /** Look up a previously-seen message from the store (the reply/forward/react/delete handle). */
   getStoredMessage(messageId: string): Promise<WAMessage | null> | undefined;
   /** Remember a lid<->phone pair the socket resolved, so later reads do not have to ask again. */
@@ -86,6 +90,21 @@ function isWebpBuffer(data: Buffer): boolean {
  * `{ animated: true }` is not optional — without it sharp silently keeps only the first frame, which
  * would reintroduce the same quiet-corruption this function exists to remove.
  */
+/**
+ * Load the deferred `sharp` binary, mapping a LOAD failure to a 500 rather than the decode path's 400.
+ * A native-binary load failure (older CPU, stripped/musl image, missing prebuilt) is a host capability
+ * gap: a valid PNG would hit it too, so reporting it as a 400 tells the caller their image is malformed.
+ */
+export async function loadSharp() {
+  try {
+    return (await import('sharp')).default;
+  } catch (error) {
+    throw new InternalServerErrorException(
+      `Sticker conversion is unavailable: sharp could not load (${error instanceof Error ? error.message : String(error)}).`,
+    );
+  }
+}
+
 async function toWebpSticker(data: Buffer, mimetype: string): Promise<Buffer> {
   if (isWebpBuffer(data)) {
     return data;
@@ -98,6 +117,12 @@ async function toWebpSticker(data: Buffer, mimetype: string): Promise<Buffer> {
       `A sticker must be a WebP image, or an image this gateway can convert to one. Received '${mimetype}'.`,
     );
   }
+  // Imported lazily so an unusable `sharp` (a native binary that will not build or load on an older
+  // CPU, a stripped image) degrades ONLY this one Baileys sticker route instead of killing the whole
+  // gateway at boot. `sharp` sits at the top of a module the built-in engine loads unconditionally, so
+  // an eager import made a single optional capability a hard boot requirement on both engines. Same
+  // deferral the adapters already use for the engine libraries themselves.
+  const sharp = await loadSharp();
   try {
     return await sharp(data, { animated: true })
       .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
@@ -112,13 +137,21 @@ async function toWebpSticker(data: Buffer, mimetype: string): Promise<Buffer> {
   }
 }
 
-/** Resolve a MediaInput's data (Buffer | base64 string | http(s) URL) to bytes + mimetype. */
-export async function resolveMediaBuffer(media: MediaInput): Promise<{ data: Buffer; mimetype: string }> {
+/**
+ * Resolve a MediaInput's data (Buffer | base64 string | http(s) URL) to bytes + mimetype.
+ *
+ * `sessionProxyUrl` is this session's egress proxy, which the URL fetch leaves through (#1626). It
+ * is required, not optional, so a new call site cannot fetch direct on a proxied session by omission.
+ */
+export async function resolveMediaBuffer(
+  media: MediaInput,
+  sessionProxyUrl: string | undefined,
+): Promise<{ data: Buffer; mimetype: string }> {
   if (Buffer.isBuffer(media.data)) {
     return { data: media.data, mimetype: media.mimetype };
   }
   if (/^https?:\/\//i.test(media.data)) {
-    const fetched = await loadRemoteMediaBuffer(media.data);
+    const fetched = await loadRemoteMediaBuffer(media.data, sessionProxyUrl);
     // A generic placeholder mimetype (buildMediaInput's 'application/octet-stream' default when the
     // caller supplied none) carries no real signal — defer to the fetched response content-type,
     // which was sniffed from the actual bytes. This fixes URL-based sends where the caller has no
@@ -159,7 +192,7 @@ export class BaileysMessaging {
     // not only when a preview was asked for.
     const options = {
       ...(this.withEphemeral(jid) ?? {}),
-      getUrlInfo: (text: string) => generateSafeLinkPreview(text),
+      getUrlInfo: (text: string) => generateSafeLinkPreview(text, { sessionProxyUrl: this.host.sessionProxyUrl() }),
       // Merged rather than assigned: getUrlInfo above must survive, or the library's own vulnerable
       // preview generator becomes reachable again on quoted sends only.
       ...((await this.quoteOption(sendOptions?.quotedMessageId)) ?? {}),
@@ -190,7 +223,7 @@ export class BaileysMessaging {
           }
         : {}),
     };
-    const sent = await this.sock().sendMessage(jid, content, options);
+    const sent = await this.send(jid, content, options);
     if (sent) {
       void this.host.putStoredMessage(sent)?.catch(err =>
         this.host.logger.warn('Failed to persist sent message to store', {
@@ -294,7 +327,7 @@ export class BaileysMessaging {
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.host.ensureReady();
-    const { data, mimetype } = await resolveMediaBuffer(media);
+    const { data, mimetype } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
     return this.sendContent(
       chatId,
       {
@@ -309,7 +342,7 @@ export class BaileysMessaging {
 
   async sendVideoMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.host.ensureReady();
-    const { data, mimetype } = await resolveMediaBuffer(media);
+    const { data, mimetype } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
     return this.sendContent(
       chatId,
       {
@@ -324,7 +357,7 @@ export class BaileysMessaging {
 
   async sendAudioMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.host.ensureReady();
-    const { data, mimetype } = await resolveMediaBuffer(media);
+    const { data, mimetype } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
     return this.sendContent(
       chatId,
       // Audio carries no caption, so a mention here tags the recipient through contextInfo without
@@ -338,7 +371,7 @@ export class BaileysMessaging {
 
   async sendDocumentMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.host.ensureReady();
-    const { data, mimetype } = await resolveMediaBuffer(media);
+    const { data, mimetype } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
     return this.sendContent(
       chatId,
       {
@@ -376,10 +409,14 @@ export class BaileysMessaging {
 
   async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.host.ensureReady();
-    const { data, mimetype } = await resolveMediaBuffer(media);
+    const { data, mimetype } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
+    // A sticker has neither text nor caption, but stickerMessage carries a contextInfo like every
+    // other content type, so a mention still tags the participant. The route accepts the field
+    // (send-sticker shares SendMediaMessageDto) and docs/06 lists it among the media sends that
+    // take one, so dropping it here left a documented capability doing nothing.
     return this.sendContent(
       chatId,
-      { sticker: await toWebpSticker(data, mimetype) },
+      { sticker: await toWebpSticker(data, mimetype), ...this.withMentions(media.mentions) },
       await this.quoteOption(media.quotedMessageId),
     );
   }
@@ -428,7 +465,7 @@ export class BaileysMessaging {
     );
   }
 
-  async replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult> {
+  async replyToMessage(chatId: string, quotedMsgId: string, text: string, mentions?: string[]): Promise<MessageResult> {
     this.host.ensureReady();
     const quoted = await this.requireStored(quotedMsgId);
     // The one requireStored path that had no chat check. whatsapp-web.js resolves the quote by
@@ -438,7 +475,40 @@ export class BaileysMessaging {
     // NOT applied to quoteOption: cross-chat quoting on the send-* routes is deliberate and
     // published in docs/06.
     this.assertStoredInChat(quoted, chatId, quotedMsgId);
-    return this.sendContent(chatId, { text }, { quoted });
+    return this.sendContent(chatId, { text, ...this.withMentions(mentions) }, { quoted });
+  }
+
+  /**
+   * Send a structured button/list reply against a stored business prompt.
+   *
+   * Classic prompts (`buttonsMessage` / `templateMessage` / `listMessage`) go through Baileys'
+   * `buttonReply` / `listReply` helpers via {@link sendContent}, so the send inherits
+   * `withEphemeral`, the store put and the own-send echo. Native-flow `interactiveMessage` has no
+   * helper; it uses the template `buttonReply` shape, which is unverified against a live business
+   * native-flow prompt.
+   */
+  async clickButton(chatId: string, messageId: string, buttonId: string, text?: string): Promise<MessageResult> {
+    this.host.ensureReady();
+    const quoted = await this.requireStored(messageId);
+    this.assertStoredInChat(quoted, chatId, messageId);
+
+    const b = await this.host.loadLib();
+    const normalized = b.normalizeMessageContent(quoted.message ?? undefined) ?? quoted.message ?? {};
+    const contentType = b.getContentType(normalized);
+    const resolved = resolveBaileysButtonClick(normalized, contentType, buttonId, text);
+    if (!resolved.ok) {
+      if (resolved.error === 'unknown_button') {
+        throw new BadRequestException(
+          `buttonId "${buttonId}" is not among the clickable choices on message ${messageId}`,
+        );
+      }
+      throw new BadRequestException(
+        `message ${messageId} is not a WhatsApp Business button/list prompt that can be clicked`,
+      );
+    }
+
+    const result = await this.sendContent(chatId, resolved.payload.content as AnyMessageContent, { quoted });
+    return { ...result, body: resolved.payload.text };
   }
 
   async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
@@ -456,7 +526,7 @@ export class BaileysMessaging {
     const target = await this.requireStored(messageId);
     this.assertStoredInChat(target, chatId, messageId);
     // Resolved like any other send: a lid-migrated contact rejects PN-addressed sends (ack 463).
-    await this.sock().sendMessage(await this.toDeliverableJid(chatId), { react: { text: emoji, key: target.key } });
+    await this.send(await this.toDeliverableJid(chatId), { react: { text: emoji, key: target.key } });
   }
 
   async deleteMessage(chatId: string, messageId: string, forEveryone = true): Promise<void> {
@@ -464,7 +534,7 @@ export class BaileysMessaging {
     const target = await this.requireStored(messageId);
     this.assertStoredInChat(target, chatId, messageId);
     if (forEveryone) {
-      await this.sock().sendMessage(await this.toDeliverableJid(chatId), { delete: target.key });
+      await this.send(await this.toDeliverableJid(chatId), { delete: target.key });
       return;
     }
     // Delete-for-me (revoke on this device only): Baileys exposes it as a chat modification, not a
@@ -484,9 +554,12 @@ export class BaileysMessaging {
     );
   }
 
-  async editMessage(chatId: string, messageId: string, body: string): Promise<MessageResult> {
+  async editMessage(chatId: string, messageId: string, body: string, mentions?: string[]): Promise<MessageResult> {
     this.host.ensureReady();
     const target = await this.requireStored(messageId);
+    // The chat check comes first so a message from another chat answers not-found whichever side
+    // sent it; checking fromMe first would tell an inbound message there from an own one.
+    this.assertStoredInChat(target, chatId, messageId);
     // Only the account's own messages are editable: WhatsApp refuses the edit of an inbound message
     // but the send would still resolve, dressing the refusal up as success (and the service layer
     // would then "update" the stored body). Refuse first — mirrors the wwjs null-edit guard.
@@ -495,19 +568,23 @@ export class BaileysMessaging {
         `the edit of message ${messageId} was rejected — only the account's own messages can be edited`,
       );
     }
-    this.assertStoredInChat(target, chatId, messageId);
     // An edit keeps the original message id, so it is neither re-persisted nor echoed as a new send.
     // The destination is resolved like any other send: a lid-migrated contact rejects PN-addressed
     // sends with ack error 463 (see toDeliverableJid).
     const jid = await this.toDeliverableJid(chatId);
     // Same guard as sendContent: an edit carries text, so without it the library would fetch
     // every URL in the new body through its own vulnerable generator.
-    const sent = await this.sock().sendMessage(
-      jid,
-      this.previewSafe({ text: body, edit: target.key }),
-      this.previewSafeOptions({ text: body, edit: target.key }),
-    );
-    return { id: sent?.key?.id ?? messageId, timestamp: this.host.toUnixSeconds(sent?.messageTimestamp) };
+    // Tags are applied to the inner message's contextInfo BEFORE the library wraps it in the
+    // protocolMessage edit envelope, so an edit can re-tag participants. An edit REPLACES the
+    // content, so omitting mentions drops whatever tags the original carried.
+    const editContent = { text: body, ...this.withMentions(mentions), edit: target.key };
+    await this.send(jid, this.previewSafe(editContent), this.previewSafeOptions(editContent));
+    // Both fields describe the EDITED MESSAGE, not the protocol envelope that carried the edit.
+    // That envelope has an id and a send time of its own; answering with either would name something
+    // no route can address and no stored row is keyed by, and would disagree with the
+    // whatsapp-web.js engine, which re-reads the message and reports the original of both. An edit
+    // does not move a message in the chat, so its timestamp is still the one it was sent at.
+    return { id: messageId, timestamp: this.host.toUnixSeconds(target.messageTimestamp) };
   }
 
   /**
@@ -589,7 +666,10 @@ export class BaileysMessaging {
    */
   private previewSafeOptions(content: AnyMessageContent, options?: MiscMessageGenerationOptions) {
     if (!('text' in content)) return options;
-    return { ...(options ?? {}), getUrlInfo: (text: string) => generateSafeLinkPreview(text) };
+    return {
+      ...(options ?? {}),
+      getUrlInfo: (text: string) => generateSafeLinkPreview(text, { sessionProxyUrl: this.host.sessionProxyUrl() }),
+    };
   }
 
   private async sendContent(
@@ -600,7 +680,7 @@ export class BaileysMessaging {
     const jid = await this.toDeliverableJid(chatId);
     const safe = this.previewSafe(content);
     const merged = this.previewSafeOptions(safe, this.withEphemeral(jid, options));
-    const sent = merged ? await this.sock().sendMessage(jid, safe, merged) : await this.sock().sendMessage(jid, safe);
+    const sent = await this.send(jid, safe, merged);
     if (sent) {
       void this.host.putStoredMessage(sent)?.catch(err =>
         this.host.logger.warn('Failed to persist sent message to store', {
@@ -608,13 +688,33 @@ export class BaileysMessaging {
         }),
       );
       // wwjs fires `message_create` for its own API sends, which SessionService turns into `message.sent`.
-      // Baileys' own socket-sends echo back only as a `type:'append'` upsert (skipped as history sync), so
-      // that event never fired for API sends. Emit the outbound "created" callback here for parity —
-      // best-effort and off the response path. No media re-download: the API caller already holds the
+      // Baileys' own socket-sends echo back only as a `type:'append'` upsert, which handleMessagesUpsert
+      // skips by the id send() recorded, so that event never fired for API sends. Emit the outbound
+      // "created" callback here for parity: best-effort,
+      // and off the response path. No media re-download: the API caller already holds the
       // payload and the REST send path persists it (wwjs, by contrast, does download it on its echo).
       void this.emitOwnSendEcho(sent);
     }
     return { id: sent?.key?.id ?? '', timestamp: this.host.toUnixSeconds(sent?.messageTimestamp) };
+  }
+
+  /**
+   * Every message this delegate sends goes through here so its id is recorded before the library
+   * echoes it back. Baileys re-emits each own send through `messages.upsert` tagged `append`, the
+   * same tag WhatsApp uses to replay what the account typed on its phone while the gateway was
+   * down, and the id is the only thing that tells the two apart (see handleMessagesUpsert). The
+   * record is synchronous on the send's own continuation, ahead of the library's buffered echo.
+   */
+  private async send(
+    jid: string,
+    content: Parameters<WASocket['sendMessage']>[1],
+    options?: Parameters<WASocket['sendMessage']>[2],
+  ): Promise<WAMessage | undefined> {
+    const sent = options
+      ? await this.sock().sendMessage(jid, content, options)
+      : await this.sock().sendMessage(jid, content);
+    this.host.rememberOwnSend(sent?.key?.id);
+    return sent;
   }
 
   /**
@@ -704,7 +804,7 @@ export class BaileysMessaging {
     // pure ESM and every other site in this codebase defers it to first connect; a module-scope
     // require would drag ~590 modules into boot even for whatsapp-web.js-only processes.
     const { proto } = await this.host.loadLib();
-    await this.sock().sendMessage(await this.toDeliverableJid(chatId), {
+    await this.send(await this.toDeliverableJid(chatId), {
       pin: target.key,
       type: proto.PinInChat.Type.PIN_FOR_ALL,
       // WhatsApp recognises only these three windows; the DTO rejects anything else before we
@@ -719,7 +819,7 @@ export class BaileysMessaging {
     this.assertStoredInChat(target, chatId, messageId);
     const { proto } = await this.host.loadLib();
     // `time` is meaningless for an unpin and is omitted rather than sent as a dummy value.
-    await this.sock().sendMessage(await this.toDeliverableJid(chatId), {
+    await this.send(await this.toDeliverableJid(chatId), {
       pin: target.key,
       type: proto.PinInChat.Type.UNPIN_FOR_ALL,
     });

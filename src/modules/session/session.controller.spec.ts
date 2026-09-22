@@ -5,6 +5,9 @@ import type { Session } from './entities/session.entity';
 import type { SessionService } from './session.service';
 import type { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
+import { ChatScopeService } from '../auth/chat-scope.service';
+import type { ChatSummary } from '../../engine/interfaces/whatsapp-engine.interface';
+import type { ApiKey } from '../auth/entities/api-key.entity';
 import { BadGatewayException, BadRequestException, ConflictException } from '@nestjs/common';
 
 // POST /sessions declared a SessionResponseDto in its Swagger metadata but returned the raw
@@ -43,6 +46,7 @@ describe('SessionController — create() response contract', () => {
     controller = new SessionControllerClass(
       sessionService as unknown as SessionService,
       auditService as unknown as AuditService,
+      new ChatScopeService(),
     );
   });
 
@@ -51,7 +55,6 @@ describe('SessionController — create() response contract', () => {
 
     expect(result).not.toHaveProperty('config');
     expect(result).not.toHaveProperty('proxyUrl');
-    expect(result).not.toHaveProperty('proxyType');
     expect(result).not.toHaveProperty('lastActiveAt');
   });
 
@@ -128,6 +131,7 @@ describe('SessionController — logout() audit + error forwarding contract', () 
     controller = new SessionControllerClass(
       sessionService as unknown as SessionService,
       auditService as unknown as AuditService,
+      new ChatScopeService(),
     );
   });
 
@@ -197,6 +201,7 @@ describe('SessionController — start/stop lifecycle', () => {
     controller = new SessionControllerClass(
       sessionService as unknown as SessionService,
       auditService as unknown as AuditService,
+      new ChatScopeService(),
     );
   });
 
@@ -287,6 +292,7 @@ describe('SessionController — muteChat', () => {
     controller = new SessionControllerClass(
       sessionService as unknown as SessionService,
       auditService as unknown as AuditService,
+      new ChatScopeService(),
     );
   });
 
@@ -304,6 +310,44 @@ describe('SessionController — muteChat', () => {
   });
 });
 
+describe('SessionController findAll name filter', () => {
+  const apiKey = { allowedSessions: ['sess-uuid-1'] } as unknown as ApiKey;
+  let sessionService: { findAll: jest.Mock; isActive: jest.Mock };
+  let controller: SessionController;
+
+  beforeEach(() => {
+    sessionService = { findAll: jest.fn().mockResolvedValue([]), isActive: jest.fn().mockReturnValue(false) };
+    controller = new SessionControllerClass(
+      sessionService as unknown as SessionService,
+      { logInfo: jest.fn() } as unknown as AuditService,
+      new ChatScopeService(),
+    );
+  });
+
+  it('forwards the name alongside the key allowlist and the window', async () => {
+    await expect(controller.findAll(apiKey, '10', '5', 'my-bot')).resolves.toEqual([]);
+
+    expect(sessionService.findAll).toHaveBeenCalledWith(['sess-uuid-1'], { limit: 10, offset: 5, name: 'my-bot' });
+  });
+
+  it('leaves the query unfiltered when name is absent', async () => {
+    await controller.findAll(apiKey);
+
+    expect(sessionService.findAll).toHaveBeenCalledWith(['sess-uuid-1'], {
+      limit: undefined,
+      offset: undefined,
+      name: undefined,
+    });
+  });
+
+  // A repeated key arrives as an array and an empty value as ''. Dropping either would return every
+  // session to a caller that asked for one, so both are refused before the service is reached.
+  it.each([[['a', 'b']], ['']])('rejects name=%p with 400', async name => {
+    await expect(controller.findAll(apiKey, undefined, undefined, name)).rejects.toBeInstanceOf(BadRequestException);
+    expect(sessionService.findAll).not.toHaveBeenCalled();
+  });
+});
+
 // The pin route forwards a boolean the engine can refuse. The value worth pinning is that the
 // engine's `false` reaches the caller: WhatsApp caps pinned chats at three, and a controller that
 // hard-coded `{ success: true }` would report a refused pin as done.
@@ -318,6 +362,7 @@ describe('SessionController — pinChat', () => {
     controller = new SessionControllerClass(
       sessionService as unknown as SessionService,
       auditService as unknown as AuditService,
+      new ChatScopeService(),
     );
   });
 
@@ -340,5 +385,101 @@ describe('SessionController — pinChat', () => {
     await controller.pinChat('sess-uuid-1', { chatId: '628123@c.us', pin: false });
 
     expect(sessionService.pinChat).toHaveBeenCalledWith('sess-uuid-1', '628123@c.us', false);
+  });
+});
+
+describe('SessionController — proxy() response contract', () => {
+  const proxyProjection = {
+    enabled: true,
+    proxyType: 'http' as const,
+    proxyHost: 'proxy.internal:8080',
+    hasCredentials: true,
+  };
+
+  let sessionService: { getProxy: jest.Mock; updateProxy: jest.Mock };
+  let auditService: { logInfo: jest.Mock };
+  let controller: SessionController;
+
+  beforeEach(() => {
+    sessionService = {
+      getProxy: jest.fn().mockResolvedValue(proxyProjection),
+      updateProxy: jest.fn().mockResolvedValue(proxyProjection),
+    };
+    auditService = { logInfo: jest.fn().mockResolvedValue(undefined) };
+    controller = new SessionControllerClass(
+      sessionService as unknown as SessionService,
+      auditService as unknown as AuditService,
+      new ChatScopeService(),
+    );
+  });
+
+  it('getProxy returns the masked projection without proxyUrl', async () => {
+    const result = await controller.getProxy('sess-uuid-1');
+
+    expect(result).toEqual(proxyProjection);
+    expect(result).not.toHaveProperty('proxyUrl');
+  });
+
+  it('updateProxy audits the masked state, not the request body', async () => {
+    await controller.updateProxy('sess-uuid-1', {
+      proxyUrl: 'http://user:secret@proxy.internal:8080',
+    });
+
+    expect(auditService.logInfo).toHaveBeenCalledWith(
+      AuditAction.SESSION_CONFIG_UPDATED,
+      expect.objectContaining({
+        sessionId: 'sess-uuid-1',
+        metadata: {
+          proxyEnabled: true,
+          proxyType: 'http',
+          proxyHost: 'proxy.internal:8080',
+        },
+      }),
+    );
+  });
+});
+
+// GET /sessions/:sessionId/chats is the one list route a chat-restricted key may use, and it must
+// FILTER BEFORE paginating: filtering the page instead hands back a short or empty window while an
+// allowed chat sits just past it.
+describe('SessionController — GET .../chats filters before paginating', () => {
+  const chat = (id: string, timestamp: number): ChatSummary => ({
+    id,
+    name: id,
+    isGroup: id.endsWith('@g.us'),
+    kind: id.endsWith('@g.us') ? 'group' : 'individual',
+    unreadCount: 0,
+    timestamp,
+    archived: false,
+    pinned: false,
+    muted: false,
+  });
+
+  let sessionService: { listChats: jest.Mock };
+  let controller: SessionController;
+
+  beforeEach(() => {
+    sessionService = { listChats: jest.fn() };
+    controller = new SessionControllerClass(
+      sessionService as unknown as SessionService,
+      { logInfo: jest.fn() } as unknown as AuditService,
+      new ChatScopeService(),
+    );
+  });
+
+  it('filters the full list before the window (a page-first filter would return nothing here)', async () => {
+    // The disallowed chat is NEWEST, so a page of 1 taken before filtering would be all-disallowed.
+    sessionService.listChats.mockResolvedValue([chat('999@g.us', 3), chat('123@g.us', 2), chat('123@g.us', 1)]);
+    const apiKey = { allowedChats: ['123@g.us'] } as ApiKey;
+
+    const out = await controller.getChats('sess-uuid-1', apiKey, '1', '0');
+
+    expect(out.map(c => c.id)).toEqual(['123@g.us']);
+  });
+
+  it('passes the whole list through for an unrestricted key', async () => {
+    sessionService.listChats.mockResolvedValue([chat('123@g.us', 3), chat('999@g.us', 2)]);
+    const out = await controller.getChats('sess-uuid-1', { allowedChats: null } as ApiKey, undefined, undefined);
+    expect(out).toHaveLength(2);
   });
 });

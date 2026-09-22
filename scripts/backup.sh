@@ -64,12 +64,30 @@ MEDIA_DIR="$(openwa_resolve STORAGE_LOCAL_PATH "$DATA_DIR/media")"
 # registry and each plugin's ctx.storage below — so an unset PLUGINS_DIR must resolve there
 # too, or the archive silently omits the plugin packages.
 PLUGIN_PACKAGES_DIR="$(openwa_resolve PLUGINS_DIR "$DATA_DIR/plugins")"
-PLUGIN_STATE_DIR="$DATA_DIR/plugins"
+# Plugin registry + every plugin's persisted ctx.storage. The app puts them at <dataDir>/plugins,
+# where dataDir is PLUGIN_STATE_DIR when that is set and ./data otherwise, so the knob has to be
+# resolved here exactly like PLUGINS_DIR above. Hardcoding $DATA_DIR/plugins meant an operator who
+# moved plugin state got an archive with neither the registry nor any plugin's storage in it, and
+# a restore that put nothing back. Resolved under its own name because the knob names the ROOT,
+# not the plugins directory inside it.
+PLUGIN_STATE_ROOT="$(openwa_resolve PLUGIN_STATE_DIR "$DATA_DIR")"
+PLUGIN_STATE_DIR="$PLUGIN_STATE_ROOT/plugins"
 GENERATED_ENV="$DATA_DIR/.env.generated"
 ADMIN_KEY_FILE="$DATA_DIR/.api-key"
 
 log() { echo "[backup] $*"; }
 
+# Check the destination before staging anything. The shipped container's root filesystem is
+# read-only, so the default ./backups (/app/backups) cannot be created there; failing only at the
+# end would first copy every database, session and media file into the staging directory.
+if ! mkdir -p "$BACKUP_DIR" 2>/dev/null || [ ! -w "$BACKUP_DIR" ]; then
+  log "ERROR: BACKUP_DIR=$BACKUP_DIR is not writable; point BACKUP_DIR at a writable, persistent directory (inside the container use BACKUP_DIR=/app/data/backups, and under docker compose also TMPDIR=/app/data/backups: its /tmp is a tmpfs charged to the container's memory)"
+  exit 1
+fi
+
+# The staging copy goes to TMPDIR. Under docker compose that is a tmpfs charged to the container's
+# memory limit, so an in-container run there points TMPDIR at the data volume (docs/11); staging the
+# data in the tmpfs gets the running gateway OOM-killed once the data outgrows its headroom.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -181,7 +199,6 @@ if [ -f "$ADMIN_KEY_FILE" ]; then
   cp -p "$ADMIN_KEY_FILE" "$STAGE/.api-key"
 fi
 
-mkdir -p "$BACKUP_DIR"
 ARCHIVE="$BACKUP_DIR/openwa-backup-$TIMESTAMP.tar.gz"
 tar -czf "$ARCHIVE" -C "$STAGE" .
 

@@ -12,6 +12,8 @@ import { RecipientUnreachableError } from '../../common/errors/recipient-unreach
  * delegate never touches lifecycle state directly.
  */
 export interface BaileysContactsHost {
+  /** This session's egress proxy URL (snapshotted at session start), or undefined when direct. */
+  sessionProxyUrl(): string | undefined;
   ensureReady(): void;
   /** Post-ensureReady socket handle — call host.ensureReady() first. */
   getSocket(): WASocket;
@@ -180,7 +182,7 @@ export class BaileysContacts {
     }
     // updateProfilePicture takes a WAMediaUpload; resolveMediaBuffer covers Buffer | base64 | URL,
     // the same conversion the media sends use.
-    const { data } = await resolveMediaBuffer(media);
+    const { data } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
     await this.confirmed(this.sock().updateProfilePicture(selfJid, data), 'the profile picture change');
   }
 
@@ -355,7 +357,9 @@ export class BaileysContacts {
    * synthesised key, which is what the 1:1 case ran on before.
    */
   private async receiptKeys(chatId: string, messageIds?: string[]): Promise<WAMessageKey[]> {
-    if (messageIds === undefined) {
+    // null as well as undefined: the REST body rejects an explicit null, but this is the engine
+    // boundary and an internal caller reaching it with one used to dereference it below as a 500.
+    if (messageIds === undefined || messageIds === null) {
       const last = this.host.lastMessage(chatId);
       return last ? [last.key] : [];
     }
@@ -364,7 +368,21 @@ export class BaileysContacts {
     }
     const remoteJid = this.host.toEngineJid(chatId);
     const stored = (await this.host.getStoredMessages(messageIds)) ?? [];
-    const keyById = new Map(stored.filter(msg => msg.key?.id).map(msg => [msg.key.id as string, msg.key]));
+    // A stored key is only usable when it belongs to THIS chat. Without the check, an id from
+    // another chat in the same session carried that chat's remoteJid into readMessages, so the
+    // receipt landed there while the route answered success for the chat the caller named.
+    // The comparison runs in the NEUTRAL dialect rather than the engine one: toEngineJid folds
+    // @c.us and @s.whatsapp.net together but returns @lid untouched, and Baileys stores a DM key
+    // under the peer's lid once WhatsApp addresses the chat that way. toNeutralJid resolves that
+    // lid to its phone user-part through the session's lid mapping, so both spellings of one chat
+    // still meet. Anything that still differs falls back to the synthesised key for the ADDRESSED
+    // chat, which is exactly what every id ran on before stored keys existed.
+    const chatKey = this.host.toNeutralJid(chatId);
+    const keyById = new Map(
+      stored
+        .filter(msg => msg.key?.id && msg.key.remoteJid && this.host.toNeutralJid(msg.key.remoteJid) === chatKey)
+        .map(msg => [msg.key.id as string, msg.key]),
+    );
     return messageIds.map(id => keyById.get(id) ?? { remoteJid, id, fromMe: false });
   }
 

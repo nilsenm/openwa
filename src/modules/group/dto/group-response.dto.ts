@@ -224,12 +224,12 @@ export class GroupPictureResponseDto {
 }
 
 export class GroupInviteCodeResponseDto {
-  @ApiProperty({ description: 'The invite code on its own.', example: 'GTvX9c8H8l718ewOH22Zk5' })
+  @ApiProperty({ description: 'The invite code on its own.', example: 'EXAMPLEINVITECODE12345' })
   inviteCode!: string;
 
   @ApiProperty({
     description: 'The same code as a joinable link.',
-    example: 'https://chat.whatsapp.com/GTvX9c8H8l718ewOH22Zk5',
+    example: 'https://chat.whatsapp.com/EXAMPLEINVITECODE12345',
   })
   inviteLink!: string;
 }

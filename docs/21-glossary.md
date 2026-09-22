@@ -28,7 +28,7 @@ Authentication token to access the OpenWA API. Sent via the `X-API-Key` header.
 
 ### Auth State
 
-WhatsApp Web session authentication data. On the whatsapp-web.js engine it is a Chrome profile (cookies, local/session storage) under `SESSION_DATA_PATH` — default `./data/sessions`, one `session-<name>` directory per session. On Baileys it is a set of credential JSON files under `BAILEYS_AUTH_DIR`, default `./data/baileys`. Losing it unlinks the WhatsApp account and requires a fresh QR scan.
+WhatsApp Web session authentication data. On the whatsapp-web.js engine it is a Chrome profile (cookies, local/session storage) under `SESSION_DATA_PATH` — default `./data/sessions`, one `session-<id>` directory per session, named after the session's UUID. On Baileys it is a set of credential JSON files under `BAILEYS_AUTH_DIR`, default `./data/baileys`, one `<id>` directory per session. Losing it unlinks the WhatsApp account and requires a fresh QR scan.
 
 ## B
 
@@ -118,7 +118,7 @@ Browser mode that runs without a GUI. Puppeteer runs Chrome in headless mode.
 
 ### Health Check
 
-Endpoints to check system health: `/api/health` (basic status and running version), `/api/health/live` (liveness) and `/api/health/ready` (readiness — probes both databases, and reports 503 while the process is draining). All three are public and exempt from rate limiting. The `/api` prefix is applied globally with no exclusions, so the unprefixed paths do not exist — container and Kubernetes probes must use the prefixed form.
+Endpoints to check system health: `/api/health` (basic status; the running version is added only for an authenticated caller), `/api/health/live` (liveness) and `/api/health/ready` (readiness — probes both databases, and reports 503 while the process is draining). All three are public and exempt from rate limiting. The `/api` prefix is applied globally with no exclusions, so the unprefixed paths do not exist — container and Kubernetes probes must use the prefixed form.
 
 ### Hook
 

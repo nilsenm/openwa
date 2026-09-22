@@ -1,3 +1,4 @@
+import { LogLevel } from '../common/services/logger.service';
 import { validateEnv } from './env.validation';
 
 /** Regression locks for boot-time env validation (no silent coercion). */
@@ -30,11 +31,46 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: '1bad' })).toThrow(/POSTGRES_SCHEMA/);
     expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'has space' })).toThrow(/POSTGRES_SCHEMA/);
     expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'a.b' })).toThrow(/POSTGRES_SCHEMA/);
-    // reserved pg_ prefix rejected (case-insensitive)
+    // upper case rejected: the unquoted search_path folds it, TypeORM's quoted schema does not
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'OpenWA' })).toThrow(/lower-case/);
+    // reserved pg_ prefix rejected
     expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'pg_catalog' })).toThrow(/POSTGRES_SCHEMA/);
     expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'Pg_temp' })).toThrow(/POSTGRES_SCHEMA/);
+    // surrounding whitespace rejected, not trimmed: the app and the migration CLI use the raw value
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: ' openwa' })).toThrow(/POSTGRES_SCHEMA/);
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: 'openwa ' })).toThrow(/POSTGRES_SCHEMA/);
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: '  ' })).toThrow(/POSTGRES_SCHEMA/);
+    expect(() => validateEnv({ ...pg, POSTGRES_SCHEMA: '' })).not.toThrow();
     // ignored for sqlite: a bogus value must NOT trip when not on postgres
     expect(() => validateEnv({ DATABASE_TYPE: 'sqlite', POSTGRES_SCHEMA: '1bad' })).not.toThrow();
+  });
+
+  /**
+   * The media knobs take RAW numbers while `BODY_SIZE_LIMIT` beside them in .env.example takes a
+   * unit string. Their read sites use `Number.parseInt`, which takes the leading digits and drops
+   * the unit, so `50mb` was accepted as 50: a 50-byte cap, and `30s` a 30 ms timeout. Both are
+   * positive integers, so the "garbage falls back to the default" those helpers promise never
+   * fired. Boot has to be the place this stops.
+   */
+  it('rejects a unit-suffixed media knob instead of reading its leading digits', () => {
+    expect(() => validateEnv({ MEDIA_DOWNLOAD_MAX_BYTES: '50mb' })).toThrow(/MEDIA_DOWNLOAD_MAX_BYTES/);
+    expect(() => validateEnv({ MEDIA_DOWNLOAD_TIMEOUT_MS: '30s' })).toThrow(/MEDIA_DOWNLOAD_TIMEOUT_MS/);
+    expect(() => validateEnv({ CHAT_HISTORY_MEDIA_BUDGET_BYTES: '25mb' })).toThrow(/CHAT_HISTORY_MEDIA_BUDGET_BYTES/);
+    expect(() => validateEnv({ INBOUND_MEDIA_CONCURRENCY: '4x' })).toThrow(/INBOUND_MEDIA_CONCURRENCY/);
+  });
+
+  it('rejects a non-positive media knob and accepts a plain byte count', () => {
+    expect(() => validateEnv({ MEDIA_DOWNLOAD_MAX_BYTES: '0' })).toThrow(/MEDIA_DOWNLOAD_MAX_BYTES/);
+    expect(() => validateEnv({ MEDIA_DOWNLOAD_MAX_BYTES: '-1' })).toThrow(/MEDIA_DOWNLOAD_MAX_BYTES/);
+    expect(() => validateEnv({ INBOUND_MEDIA_CONCURRENCY: 'abc' })).toThrow(/INBOUND_MEDIA_CONCURRENCY/);
+    expect(() => validateEnv({ MEDIA_DOWNLOAD_MAX_BYTES: '52428800' })).not.toThrow();
+    expect(() => validateEnv({ MEDIA_DOWNLOAD_TIMEOUT_MS: '30000' })).not.toThrow();
+  });
+
+  // Unset and empty stay the operator's way of taking the default; compose forwards a blank.
+  it('leaves an unset or blank media knob alone', () => {
+    expect(() => validateEnv({})).not.toThrow();
+    expect(() => validateEnv({ MEDIA_DOWNLOAD_MAX_BYTES: '', MEDIA_DOWNLOAD_TIMEOUT_MS: '   ' })).not.toThrow();
   });
 
   it('rejects a non-integer / out-of-range port', () => {
@@ -287,6 +323,31 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ SEARCH_PROVIDER: 'none' })).not.toThrow();
     // Unset is accepted (the configuration default of 'auto' applies downstream).
     expect(() => validateEnv({})).not.toThrow();
+  });
+
+  it('rejects a LOG_LEVEL misspelling instead of silently logging at info', () => {
+    // Plausible spellings from neighbouring vocabularies that this repo's LogLevel does not carry;
+    // every one of them silently meant INFO before this check existed.
+    expect(() => validateEnv({ LOG_LEVEL: 'warning' })).toThrow(/LOG_LEVEL/);
+    expect(() => validateEnv({ LOG_LEVEL: 'log' })).toThrow(/LOG_LEVEL/); // Nest's spelling
+    expect(() => validateEnv({ LOG_LEVEL: 'trace' })).toThrow(/LOG_LEVEL/); // Baileys' vocabulary
+    // The reader (main.ts) trims and lowercases before matching, so these keep booting.
+    expect(() => validateEnv({ LOG_LEVEL: 'DEBUG' })).not.toThrow();
+    expect(() => validateEnv({ LOG_LEVEL: ' warn ' })).not.toThrow();
+    // Unset means INFO and passes.
+    expect(() => validateEnv({})).not.toThrow();
+  });
+
+  it('accepts exactly the LogLevel values main.ts applies, no more and no fewer', () => {
+    // env.validation.ts keeps its own copy of the level list while main.ts matches against the enum.
+    // The rejection message prints that copy, so comparing it with the enum catches drift either way.
+    const levels: string[] = Object.values(LogLevel);
+    for (const level of levels) {
+      expect(() => validateEnv({ LOG_LEVEL: level })).not.toThrow();
+    }
+    expect(() => validateEnv({ LOG_LEVEL: 'nope' })).toThrow(
+      `LOG_LEVEL must be one of ${levels.map(v => `"${v}"`).join(', ')} (got "nope")`,
+    );
   });
 
   it('rejects a sqlite data DB path that collides with the internal main database file', () => {

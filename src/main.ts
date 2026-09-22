@@ -28,6 +28,7 @@ import { AuthService } from './modules/auth/auth.service';
 import { AuditService } from './modules/audit/audit.service';
 import { Request, Response, NextFunction } from 'express';
 import { RedisIoAdapter } from './modules/events/redis-io.adapter';
+import { prestartBuiltinDatabase } from './modules/docker/docker.service';
 
 // The created app, exposed at module scope so the fatal handler below can run a best-effort teardown
 // (engine sessions, Redis/pg) when bootstrap fails AFTER NestFactory.create succeeded — notably a
@@ -35,7 +36,9 @@ import { RedisIoAdapter } from './modules/events/redis-io.adapter';
 let appInstance: INestApplication | undefined;
 
 async function bootstrap() {
-  // Apply the operator-configured log verbosity (LOG_LEVEL) before anything logs. Unset/invalid → INFO.
+  // Apply the operator-configured log verbosity (LOG_LEVEL) before anything logs. Unset means INFO.
+  // A misspelling is skipped here; env.validation.ts rejects it and the boot fails inside
+  // NestFactory.create.
   const requestedLevel = process.env.LOG_LEVEL?.trim().toLowerCase();
   if (requestedLevel && (Object.values(LogLevel) as string[]).includes(requestedLevel)) {
     LoggerService.setLogLevel(requestedLevel as LogLevel);
@@ -99,6 +102,10 @@ async function bootstrap() {
     configured: process.env.STORAGE_LOCAL_PATH,
     logger: bootstrapLogger,
   });
+
+  // The data connection dials PostgreSQL inside NestFactory.create, so a stopped built-in container
+  // must be started before it, not from DockerService.onModuleInit (see the helper).
+  await prestartBuiltinDatabase();
 
   // Disable Nest's default body parser so we can set an explicit size cap below.
   const app = await NestFactory.create(AppModule, { bodyParser: false });
@@ -240,11 +247,13 @@ async function bootstrap() {
 }
 
 // A failed bootstrap MUST terminate the process with a non-zero code, not just set `process.exitCode`:
-// listen() runs the FULL init (sessions, Redis, pg, Chromium) before binding the port, so a bind failure
-// (EADDRINUSE) would otherwise leave a zombie process — no HTTP port, yet still holding the event loop
-// open and running WhatsApp sessions, invisible to Docker's restart policy. runBootstrapOrExit logs the
-// failure, runs a bounded best-effort app.close() teardown, then exits(1); a successful boot returns
-// without touching exit. Puppeteer's own `exit` handlers kill any browser children still up.
+// listen() runs the full module init (database, Redis, plugin registration) before binding the port, and
+// the detached session auto-start (SessionService.onApplicationBootstrap) is already launching engines by
+// then, so a bind failure (EADDRINUSE) would otherwise leave a zombie process: no HTTP port, yet still
+// holding the event loop open and running WhatsApp sessions, invisible to Docker's restart policy.
+// runBootstrapOrExit logs the failure, runs a bounded best-effort app.close() teardown, then exits(1); a
+// successful boot returns without touching exit. Puppeteer's own `exit` handlers kill any browser
+// children still up.
 void runBootstrapOrExit(bootstrap, {
   logger: createLogger('Bootstrap'),
   closeApp: () => (appInstance ? appInstance.close() : Promise.resolve()),

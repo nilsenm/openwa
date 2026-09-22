@@ -10,8 +10,9 @@ import type { HandoverState } from '../../modules/integration/entities/conversat
  * call, plus one for the automation reply path. Deliberately not whole-service mirrors: a reviewer
  * reads here what the plugin runtime can reach, nothing more.
  *
- * The module that owns each service binds it to the port's token with an adapter provider
- * (a `useFactory` closing over the real service). Core resolves the TOKEN at call time via
+ * The module that owns each service binds it to the port's token with a `useExisting` alias (an
+ * alias, not a factory returning the instance: Nest runs lifecycle hooks once per non-alias
+ * provider, so a factory doubled the service's hooks). Core resolves the TOKEN at call time via
  * `ModuleRef.get(..., { strict: false })` — never the service class — so the deferral that breaks
  * the plugin provider cycle stays, while core/plugins itself imports no feature-module value and
  * the old lazy `require(...)` of feature-module paths is gone entirely.

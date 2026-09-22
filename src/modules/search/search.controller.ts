@@ -5,6 +5,7 @@ import { RequireRole, CurrentApiKey } from '../auth/decorators/auth.decorators';
 import { ApiKey, ApiKeyRole } from '../auth/entities/api-key.entity';
 import { SearchService } from './search.service';
 import { SearchQueryDto } from './dto/search-query.dto';
+import { SEARCH_OFFSET_MAX } from './search.constants';
 import type { SearchResults } from './search.types';
 
 @ApiTags('search')
@@ -18,6 +19,18 @@ export class SearchController {
   @ApiResponse({ status: 200, description: 'Search results from the active provider', type: SearchResultsResponseDto })
   @ApiResponse({ status: 400, description: 'Empty or whitespace-only "q"' })
   @ApiResponse({ status: 501, description: 'No search provider configured' })
+  @ApiResponse({
+    status: 502,
+    description:
+      'The active plugin search provider returned a result shape that failed validation, so nothing ' +
+      'trustworthy could be forwarded. The built-in provider never returns this.',
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      'The active plugin search provider did not answer: its worker is not running, timed out, or reported ' +
+      'a failure. The built-in provider never returns this. Retryable.',
+  })
   @ApiQuery({ name: 'q', required: true, description: 'Search term (required, non-empty)' })
   @ApiQuery({ name: 'sessionId', required: false, description: 'Restrict to a single session' })
   @ApiQuery({ name: 'chatId', required: false, description: 'Restrict to a single chat id' })
@@ -27,7 +40,12 @@ export class SearchController {
   @ApiQuery({ name: 'dateFrom', required: false, description: 'Epoch-ms lower bound (inclusive)' })
   @ApiQuery({ name: 'dateTo', required: false, description: 'Epoch-ms upper bound (inclusive)' })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Max hits to return' })
-  @ApiQuery({ name: 'offset', required: false, type: Number, description: 'Pagination offset' })
+  @ApiQuery({
+    name: 'offset',
+    required: false,
+    type: Number,
+    description: `Pagination offset, at most ${SEARCH_OFFSET_MAX}`,
+  })
   async search(@Query() dto: SearchQueryDto, @CurrentApiKey() apiKey?: ApiKey): Promise<SearchResults> {
     if (!dto.q || !dto.q.trim()) {
       throw new BadRequestException('Query parameter "q" is required and must be non-empty.');

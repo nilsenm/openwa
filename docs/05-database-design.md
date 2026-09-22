@@ -79,20 +79,20 @@ The main DB is unconditionally SQLite, but its _path_ is not fixed: `MAIN_DATABA
 
 #### Built-in PostgreSQL Orchestration
 
-When using PostgreSQL Built-in mode (`POSTGRES_BUILTIN=true`), `DockerService.onModuleInit()` runs a bootstrap orchestration that starts the managed `postgres` container (alongside `redis` / `minio` when their own `REDIS_BUILTIN` / `MINIO_BUILTIN` flags are set). This happens **during** Nest module initialization, not before it — there is no pre-bootstrap step in `main.ts`.
+When using PostgreSQL Built-in mode (`DATABASE_TYPE=postgres` with `POSTGRES_BUILTIN=true`), `main.ts` starts the managed `postgres` container (creating it if it does not exist) **before** `NestFactory.create`. It has to run that early: the `data` connection is opened while Nest instantiates providers, before any `onModuleInit` hook, so a stopped `openwa-postgres` would otherwise fail every boot. The step is bounded at 15 seconds and never fails boot on its own. `DockerService.onModuleInit()` later runs the same orchestration for `redis` / `minio` when their own `REDIS_BUILTIN` / `MINIO_BUILTIN` flags are set.
 
-Because the container can therefore still be coming up when the `data` connection first dials it, that connection is configured with `retryAttempts: 10` and `retryDelay: 3000` (`src/app.module.ts`), giving the database roughly 30 seconds to become reachable.
+The container can still be coming up when the `data` connection first dials it, so that connection is configured with `retryAttempts: 10` and `retryDelay: 3000` (`src/app.module.ts`), giving the database roughly 30 seconds to become reachable.
 
 > [!NOTE]
-> If the Docker API is unreachable, orchestration logs a warning and is skipped — no container is started, and the `data` connection then fails its retries against whatever `DATABASE_HOST` points at.
+> If the Docker API is unreachable, the start is skipped with a warning: no container is started, and the `data` connection then fails its retries against whatever `DATABASE_HOST` points at. Start the container by hand (`docker start openwa-postgres`) and restart OpenWA.
 
 #### PostgreSQL Schema Selection
 
 When using PostgreSQL, OpenWA can place its tables and migration ledger in a dedicated schema via the `POSTGRES_SCHEMA` environment variable:
 
-| Setting           | Default  | Description                                                      |
-| ----------------- | -------- | ---------------------------------------------------------------- |
-| `POSTGRES_SCHEMA` | `public` | PostgreSQL schema for OpenWA tables and TypeORM migration ledger |
+| Setting           | Default  | Description                                                                                                   |
+| ----------------- | -------- | ------------------------------------------------------------------------------------------------------------- |
+| `POSTGRES_SCHEMA` | `public` | PostgreSQL schema for OpenWA tables and TypeORM migration ledger (lower-case letters, digits and underscores) |
 
 **Use Cases:**
 
@@ -170,6 +170,20 @@ connectedAt: Date | null;
 > [!NOTE]
 > Main DB entities (api_keys, audit_logs) use native SQLite `datetime` type since they always remain in SQLite.
 
+#### Timestamps on PostgreSQL are UTC
+
+Every timestamp column on the PostgreSQL data connection is `timestamp without time zone`, which stores no zone: the value means whatever the writer intended. OpenWA pins that meaning to **UTC**, on the connection rather than on the deployment (`src/database/postgres-utc.ts`):
+
+- a JS `Date` parameter is bound as UTC (`parseInputDatesAsUTC`), so an app-written column such as `sessions.connectedAt` holds UTC wall-clock time whatever zone the host runs in;
+- a naive timestamp is parsed back as UTC, through a parser registered for the scalar `timestamp` OID only (the `timestamp[]` OID keeps the driver's array parser; the schema has no such column);
+- every pooled connection issues `SET TIME ZONE 'UTC'` on connect, through the pool's own connect hook so that a socket failure or a refused statement fails the acquire instead of the process. That is what makes the server-side `DEFAULT now()` behind each `@CreateDateColumn`/`@UpdateDateColumn` write UTC too. Boot reads the effective `TimeZone` back, at two instants six months apart so a zone that merely reads +00 in winter is caught, and fails if it is not UTC; a pin that a pooler or a server-side default overrode cannot pass unnoticed.
+
+Three `@CreateDateColumn`/`@UpdateDateColumn` columns are filled by the app rather than by that default: `lid_mappings.updatedAt`, `chat_states.updatedAt` and `baileys_stored_messages.createdAt` reach the database through an `upsert` that passes the value, so the default behind them never fires and they follow the binding rule above instead of the session zone.
+
+`messages.createdAt` is a fourth, and split within itself: a live message takes the server default, while a row written by the Baileys history backfill carries the message's own time, stamped in `message-history-projector.ts` so the chat panel orders history correctly. Both conventions are UTC from this release on, and the two cannot be told apart row by row, which is why the upgrade notes exclude that column from any blanket conversion. A restore writes `createdAt`/`updatedAt` explicitly wherever the archive carries them, so a restored table follows the archive rather than either rule above; the upgrade notes cover that case separately.
+
+Comparisons therefore mean the same thing on both dialects: a retention `LessThan(cutoff)`, a lease deadline written by another node, and a backup restored from any host all line up. SQLite is unaffected; it already stores ISO text in UTC.
+
 ## 5.2 Entity Relationship Diagram
 
 ```mermaid
@@ -239,6 +253,7 @@ erDiagram
         varchar role
         simple_array allowedIps
         simple_array allowedSessions
+        simple_array allowedChats
         boolean isActive
         timestamp expiresAt
         timestamp lastUsedAt
@@ -294,16 +309,16 @@ CREATE TABLE sessions (
     config JSONB NOT NULL DEFAULT '{}',
     "proxyUrl" VARCHAR(255),
     "proxyType" VARCHAR(10),
-    "connectedAt" TIMESTAMP WITH TIME ZONE,
-    "lastActiveAt" TIMESTAMP WITH TIME ZONE,
+    "connectedAt" TIMESTAMP,
+    "lastActiveAt" TIMESTAMP,
     -- Session ownership / multi-node routing: which process runs the engine, since when, where it
     -- answers HTTP for peers, and how long its claim survives unrenewed. All NULL on a single node.
     "nodeId" VARCHAR(190),
-    "claimedAt" TIMESTAMP WITH TIME ZONE,
+    "claimedAt" TIMESTAMP,
     "nodeUrl" VARCHAR(2048),
-    "leaseExpiresAt" TIMESTAMP WITH TIME ZONE,
-    "createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    "updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    "leaseExpiresAt" TIMESTAMP,
+    "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+    "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
 );
 ```
 
@@ -361,11 +376,11 @@ clears it, and so does a gateway restart.
 }
 ```
 
-| Key                    | Default   | Effect                                                                   |
-| ---------------------- | --------- | ------------------------------------------------------------------------ |
-| `maxReconnectAttempts` | unlimited | Reconnect attempt cap, clamped to 0–20 (`0` disables reconnect entirely) |
-| `reconnectBaseDelay`   | `5000` ms | Base delay of the reconnect backoff, clamped to 1000–300000 ms           |
-| `autoRejectCalls`      | `false`   | Auto-reject an incoming call as soon as it rings                         |
+| Key                    | Default   | Effect                                                                                                                                                                                                 |
+| ---------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `maxReconnectAttempts` | unlimited | Reconnect attempt cap, clamped to 0-20 (`0` disables reconnect entirely). Bounds the gateway's own reconnect: every reconnect on whatsapp-web.js, and on Baileys only the one after a logged-out close |
+| `reconnectBaseDelay`   | `5000` ms | Base delay of the reconnect backoff, clamped to 1000-300000 ms. Same engine scope as `maxReconnectAttempts`                                                                                            |
+| `autoRejectCalls`      | `false`   | Auto-reject an incoming call as soon as it rings (Baileys only)                                                                                                                                        |
 
 Set them at creation with `POST /api/sessions`, or on an existing session with
 `PATCH /api/sessions/{sessionId}/config` — no restart, and no re-scan of the QR. The patch merges, so a key
@@ -528,6 +543,7 @@ CREATE TABLE api_keys (
     role VARCHAR(20) NOT NULL DEFAULT 'operator',  -- admin | operator | viewer
     "allowedIps" TEXT,                             -- simple-array (comma-joined), null = any IP
     "allowedSessions" TEXT,                        -- simple-array, null = all sessions
+    "allowedChats" TEXT,                           -- simple-array, null = all chats
     "isActive" BOOLEAN NOT NULL DEFAULT 1,
     "expiresAt" DATETIME,
     "lastUsedAt" DATETIME,
@@ -540,7 +556,7 @@ CREATE UNIQUE INDEX "IDX_df3b25181df0b4b59bd93f16e1" ON api_keys("keyHash");
 ```
 
 > [!NOTE]
-> Access control is **role-based** (`admin` / `operator` / `viewer`), optionally scoped by `allowedIps` and `allowedSessions`. There is no granular `permissions` string array — see [04 - Security Design](./04-security-design.md) for what each role can do.
+> Access control is **role-based** (`admin` / `operator` / `viewer`), optionally scoped by `allowedIps`, `allowedSessions` and `allowedChats`. There is no granular `permissions` string array — see [04 - Security Design](./04-security-design.md) for what each role can do.
 
 ---
 

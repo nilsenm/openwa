@@ -99,6 +99,11 @@ type SendTemplateRequest struct {
 	TemplateID   string            `json:"templateId,omitempty"`
 	TemplateName string            `json:"templateName,omitempty"`
 	Vars         map[string]string `json:"vars,omitempty"`
+	// Mentions lists WIDs to @mention in the rendered body, which must carry the @<number> token.
+	Mentions []string `json:"mentions,omitempty"`
+	// LinkPreview controls the URL preview on the rendered body, with the same engine split as
+	// SendTextRequest. A pointer so an explicit false is distinguishable from "not set".
+	LinkPreview *bool `json:"linkPreview,omitempty"`
 }
 
 // SendPollRequest sends a native WhatsApp poll. Options holds the choices to
@@ -121,6 +126,16 @@ type ReplyMessageRequest struct {
 	ChatID          string `json:"chatId"`
 	QuotedMessageID string `json:"quotedMessageId"`
 	Text            string `json:"text"`
+	// Mentions lists WIDs to @mention. The text must also contain the @<number> token.
+	Mentions []string `json:"mentions,omitempty"`
+}
+
+// ClickButtonRequest taps a choice on a WhatsApp Business prompt. Baileys only.
+type ClickButtonRequest struct {
+	ChatID    string `json:"chatId"`
+	MessageID string `json:"messageId"`
+	ButtonID  string `json:"buttonId"`
+	Text      string `json:"text,omitempty"`
 }
 
 // ForwardMessageRequest forwards a message between chats.
@@ -151,6 +166,9 @@ type EditMessageRequest struct {
 	ChatID    string `json:"chatId"`
 	MessageID string `json:"messageId"`
 	Body      string `json:"body"`
+	// Mentions re-applies participant tags: an edit REPLACES the body rather than amending it, so
+	// tags the original carried are lost unless resent.
+	Mentions []string `json:"mentions,omitempty"`
 }
 
 // ListMessagesQuery filters GET /sessions/:id/messages.
@@ -159,6 +177,12 @@ type ListMessagesQuery struct {
 	From   *string
 	Limit  *int
 	Offset *int
+	// After is a keyset cursor: the id of the last message of the previous page. Takes
+	// precedence over Offset.
+	After *string
+	// InlineMedia set to false omits inline media payloads. The budget is per response, so a
+	// walk repays it on every page.
+	InlineMedia *bool
 }
 
 func (q *ListMessagesQuery) values() url.Values {
@@ -167,6 +191,8 @@ func (q *ListMessagesQuery) values() url.Values {
 	setStr(v, "from", q.From)
 	setInt(v, "limit", q.Limit)
 	setInt(v, "offset", q.Offset)
+	setStr(v, "after", q.After)
+	setBool(v, "inlineMedia", q.InlineMedia)
 	return v
 }
 
@@ -275,6 +301,24 @@ type ChatHistoryMessage struct {
 	Media         *ChatHistoryMedia `json:"media,omitempty"`
 	QuotedMessage *QuotedMessage    `json:"quotedMessage,omitempty"`
 	Location      *MessageLocation  `json:"location,omitempty"`
+	Order         *MessageOrder     `json:"order,omitempty"`
+	Product       *MessageProduct   `json:"product,omitempty"`
+}
+
+// MessageOrder is the order block on a live history message, present on order messages only: the
+// cart the customer placed from the business catalog, plus the single-order token for its items.
+type MessageOrder struct {
+	OrderID string `json:"orderId"`
+	Token   string `json:"token,omitempty"`
+}
+
+// MessageProduct is the product block on a live history message, present on product messages only:
+// the catalog product shared into the chat.
+type MessageProduct struct {
+	ProductID        string `json:"productId"`
+	Title            string `json:"title,omitempty"`
+	Description      string `json:"description,omitempty"`
+	BusinessOwnerJID string `json:"businessOwnerJid,omitempty"`
 }
 
 // MessageCall is the call block on a live history message, present on call messages only.
@@ -283,8 +327,9 @@ type MessageCall struct {
 	Missed bool `json:"missed"`
 }
 
-// MessageContact is the sender contact block on a live history message. History carries PushName
-// only; the richer fields arrive on message.received when WEBHOOK_CONTACT_DETAILS is enabled.
+// MessageContact is the sender contact block on a live history message. History carries Name and
+// PushName; the richer fields are added when WEBHOOK_CONTACT_DETAILS is enabled, as on
+// message.received.
 type MessageContact struct {
 	ID           string `json:"id,omitempty"`
 	Number       string `json:"number,omitempty"`
@@ -340,6 +385,9 @@ type BulkMessageContent struct {
 	Audio    *BulkMediaContent `json:"audio,omitempty"`
 	Document *BulkMediaContent `json:"document,omitempty"`
 	Caption  string            `json:"caption,omitempty"`
+	// Mentions is per item: a batch fans out to many chats, and a WID is only taggable in a chat
+	// the participant is in.
+	Mentions []string `json:"mentions,omitempty"`
 }
 
 // BulkMessageItem is one message in a bulk send. Type is one of: text, image,
@@ -417,6 +465,8 @@ const (
 	MsgPoll     MessageType = "poll"
 	MsgCall     MessageType = "call"
 	MsgRevoked  MessageType = "revoked"
+	MsgOrder    MessageType = "order"
+	MsgProduct  MessageType = "product"
 	MsgMasked   MessageType = "masked"
 	MsgUnknown  MessageType = "unknown"
 )

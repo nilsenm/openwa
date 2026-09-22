@@ -79,7 +79,14 @@ MEDIA_DIR="$(openwa_resolve STORAGE_LOCAL_PATH "$DATA_DIR/media")"
 # registry and each plugin's ctx.storage below — so an unset PLUGINS_DIR must resolve there
 # too, or the archive silently omits the plugin packages.
 PLUGIN_PACKAGES_DIR="$(openwa_resolve PLUGINS_DIR "$DATA_DIR/plugins")"
-PLUGIN_STATE_DIR="$DATA_DIR/plugins"
+# Plugin registry + every plugin's persisted ctx.storage. The app puts them at <dataDir>/plugins,
+# where dataDir is PLUGIN_STATE_DIR when that is set and ./data otherwise, so the knob has to be
+# resolved here exactly like PLUGINS_DIR above. Hardcoding $DATA_DIR/plugins meant an operator who
+# moved plugin state got an archive with neither the registry nor any plugin's storage in it, and
+# a restore that put nothing back. Resolved under its own name because the knob names the ROOT,
+# not the plugins directory inside it.
+PLUGIN_STATE_ROOT="$(openwa_resolve PLUGIN_STATE_DIR "$DATA_DIR")"
+PLUGIN_STATE_DIR="$PLUGIN_STATE_ROOT/plugins"
 RESTORE_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 RESOLVED_CWD="$(pwd -P)"
 
@@ -194,12 +201,21 @@ snapshot_external_db() {
 # the target it is guarding; a missing file — or one with no tables yet, as a
 # fresh install leaves behind — is safe to restore over. Without the CLI there is no way to prove
 # the file empty, so any non-empty target counts as live rather than guessed safe.
+# sqlite3 applies the operator's rc file even to a one-shot query, and .headers on or another output
+# mode turns the count into text, so the probe loads no rc file. Anything but a bare count still
+# means the probe did not answer, which counts as live like a probe that failed outright.
 db_appears_live() {
   target="$1"
   [ -f "$target" ] || return 1
   if command -v sqlite3 >/dev/null 2>&1; then
-    tables="$(sqlite3 -readonly "$target" "SELECT count(*) FROM sqlite_master;" 2>/dev/null)" || return 0
-    [ "${tables:-0}" -gt 0 ]
+    tables="$(sqlite3 -batch -noheader -list -init /dev/null -readonly "$target" \
+      "SELECT count(*) FROM sqlite_master;" 2>/dev/null)" || return 0
+    case "$tables" in
+      '' | *[!0-9]*)
+        return 0
+        ;;
+    esac
+    [ "$tables" -gt 0 ]
   else
     [ -s "$target" ]
   fi

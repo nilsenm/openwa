@@ -18,6 +18,7 @@ from ..types import (
     DeleteChatRequest,
     MarkChatReadRequest,
     MarkChatRequest,
+    SubscribePresenceRequest,
     SendChatStateRequest,
     SuccessResult,
 )
@@ -38,7 +39,7 @@ class ChatsResource:
     def list(self, session_id: str, query: ListChatsQuery | None = None) -> list[ChatSummary]:
         return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/chats", query=query)
 
-    def subscribe_presence(self, session_id: str, body: MarkChatRequest) -> SuccessResult:
+    def subscribe_presence(self, session_id: str, body: SubscribePresenceRequest) -> SuccessResult:
         """Subscribe to a chat's presence; updates arrive as presence.update events.
 
         Presence cannot be fetched from either engine, only received. The subscription belongs to

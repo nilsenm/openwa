@@ -94,6 +94,13 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
       const rows = await this.outbox.findStale(new Date(now.getTime() - opts.graceMs), opts.batchSize);
       stats.scanned = rows.length;
       for (const row of rows) {
+        if (this.delivery.isLocallyPending(row.idempotencyKey)) {
+          // Still owned by a dispatch on this node (parked in the limiter or mid retry loop), so it
+          // is slow rather than stranded. Replaying it would POST alongside the original and outside
+          // the dispatch concurrency bound, and would spend its budget while it is still running.
+          stats.skipped++;
+          continue;
+        }
         if (row.attempts >= opts.maxAttempts) {
           // Budget spent: stop replaying and leave the failure row as the recovery path.
           await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
@@ -108,13 +115,37 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
           stats.skipped++;
           continue;
         }
-        await this.outbox.countAttempt(row.id, row.attempts);
+        if (!(await this.outbox.countAttempt(row.id, row.attempts))) {
+          // Settled since the batch was read, typically a local dispatch that finished while an
+          // earlier row in this pass was replaying. The copy in hand is stale; replaying it duplicates.
+          stats.skipped++;
+          continue;
+        }
         try {
-          await this.delivery.redeliver(webhook, row.sessionId, row.event, row.idempotencyKey, row.payload);
+          // The outcome is a RETURN VALUE, not an exception. Every delivery failure is handled in
+          // place (dead-letter row, hook, log), so redeliver resolves either way and a catch here
+          // would see nothing: retiring on resolve alone marked dead-lettered events 'dispatched'
+          // and nulled their payload, spending the whole budget on one sweep.
+          const outcome = await this.delivery.redeliver(
+            webhook,
+            row.sessionId,
+            row.event,
+            row.idempotencyKey,
+            row.payload,
+          );
+          if (outcome === 'failed') {
+            // Left 'pending' on purpose: the next sweep retries it until the budget is spent.
+            this.logger.warn(`Replay of ${row.event} to webhook ${row.webhookId} did not deliver`);
+            stats.failed++;
+            continue;
+          }
+          // 'delivered', 'enqueued' and 'cancelled' all retire the row: the delivery either reached a
+          // durable owner or a plugin dropped it on purpose. Only 'failed' is worth another sweep.
           await this.outbox.close(row.webhookId, row.idempotencyKey, 'dispatched');
           stats.replayed++;
         } catch (error) {
-          // Left 'pending' on purpose: the next sweep retries it until the budget is spent.
+          // An exception is an unexpected fault rather than a delivery failure; the row stays
+          // pending either way.
           this.logger.warn(`Replay of ${row.event} to webhook ${row.webhookId} failed: ${String(error)}`);
           stats.failed++;
         }

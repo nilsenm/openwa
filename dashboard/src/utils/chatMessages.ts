@@ -25,11 +25,17 @@ export function mapEngineHistoryMessage(h: EngineHistoryMessage): ChatMessage {
     status: 'read',
     timestamp: h.timestamp,
     createdAt: new Date((h.timestamp ?? 0) * 1000).toISOString(),
-    metadata: h.media
-      ? { media: h.media }
-      : HISTORY_MEDIA_TYPES.has(h.type)
-        ? { media: { mimetype: '', omitted: true } }
-        : undefined,
+    metadata: (() => {
+      const metadata: ChatMessageView['metadata'] = {};
+      if (h.media) {
+        metadata.media = h.media;
+      } else if (HISTORY_MEDIA_TYPES.has(h.type)) {
+        metadata.media = { mimetype: '', omitted: true };
+      }
+      if (h.quotedMessage) metadata.quotedMessage = h.quotedMessage;
+      if (h.call) metadata.call = h.call;
+      return Object.keys(metadata).length > 0 ? metadata : undefined;
+    })(),
   };
 }
 
@@ -65,9 +71,11 @@ export function mergeChatMessages(db: ChatMessage[], history: ChatMessage[]): Ch
  * renderable (thread + lightbox). Count-based (not byte-based): payloads are bounded upstream
  * by the backend's media size cap.
  *
- * The cap must cover the fetch window: useChatMessages loads a 100-message slice with media, so a
- * smaller cap strips payloads INSIDE the window the user can scroll to — and with staleTime:
- * Infinity there is no refetch path, leaving a dead-end 📎 placeholder for media that was fetched.
+ * The cap bounds the RENDERED set, not the fetch window: useChatMessages pages, so a thread scrolled
+ * back far enough holds several 100-row pages and the older payloads inside the scrollable window
+ * fall back to the 📎 placeholder, whose download button still works. Do not scale `keep` with the
+ * page count to close that gap — the rendered set is exactly where a payload costs a second `data:`
+ * URI copy and a decoded bitmap, so scaling removes the bound this exists to enforce.
  */
 export const MEDIA_PAYLOAD_CACHE_LIMIT = 100;
 
@@ -127,7 +135,29 @@ export interface ChatMessageView extends ChatMessage {
     quotedMessage?: { id: string; body: string };
     reactions?: Record<string, string>;
     call?: { video: boolean; missed: boolean };
+    buttons?: Array<{ id: string; text: string }>;
   };
+}
+
+/**
+ * Metadata for a live `message.received` / `message.sent` WS payload. Prompt `buttons` arrive
+ * top-level on that event (the history route never populates them) and are folded here so the
+ * thread renders from `metadata.buttons`, matching persisted DB rows.
+ */
+export function liveMessageMetadata(msg: {
+  media?: MessageMedia;
+  quotedMessage?: { id: string; body: string };
+  call?: { video: boolean; missed: boolean };
+  buttons?: Array<{ id: string; text: string }>;
+  metadata?: ChatMessageView['metadata'];
+}): ChatMessageView['metadata'] {
+  if (msg.metadata) return msg.metadata;
+  const metadata: NonNullable<ChatMessageView['metadata']> = {};
+  if (msg.media) metadata.media = msg.media;
+  if (msg.quotedMessage) metadata.quotedMessage = msg.quotedMessage;
+  if (msg.call) metadata.call = msg.call;
+  if (msg.buttons?.length) metadata.buttons = msg.buttons;
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 // Delivery ticks only ADVANCE, never regress. Live websocket events (incl. a replayed message.sent on
@@ -195,6 +225,8 @@ function mergeMessageMetadata(
   if (reactions) merged.reactions = reactions;
   const call = incoming.call ?? existing.call;
   if (call) merged.call = call;
+  const buttons = incoming.buttons ?? existing.buttons;
+  if (buttons?.length) merged.buttons = buttons;
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
@@ -207,6 +239,9 @@ function mergeMessageMetadata(
  * the existing media/quote — see mergeMessageMetadata). The result is run through capMediaPayloads
  * so a long session of incoming media can't grow the cached slice's base64 heap without bound.
  * Returns a new array — does not mutate the input.
+ *
+ * Requires an ASCENDING (oldest-first) `list` — the cap strips from the front, so a caller holding
+ * a `createdAt DESC` page would need to reverse it first, not call this directly on server order.
  */
 export function mergeOrAppend(list: ChatMessageView[], incoming: ChatMessageView): ChatMessageView[] {
   const idx = list.findIndex(m => msgKey(m) === msgKey(incoming));
@@ -246,6 +281,35 @@ export function removeMessageById(list: ChatMessageView[], id: string): ChatMess
   return list.filter(m => m.id !== id);
 }
 
+/** Does this row carry the given WhatsApp identity, under either of the two ids it can be keyed by? */
+export const byMessageId =
+  (messageId: string) =>
+  (m: ChatMessageView): boolean =>
+    m.id === messageId || m.waMessageId === messageId;
+
+/**
+ * Patch every row a WhatsApp identity names, leaving the array untouched when none match.
+ *
+ * Every match is patched, not just the first: a paged cache can hold the persisted row and its live
+ * copy on different pages (see findRevokedIndex for why the two are keyed differently), and
+ * patching only the one the merged view preferred would leave the other stale.
+ */
+export function patchMatchingMessage(
+  list: ChatMessageView[],
+  messageId: string,
+  patch: (message: ChatMessageView) => ChatMessageView,
+): ChatMessageView[] {
+  const isMatch = byMessageId(messageId);
+  let changed = false;
+  const next = list.map(m => {
+    if (!isMatch(m)) return m;
+    const patched = patch(m);
+    if (patched !== m) changed = true;
+    return patched;
+  });
+  return changed ? next : list;
+}
+
 /**
  * Locate the message a `message.revoked` event refers to. Returns -1 if it isn't cached.
  *
@@ -262,21 +326,22 @@ export function removeMessageById(list: ChatMessageView[], id: string): ChatMess
  * whose `waMessageId` is also undefined.
  */
 export function findRevokedIndex(list: ChatMessageView[], event: { id: string; revokedId?: string }): number {
-  const matches = (m: ChatMessageView, candidate: string): boolean => m.id === candidate || m.waMessageId === candidate;
-  return list.findIndex(m => matches(m, event.id) || (event.revokedId !== undefined && matches(m, event.revokedId)));
+  const byId = byMessageId(event.id);
+  const byRevokedId = event.revokedId !== undefined ? byMessageId(event.revokedId) : undefined;
+  return list.findIndex(m => byId(m) || (byRevokedId?.(m) ?? false));
 }
 
 /**
- * Replace the displayed body of a cached WhatsApp message after a `message.edited` event. Persisted
- * rows use a local UUID in `id` and the WhatsApp identity in `waMessageId`; live rows often use the
- * WhatsApp identity for both, so both candidates are required. Returns the original array on a miss.
+ * Replace the displayed body of a cached WhatsApp message after a `message.edited` event. Both id
+ * candidates are matched, for the reason given on findRevokedIndex. Returns the original array on
+ * a miss.
  */
 export function applyMessageEdit(
   list: ChatMessageView[],
   event: { messageId: string; body: string },
 ): ChatMessageView[] {
   if (!event.messageId) return list;
-  const idx = list.findIndex(m => m.id === event.messageId || m.waMessageId === event.messageId);
+  const idx = list.findIndex(byMessageId(event.messageId));
   if (idx === -1) return list;
   const next = list.slice();
   next[idx] = { ...next[idx], body: event.body };

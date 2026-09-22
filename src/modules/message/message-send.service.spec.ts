@@ -1,6 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { FindOperator, In, Repository } from 'typeorm';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import type { LidMapping } from '../../engine/identity/lid-mapping.entity';
 import { BadRequestException, NotFoundException, PayloadTooLargeException } from '@nestjs/common';
 import { MessageSendService } from './message-send.service';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
@@ -35,6 +37,7 @@ function createMockEngine() {
     sendContactMessage: jest.fn().mockResolvedValue(mockEngineResult),
     sendPollMessage: jest.fn().mockResolvedValue(mockEngineResult),
     replyToMessage: jest.fn().mockResolvedValue(mockEngineResult),
+    clickButton: jest.fn().mockResolvedValue({ ...mockEngineResult, body: 'Sim' }),
     forwardMessage: jest.fn().mockResolvedValue(mockEngineResult),
     sendChatState: jest.fn().mockResolvedValue(undefined),
   };
@@ -298,6 +301,35 @@ describe('MessageSendService', () => {
       expect(calls[1][1]).toMatchObject({ message: { status: MessageStatus.FAILED } });
     });
 
+    it('logs an engine-side send failure with the session, chat and type', async () => {
+      const warn = jest.spyOn(
+        (service as unknown as { logger: { warn: (...args: unknown[]) => void } }).logger,
+        'warn',
+      );
+      const pageError = new Error('t');
+      pageError.name = 't';
+      mockEngine.sendTextMessage.mockRejectedValueOnce(pageError);
+
+      await expect(service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' })).rejects.toThrow();
+
+      expect(warn).toHaveBeenCalledWith(
+        'Send failed in the engine (text)',
+        expect.objectContaining({ sessionId: 'sess-1', chatId: '628123456789@c.us', error: 't: t' }),
+      );
+    });
+
+    it('does not log a client-fault send failure', async () => {
+      const warn = jest.spyOn(
+        (service as unknown as { logger: { warn: (...args: unknown[]) => void } }).logger,
+        'warn',
+      );
+      mockEngine.sendTextMessage.mockRejectedValueOnce(new BadRequestException('bad chat id'));
+
+      await expect(service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' })).rejects.toThrow();
+
+      expect(warn).not.toHaveBeenCalledWith('Send failed in the engine (text)', expect.anything());
+    });
+
     it('reconciles provider indexes when the send echo won the race: upsert the surviving row + drop the ghost (#906)', async () => {
       const echoRow = {
         id: 'echo-uuid-9',
@@ -314,11 +346,10 @@ describe('MessageSendService', () => {
 
       await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' });
 
-      // SENT state merged onto the echo row; the redundant PENDING row dropped.
-      expect(repository.update).toHaveBeenCalledWith(
-        { sessionId: 'sess-1', waMessageId: 'wa-msg-1' },
-        expect.objectContaining({ status: MessageStatus.SENT }),
-      );
+      // Timestamp merged onto the echo row; the redundant PENDING row dropped. `status` is NOT
+      // written: the echo row is already SENT and an ack may have advanced it further.
+      const [, mergePatch] = (repository.update as jest.Mock).mock.calls[0] as [unknown, object];
+      expect(mergePatch).not.toHaveProperty('status');
       expect(repository.delete).toHaveBeenCalledWith({ id: 'msg-uuid-1' });
       const persisted = (hookManager.execute as jest.Mock).mock.calls.filter(
         ([ev]: unknown[]) => ev === 'message:persisted',
@@ -424,6 +455,33 @@ describe('MessageSendService', () => {
       });
 
       expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('test@c.us', 'Hi Alice {{unknown}}');
+    });
+
+    it('carries mentions and linkPreview from the template body through to the send', async () => {
+      // The rendered body is dispatched through sendText, so the two optionals it already honours
+      // reach the engine unchanged rather than being dropped at the template DTO.
+      (templateService.resolve as jest.Mock).mockResolvedValue(mockTemplate({ body: 'Hi @62811' }));
+
+      await service.sendTemplate('sess-1', {
+        chatId: 'group@g.us',
+        templateId: 'tpl-1',
+        mentions: ['62811@c.us'],
+        linkPreview: false,
+      });
+
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('group@g.us', 'Hi @62811', ['62811@c.us'], {
+        linkPreview: false,
+      });
+    });
+
+    it('leaves a plain template send on its two-argument call shape', async () => {
+      // Control for the case above: without either optional the call must not gain arguments, or
+      // every existing template send changes shape.
+      (templateService.resolve as jest.Mock).mockResolvedValue(mockTemplate({ body: 'Hi there' }));
+
+      await service.sendTemplate('sess-1', { chatId: 'test@c.us', templateId: 'tpl-1' });
+
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('test@c.us', 'Hi there');
     });
 
     it('should propagate NotFoundException when the template cannot be resolved', async () => {
@@ -911,6 +969,138 @@ describe('MessageSendService', () => {
 
       expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('test@c.us', 'hi');
     });
+
+    it('stores the quoted message body, not an empty quote box', async () => {
+      // Every sender but reply and click-button routes the quoted id through the shared persist,
+      // which hardcoded an empty body, so the dashboard drew a blank quote above a quoted image,
+      // location, contact or poll.
+      (repository.findOne as jest.Mock).mockResolvedValueOnce({ id: 'row-9', body: 'the original text' });
+
+      await service.sendImage('sess-1', {
+        chatId: 'test@c.us',
+        url: 'https://example.com/a.png',
+        quotedMessageId: 'wa-quoted-9',
+      });
+
+      expect(repository.findOne).toHaveBeenCalledWith({ where: { sessionId: 'sess-1', waMessageId: 'wa-quoted-9' } });
+      expect(repository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            quotedMessage: { id: 'wa-quoted-9', body: 'the original text' },
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('still stores the quote when the quoted row cannot be read', async () => {
+      (repository.findOne as jest.Mock).mockRejectedValueOnce(new Error('database is locked'));
+
+      await service.sendLocation('sess-1', {
+        chatId: 'test@c.us',
+        latitude: 1,
+        longitude: 2,
+        quotedMessageId: 'wa-quoted-9',
+      });
+
+      expect(repository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({ quotedMessage: { id: 'wa-quoted-9', body: '' } }) as unknown,
+        }),
+      );
+    });
+  });
+
+  describe('a reply or button click reads the quoted body from the target chat only', () => {
+    // A stored row per chat. The fake honours the WHERE clause, so a lookup that ignores the chat
+    // would find the foreign row and copy its body.
+    const rows = [
+      { sessionId: 'sess-1', chatId: 'other@g.us', waMessageId: 'wa-foreign', body: 'not yours' },
+      { sessionId: 'sess-1', chatId: '999@lid', waMessageId: 'wa-own', body: 'same chat, lid form' },
+    ];
+    const honourWhere = (opts: { where: { sessionId: string; chatId?: FindOperator<string>; waMessageId: string } }) =>
+      Promise.resolve(
+        rows.find(
+          r =>
+            r.sessionId === opts.where.sessionId &&
+            r.waMessageId === opts.where.waMessageId &&
+            (!opts.where.chatId || (opts.where.chatId.value as unknown as string[]).includes(r.chatId)),
+        ) ?? null,
+      );
+    const quoteOf = (): unknown => {
+      const calls = (repository.create as jest.Mock).mock.calls as [{ metadata: { quotedMessage: unknown } }][];
+      return calls[0][0].metadata.quotedMessage;
+    };
+
+    beforeEach(() => {
+      (repository.findOne as jest.Mock).mockImplementation(honourWhere);
+    });
+
+    it('reply stores no body for a message id from another chat', async () => {
+      await service.reply('sess-1', { chatId: '628111@c.us', quotedMessageId: 'wa-foreign', text: 'hi' });
+      expect(quoteOf()).toEqual({ id: 'wa-foreign', body: '' });
+    });
+
+    it('clickButton stores no prompt body for a message id from another chat', async () => {
+      await service.clickButton('sess-1', { chatId: '628111@c.us', messageId: 'wa-foreign', buttonId: 'yes' });
+      expect(quoteOf()).toEqual({ id: 'wa-foreign', body: '' });
+    });
+
+    it('a quoting send keeps a quote from another chat, which the send routes allow', async () => {
+      await service.sendText('sess-1', { chatId: '628111@c.us', text: 'hi', quotedMessageId: 'wa-foreign' });
+      expect(quoteOf()).toEqual({ id: 'wa-foreign', body: 'not yours' });
+    });
+
+    it('stores no body from the chat a stale cached lid mapping names', async () => {
+      // This node cached lid 999 -> 628111; another node has since re-mapped it to 628333 in the
+      // shared table. A reply to 999@lid must not read a quote out of chat 628111.
+      rows.push({ sessionId: 'sess-1', chatId: '628111@c.us', waMessageId: 'wa-stale', body: 'chat 628111 only' });
+      const table = [{ lid: '999', phone: '628111' }];
+      const store = new LidMappingStoreService({
+        find: () => Promise.resolve([]),
+        findOne: ({ where }: { where: { lid: string } }) =>
+          Promise.resolve(table.find(r => r.lid === where.lid) ?? null),
+        upsert: () => Promise.resolve({}),
+      } as unknown as Repository<LidMapping>);
+      await store.remember('999', '628111');
+      table[0].phone = '628333';
+      const withStore = new MessageSendService(
+        repository as Repository<Message>,
+        sessionService as unknown as SessionService,
+        engines,
+        hookManager as HookManager,
+        templateService as unknown as TemplateService,
+        inertPacing(),
+        undefined,
+        undefined,
+        store,
+      );
+      try {
+        await withStore.reply('sess-1', { chatId: '999@lid', quotedMessageId: 'wa-stale', text: 'hi' });
+        expect(quoteOf()).toEqual({ id: 'wa-stale', body: '' });
+      } finally {
+        rows.pop();
+      }
+    });
+
+    it('still finds a quote stored under the lid form of the target chat', async () => {
+      const store = {
+        findPhoneForLid: jest.fn().mockResolvedValue(null),
+        findLidsForPhone: jest.fn((phone: string) => Promise.resolve(phone === '628111' ? ['999'] : [])),
+      } as unknown as LidMappingStoreService;
+      const withStore = new MessageSendService(
+        repository as Repository<Message>,
+        sessionService as unknown as SessionService,
+        engines,
+        hookManager as HookManager,
+        templateService as unknown as TemplateService,
+        inertPacing(),
+        undefined,
+        undefined,
+        store,
+      );
+      await withStore.reply('sess-1', { chatId: '628111@c.us', quotedMessageId: 'wa-own', text: 'hi' });
+      expect(quoteOf()).toEqual({ id: 'wa-own', body: 'same chat, lid form' });
+    });
   });
 
   // ── reply / forward ───────────────────────────────────────────────
@@ -924,6 +1114,128 @@ describe('MessageSendService', () => {
       });
 
       expect(mockEngine.replyToMessage).toHaveBeenCalledWith('test@c.us', 'wa-quoted-1', 'This is a reply');
+    });
+
+    it('forwards the tag list to the engine, and keeps the untagged call three-argument', async () => {
+      await service.reply('sess-1', {
+        chatId: 'group@g.us',
+        quotedMessageId: 'wa-quoted-1',
+        text: 'hi @62811',
+        mentions: ['62811@c.us'],
+      });
+
+      expect(mockEngine.replyToMessage).toHaveBeenCalledWith('group@g.us', 'wa-quoted-1', 'hi @62811', ['62811@c.us']);
+
+      // Control: an empty list is not a tag request, so the call shape every existing reply makes is
+      // left untouched rather than gaining a trailing argument.
+      mockEngine.replyToMessage.mockClear();
+      await service.reply('sess-1', {
+        chatId: 'group@g.us',
+        quotedMessageId: 'wa-quoted-1',
+        text: 'plain',
+        mentions: [],
+      });
+      expect(mockEngine.replyToMessage).toHaveBeenCalledWith('group@g.us', 'wa-quoted-1', 'plain');
+    });
+
+    it('honours a plugin that rewrites the tag list, not the list the caller sent', async () => {
+      // message:sending is a moderation chokepoint. Reading the caller's own dto here instead of the
+      // gated result would send the unredacted tags while the hook reported success.
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: {
+          input: {
+            chatId: 'group@g.us',
+            quotedMessageId: 'wa-quoted-1',
+            text: 'hi @62811',
+            mentions: ['62811@c.us'],
+          },
+        },
+      });
+
+      await service.reply('sess-1', {
+        chatId: 'group@g.us',
+        quotedMessageId: 'wa-quoted-1',
+        text: 'hi @62811 @62999',
+        mentions: ['62811@c.us', '62999@c.us'],
+      });
+
+      expect(mockEngine.replyToMessage).toHaveBeenCalledWith('group@g.us', 'wa-quoted-1', 'hi @62811', ['62811@c.us']);
+    });
+  });
+
+  describe('clickButton', () => {
+    it('calls the engine and persists the resolved label, not the raw buttonId', async () => {
+      await service.clickButton('sess-1', {
+        chatId: 'test@c.us',
+        messageId: 'PROMPT-1',
+        buttonId: 'yes',
+      });
+
+      expect(mockEngine.clickButton).toHaveBeenCalledWith('test@c.us', 'PROMPT-1', 'yes', undefined);
+      expect(repository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: 'yes',
+          type: 'text',
+          status: MessageStatus.PENDING,
+          metadata: {
+            button: { id: 'yes', text: undefined },
+            quotedMessage: { id: 'PROMPT-1', body: '' },
+          },
+        }),
+      );
+      expect(repository.save).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          body: 'Sim',
+          status: MessageStatus.SENT,
+          metadata: {
+            quotedMessage: { id: 'PROMPT-1', body: '' },
+            button: { id: 'yes', text: 'Sim' },
+          },
+        }),
+      );
+    });
+
+    it('quotes the prompt body so the dashboard renders the answered prompt, not an empty box', async () => {
+      // A click IS a reply to the prompt. The quote box is rendered from this metadata, and it was
+      // hardcoded empty while the reply path resolved the same field from the stored message.
+      (repository.findOne as jest.Mock).mockResolvedValueOnce({ id: 'row-1', body: 'Confirmar o pedido?' });
+
+      await service.clickButton('sess-1', {
+        chatId: 'test@c.us',
+        messageId: 'PROMPT-1',
+        buttonId: 'yes',
+      });
+
+      // The lookup is scoped to the session: without it, one session's prompt body could be quoted
+      // into another session's outgoing row.
+      expect(repository.findOne).toHaveBeenCalledWith({
+        where: { sessionId: 'sess-1', chatId: In(['test@c.us', 'test@s.whatsapp.net']), waMessageId: 'PROMPT-1' },
+      });
+      expect(repository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            quotedMessage: { id: 'PROMPT-1', body: 'Confirmar o pedido?' },
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('routes an engine refusal through failSend so the pending row is marked failed', async () => {
+      mockEngine.clickButton.mockRejectedValueOnce(
+        new BadRequestException('message PROMPT-1 is not a WhatsApp Business button/list prompt that can be clicked'),
+      );
+
+      await expect(
+        service.clickButton('sess-1', { chatId: 'test@c.us', messageId: 'PROMPT-1', buttonId: 'yes' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(repository.save).toHaveBeenCalledWith(expect.objectContaining({ status: MessageStatus.FAILED }));
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:failed',
+        expect.objectContaining({ sessionId: 'sess-1', type: 'click-button' }),
+        expect.anything(),
+      );
     });
   });
 
@@ -972,6 +1284,22 @@ describe('MessageSendService', () => {
   // ── buildMediaInput (via sendImage) ───────────────────────────────
 
   describe('buildMediaInput validation', () => {
+    // A plugin send and a message:sending rewrite never pass the DTO, and both engines decode anything
+    // that is not an http(s) URL as base64.
+    it('refuses a url that is not absolute http(s), including one a hook rewrote', async () => {
+      await expect(service.sendImage('sess-1', { chatId: 'test@c.us', url: '/files/x.png' })).rejects.toThrow(
+        'url must be an absolute http(s) URL',
+      );
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { sessionId: 'sess-1', type: 'image', input: { chatId: 'test@c.us', url: 's3://bucket/key' } },
+      });
+      await expect(service.sendImage('sess-1', { chatId: 'test@c.us', url: 'https://e.com/i.jpg' })).rejects.toThrow(
+        'url must be an absolute http(s) URL',
+      );
+      expect(mockEngine.sendImageMessage).not.toHaveBeenCalled();
+    });
+
     it('should throw when neither url nor base64 is provided', async () => {
       await expect(service.sendImage('sess-1', { chatId: 'test@c.us' })).rejects.toThrow(
         'Either url or base64 must be provided',
@@ -1079,11 +1407,12 @@ describe('MessageSendService', () => {
       expect(repository.update).toHaveBeenCalledWith(
         { sessionId: 'sess-1', waMessageId: 'wa-bulk-1' },
         expect.objectContaining({
-          status: MessageStatus.SENT,
           timestamp: 1706868000,
           metadata: bulkRow.metadata,
         }),
       );
+      const [, bulkPatch] = (repository.update as jest.Mock).mock.calls[0] as [unknown, object];
+      expect(bulkPatch).not.toHaveProperty('status');
       expect(saved).toEqual(expect.objectContaining({ id: 'echo-row' }));
     });
 
@@ -1147,8 +1476,18 @@ describe('MessageSendService', () => {
       expect(result.messageId).toBe('wa-msg-1'); // send reported success
       expect(repository.update).toHaveBeenCalledWith(
         { sessionId: 'sess-1', waMessageId: 'wa-msg-1' },
-        expect.objectContaining({ status: MessageStatus.SENT, timestamp: 1706868000 }),
+        expect.objectContaining({ timestamp: 1706868000 }),
       );
+      /**
+       * The delivery state is not in that patch, and that is the point.
+       *
+       * The row it merges onto is the own-send echo's, inserted SENT, and the ack path advances it
+       * forward-only. This merge could only ever write PENDING or SENT, so it was never an upgrade:
+       * when a `delivered` ack won the race, writing SENT here dragged the row back and the
+       * dashboard showed one tick for a message the recipient already had.
+       */
+      const [, sentPatch] = (repository.update as jest.Mock).mock.calls[0] as [unknown, object];
+      expect(sentPatch).not.toHaveProperty('status');
       expect(repository.delete).toHaveBeenCalledWith({ id: 'msg-uuid-1' });
     });
 

@@ -25,7 +25,7 @@ jest.mock('fs', () => {
 import { DataSource, IsNull, QueryFailedError } from 'typeorm';
 import { ConflictException } from '@nestjs/common';
 import { InfraDataController } from './infra-data.controller';
-import { InfraDataService, restoreSessionOwnership } from './infra-data.service';
+import { InfraDataService, restoreSessionOwnership, toSqliteDatetime } from './infra-data.service';
 import { EXPORT_TABLES } from './export-tables';
 import { Session, SessionStatus } from '../session/entities/session.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
@@ -34,11 +34,13 @@ import { MessageBatch, BatchStatus } from '../message/entities/message-batch.ent
 import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
 import { LidMapping } from '../../engine/identity/lid-mapping.entity';
+import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { PluginInstance } from '../integration/entities/plugin-instance.entity';
 import { ConversationMapping } from '../integration/entities/conversation-mapping.entity';
 import { IngressEvent } from '../integration/entities/ingress-event.entity';
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
 import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.entity';
+import { WebhookOutboxService } from '../webhook/webhook-outbox.service';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
 import { AutomationRule } from '../automation/entities/automation-rule.entity';
@@ -71,6 +73,7 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
@@ -453,6 +456,53 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     // The rollback must have restored the pre-import row, ownership and all.
     const stored = await ds.getRepository(Session).findOneByOrFail({ id: 's1' });
     expect(stored.nodeId).toBe('node-a');
+  });
+
+  it('answers imported:false with the real row error when PostgreSQL aborts the transaction', async () => {
+    await seedSession('s1');
+    await seedSession('s2');
+    const dump = await controller.exportData();
+
+    // PostgreSQL semantics on the SQLite harness: the first sessions INSERT fails, and from then on
+    // every statement except ROLLBACK fails with 25P02, as it would on an aborted PG transaction.
+    // The type flip is what the service keys its PostgreSQL handling on.
+    const realOptions = ds.options;
+    Object.defineProperty(ds, 'options', { value: { ...realOptions, type: 'postgres' }, configurable: true });
+    // better-sqlite3 hands out one runner per DataSource, so the patch is undone on that instance.
+    const runner = ds.createQueryRunner();
+    const realQuery = runner.query.bind(runner);
+    jest.spyOn(ds, 'createQueryRunner').mockImplementation(() => {
+      let aborted = false;
+      runner.query = ((...callArgs: Parameters<typeof realQuery>) => {
+        const sql = callArgs[0];
+        if (aborted && sql !== 'ROLLBACK') {
+          return Promise.reject(
+            new Error('current transaction is aborted, commands ignored until end of transaction block'),
+          );
+        }
+        if (/INSERT INTO sessions/.test(sql)) {
+          aborted = true;
+          return Promise.reject(new Error('duplicate key value violates unique constraint "PK_sessions"'));
+        }
+        return realQuery(...callArgs);
+      }) as typeof runner.query;
+      return runner;
+    });
+
+    let res: Awaited<ReturnType<typeof controller.importData>>;
+    try {
+      res = await controller.importData({ tables: dump.tables });
+    } finally {
+      jest.restoreAllMocks();
+      runner.query = realQuery;
+      Object.defineProperty(ds, 'options', { value: realOptions, configurable: true });
+    }
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings).toEqual([
+      'Failed to import session s1: duplicate key value violates unique constraint "PK_sessions"',
+    ]);
+    expect((await ds.getRepository(Session).find()).map(s => s.id).sort()).toEqual(['s1', 's2']);
   });
 
   it('leaves a session that had no claim unclaimed rather than inventing one', async () => {
@@ -1211,6 +1261,7 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
@@ -1266,6 +1317,126 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect(await lidRepo.count()).toBe(2);
     expect((await lidRepo.findOneByOrFail({ lid: '111' })).phone).toBe('628111');
     expect((await lidRepo.findOneByOrFail({ lid: '222' })).phone).toBeNull();
+  });
+
+  // Restoring ONTO the instance that produced the archive is the rollback flow, and it is the one the
+  // outbox broke. The table carries no FK to sessions, so the sessions DELETE never reached it, and
+  // UNIQUE(webhookId, idempotencyKey) then collided on every row until the all-or-nothing gate rolled
+  // the entire import back. Every other table's test clears first, which is why nothing caught it;
+  // this one deliberately does not.
+  it('restores webhook_outbox_events onto an instance that already holds them', async () => {
+    await seedSession('s1');
+    const outboxRepo = ds.getRepository(WebhookOutboxEvent);
+    await outboxRepo.save(
+      outboxRepo.create({
+        webhookId: 'wh-1',
+        sessionId: 's1',
+        event: 'message.received',
+        idempotencyKey: 'key-1',
+        deliveryId: 'del-1',
+        payload: { from: '628111@c.us' },
+        state: 'pending',
+        attempts: 0,
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect((dump.tables as unknown as { webhookOutboxEvents?: unknown[] }).webhookOutboxEvents).toHaveLength(1);
+
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(await outboxRepo.count()).toBe(1);
+    expect((await outboxRepo.findOneByOrFail({ idempotencyKey: 'key-1' })).state).toBe('pending');
+  });
+
+  // A PostgreSQL export serializes CreateDateColumn/UpdateDateColumn values as ISO `...T...Z`, while
+  // TypeORM writes and compares them on SQLite as `YYYY-MM-DD HH:MM:SS.SSS`. Stored verbatim, a
+  // restored pending row never matched `createdAt < cutoff` on its own calendar day, so the replay
+  // sweep skipped the whole restored backlog until the next UTC day.
+  it('stores PostgreSQL-archived datetime columns in the SQLite form so same-day comparisons match', async () => {
+    const res = await controller.importData({
+      tables: {
+        sessions: [
+          {
+            id: 's1',
+            name: 'session-s1',
+            status: 'disconnected',
+            phone: null,
+            pushName: null,
+            config: {},
+            proxyUrl: null,
+            proxyType: null,
+            connectedAt: '2026-09-14T01:00:00.000Z',
+            lastActiveAt: null,
+            createdAt: '2026-09-14T01:00:00.000Z',
+            // Already in the SQLite form (a SQLite-made archive): carries no zone and stays untouched.
+            updatedAt: '2026-09-14 02:00:00.000',
+          },
+        ],
+        messageBatches: [
+          {
+            id: 'b1',
+            batch_id: 'batch-1',
+            session_id: 's1',
+            status: 'pending',
+            messages: [],
+            options: null,
+            progress: null,
+            results: null,
+            current_index: 0,
+            created_at: '2026-09-14T03:00:00.000Z',
+            updated_at: '2026-09-14T03:30:00.000+07:00',
+            started_at: null,
+            completed_at: null,
+          },
+        ],
+        webhookOutboxEvents: [
+          {
+            id: 'o1',
+            webhookId: 'wh-1',
+            sessionId: 's1',
+            event: 'message.received',
+            idempotencyKey: 'key-1',
+            deliveryId: 'del-1',
+            payload: JSON.stringify({ from: '628111@c.us' }),
+            state: 'pending',
+            attempts: 1,
+            lastAttemptAt: '2026-09-14T03:05:00.000Z',
+            createdAt: '2026-09-14T03:00:00.000Z',
+          },
+        ],
+      },
+    });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+
+    const [outbox] = await ds.query<unknown[]>('SELECT "createdAt", "lastAttemptAt" FROM webhook_outbox_events');
+    expect(outbox).toEqual({ createdAt: '2026-09-14 03:00:00.000', lastAttemptAt: '2026-09-14T03:05:00.000Z' });
+    const stale = await new WebhookOutboxService(ds.getRepository(WebhookOutboxEvent)).findStale(
+      new Date('2026-09-14T10:00:00.000Z'),
+      10,
+    );
+    expect(stale.map(row => row.idempotencyKey)).toEqual(['key-1']);
+
+    const [session] = await ds.query<unknown[]>('SELECT "connectedAt", "createdAt", "updatedAt" FROM sessions');
+    expect(session).toEqual({
+      connectedAt: '2026-09-14T01:00:00.000Z',
+      createdAt: '2026-09-14 01:00:00.000',
+      updatedAt: '2026-09-14 02:00:00.000',
+    });
+    const [batch] = await ds.query<unknown[]>('SELECT created_at, updated_at FROM message_batches');
+    expect(batch).toEqual({ created_at: '2026-09-14 03:00:00.000', updated_at: '2026-09-13 20:30:00.000' });
+  });
+
+  // A zoneless value must never be parsed: `new Date()` reads it as host-local time and shifts it. The
+  // millisecond-less forms change text when reformatted even on a UTC host, so this holds in any TZ.
+  it('leaves datetime values without a zone untouched', () => {
+    expect(toSqliteDatetime('2026-09-14 02:00:00')).toBe('2026-09-14 02:00:00');
+    expect(toSqliteDatetime('2026-09-14T02:00:00')).toBe('2026-09-14T02:00:00');
+    expect(toSqliteDatetime('2026-09-14T02:00:00Z')).toBe('2026-09-14 02:00:00.000');
   });
 
   // The messages import column list must carry every later-added column; `author` (the group
@@ -1443,6 +1614,7 @@ describe('InfraDataController audit trail — import emits only on a committed r
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
@@ -1588,6 +1760,7 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,

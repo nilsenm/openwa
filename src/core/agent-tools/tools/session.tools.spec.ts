@@ -1,3 +1,4 @@
+import { BadRequestException } from '@nestjs/common';
 import { invokeTool } from '../tool-invoker';
 import { sessionTools } from './session.tools';
 import type { AnyToolDescriptor } from '../tool-descriptor';
@@ -32,6 +33,23 @@ describe('sessionTools', () => {
     expect(findAll).toHaveBeenCalledWith(null, { limit: 5, offset: undefined });
     expect(isActive).toHaveBeenCalledWith('s1');
     expect(out).toEqual([expect.objectContaining({ id: 's1', engineLoaded: true })]);
+  });
+
+  it('SessionFindAll forwards the name filter together with a scoped key allowlist', async () => {
+    const findAll = jest.fn().mockResolvedValue([]);
+    const auth = { ...makeAuth(), validateApiKey: jest.fn().mockResolvedValue({ id: 'k1', allowedSessions: ['s1'] }) };
+    const tool = makeTools({ findAll, isActive: jest.fn() } as unknown as SessionService).get('SessionFindAll')!;
+
+    await expect(invokeTool(tool, { name: 'other-bot' }, 'key', auth as unknown as AuthService)).resolves.toEqual([]);
+    expect(findAll).toHaveBeenCalledWith(['s1'], { limit: undefined, offset: undefined, name: 'other-bot' });
+  });
+
+  it('SessionFindAll rejects an empty name before reaching the service', async () => {
+    const findAll = jest.fn();
+    const tool = makeTools({ findAll } as unknown as SessionService).get('SessionFindAll')!;
+
+    await expect(run(tool, { name: '' })).rejects.toThrow();
+    expect(findAll).not.toHaveBeenCalled();
   });
 
   it('SessionFindOne delegates to findOne and maps to the response DTO', async () => {
@@ -102,6 +120,27 @@ describe('sessionTools', () => {
       messageIds: ['M1', 'M2'],
     });
     expect(sendSeen).toHaveBeenCalledWith('s1', '628111@c.us', ['M1', 'M2']);
+  });
+
+  // The REST body rejects a whitespace-only id, and this path never sees that DTO: invokeTool parses
+  // the tool's own schema and calls the service directly, so an id the schema accepts is sent as a
+  // receipt key. Asserting the service was not reached is the point; a 400 that still delegated
+  // would leave the defect in place.
+  it('SessionMarkChatRead refuses a whitespace-only message id instead of sending it as a key', async () => {
+    const sendSeen = jest.fn().mockResolvedValue(true);
+    const tool = makeTools({ sendSeen } as unknown as SessionService).get('SessionMarkChatRead')!;
+
+    const failure = await run(tool, { sessionId: 's1', chatId: '628111@c.us', messageIds: ['  '] }).catch(
+      (e: unknown) => e,
+    );
+    expect(failure).toBeInstanceOf(BadRequestException);
+    expect(JSON.stringify((failure as BadRequestException).getResponse())).toContain('no whitespace');
+    expect(sendSeen).not.toHaveBeenCalled();
+
+    // Control: a well-formed id still reaches the service, so the refusal above is this rule and not
+    // a schema that turns everything away.
+    await run(tool, { sessionId: 's1', chatId: '628111@c.us', messageIds: ['3EB0C767D26B8A3F1A2B'] });
+    expect(sendSeen).toHaveBeenCalledWith('s1', '628111@c.us', ['3EB0C767D26B8A3F1A2B']);
   });
 
   it('SessionMarkChatUnread maps the markUnread result to a success field', async () => {

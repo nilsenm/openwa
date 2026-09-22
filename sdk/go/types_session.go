@@ -5,16 +5,19 @@ import (
 	"net/url"
 )
 
-// ListSessionsQuery paginates GET /sessions. Both fields optional.
+// ListSessionsQuery paginates GET /sessions. All fields optional.
 type ListSessionsQuery struct {
 	Limit  *int
 	Offset *int
+	// Name returns only the session with exactly this name (case-sensitive).
+	Name *string
 }
 
 func (q *ListSessionsQuery) values() url.Values {
 	v := url.Values{}
 	setInt(v, "limit", q.Limit)
 	setInt(v, "offset", q.Offset)
+	setStr(v, "name", q.Name)
 	return v
 }
 
@@ -64,11 +67,11 @@ type CustomLinkPreview struct {
 // UpsertLabelRequest is a label create-or-update body. The id travels in the path, because WhatsApp
 // keys the write on it.
 type UpsertLabelRequest struct {
-	// Name is left alone when nil.
+	// Name nil drops the current name: the write replaces the whole label.
 	Name *string `json:"name,omitempty"`
 	// Color is WhatsApp's colour INDEX (0-19), NOT a hex value — it does not round-trip with the
-	// HexColor labels are read back with, because neither engine exposes the mapping. Nil leaves the
-	// current colour alone.
+	// HexColor labels are read back with, because neither engine exposes the mapping. Nil drops
+	// the current colour.
 	Color *int `json:"color,omitempty"`
 }
 
@@ -182,6 +185,40 @@ type CreateSessionRequest struct {
 	Config    map[string]any `json:"config,omitempty"`
 	ProxyURL  string         `json:"proxyUrl,omitempty"`
 	ProxyType ProxyType      `json:"proxyType,omitempty"`
+}
+
+// SessionProxy is the masked per-session proxy configuration returned by GET/PATCH /proxy.
+type SessionProxy struct {
+	Enabled        bool       `json:"enabled"`
+	ProxyType      *ProxyType `json:"proxyType"`
+	ProxyHost      *string    `json:"proxyHost"`
+	HasCredentials bool       `json:"hasCredentials"`
+}
+
+// UpdateSessionProxyRequest updates per-session proxy settings. Changes apply on the next start,
+// not to a running engine.
+//
+// Three states, the same shape as UpdateSessionConfigRequest: an absent key leaves the proxy
+// unchanged, an explicit null clears it, and a value sets it. `omitempty` on a nil pointer OMITS the
+// key rather than emitting null, so clearing needs its own flag and the MarshalJSON below.
+type UpdateSessionProxyRequest struct {
+	ProxyURL *string `json:"-"`
+
+	// ClearProxyURL sends an explicit null, removing the proxy. It wins over ProxyURL if both are set.
+	ClearProxyURL bool `json:"-"`
+}
+
+// MarshalJSON emits only what the caller addressed: the Clear flag becomes an explicit null, a
+// non-nil pointer becomes its value, and neither leaves the key out so the server keeps the proxy
+// it already has.
+func (r UpdateSessionProxyRequest) MarshalJSON() ([]byte, error) {
+	out := map[string]any{}
+	if r.ClearProxyURL {
+		out["proxyUrl"] = nil
+	} else if r.ProxyURL != nil {
+		out["proxyUrl"] = *r.ProxyURL
+	}
+	return json.Marshal(out)
 }
 
 // QrCodeResponse carries the current QR code for a session awaiting scan.

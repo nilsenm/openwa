@@ -16,14 +16,14 @@ Java 17+, one runtime dependency ([Gson](https://github.com/google/gson)).
 <dependency>
   <groupId>com.rmyndharis</groupId>
   <artifactId>openwa</artifactId>
-  <version>0.4.0</version>
+  <version>0.5.0</version>
 </dependency>
 ```
 
 **Gradle**
 
 ```groovy
-implementation 'com.rmyndharis:openwa:0.4.0'
+implementation 'com.rmyndharis:openwa:0.5.0'
 ```
 
 ## Quickstart
@@ -103,7 +103,7 @@ try {
 | `OpenWAApiError`                | —    | Any other non-2xx (carries `.status()`)                 |
 | `OpenWATimeoutError`            | —    | Request exceeded the configured timeout                 |
 
-All extend `OpenWAError` (a `RuntimeException`).
+All extend `OpenWAError` (a `RuntimeException`). In a routed deployment only 503 proves the request was never carried out: a forward that fails after the request reached the owner node answers 502 or 504.
 
 ## Reliability & security
 
@@ -155,7 +155,7 @@ before tagging rather than tagging to see what happens.
 Cutting a release:
 
 1. Bump `<version>` in `pom.xml` and land it on `main`.
-2. Tag that commit `java-sdk-v<version>` (e.g. `java-sdk-v0.4.0`) and push the
+2. Tag that commit `java-sdk-v<version>` (e.g. `java-sdk-v0.5.0`) and push the
    tag. The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK publish.
 3. The workflow builds, signs, and publishes; Central syncs within a few hours.

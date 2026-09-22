@@ -431,6 +431,10 @@ export BACKUP_DIR="/backups/openwa"
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/infra/export-data > "$BACKUP_DIR/export-data.json"
 
+# Started with docker-compose.dev.yml (the README Quick Start)? Add `-f docker-compose.dev.yml`
+# to every docker compose command in this runbook, the Rollback block included, and write `openwa`
+# wherever a command names the `openwa-api` service (steps 6 and 7, rollback step 2).
+
 # 4. Stop services
 docker compose down
 
@@ -455,8 +459,8 @@ docker compose up -d
 sleep 30
 curl http://localhost:2785/api/health
 
-# 10. Verify version
-curl http://localhost:2785/api/health | jq '.version'
+# 10. Verify version (`version` is only included for an authenticated request)
+curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health | jq '.version'
 
 # 11. Verify all sessions
 curl -H "X-API-Key: $API_KEY" \
@@ -473,11 +477,19 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 > `image: ghcr.io/rmyndharis/openwa:<tag>` — replace steps 5-6 with editing that tag and running
 > `docker compose pull`.
 
+> On Kubernetes with the chart in `charts/openwa`, back up the persistent volume and take the step 3
+> export first, then replace steps 4-8 with checking out the new release and running
+> `helm upgrade openwa ./charts/openwa --reuse-values`. The image tag defaults to the chart's
+> `appVersion`, so the checkout moves it, unless `image.tag` was set at install: `--reuse-values` keeps
+> that value, so pass `--set image.tag=<new-version>` in that case.
+> Run steps 9-12 through `kubectl port-forward` to the release's Service. `helm rollback` keeps the
+> volume, so read the notes on restoring `sessions/` below before relying on it.
+
 **Verification:**
 
 ```bash
-# Correct version
-curl http://localhost:2785/api/health | jq '.version'
+# Correct version (`version` is only included for an authenticated request)
+curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health | jq '.version'
 # Expected: "<new-version>"
 
 # All sessions reconnected
@@ -506,6 +518,25 @@ docker compose up -d
 # 5. Verify rollback (note: readiness is at /api/health/ready)
 curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 ```
+
+> Restoring `sessions/` is required, not optional, when the rollback crosses a browser major upgrade (on
+> amd64, 0.23.5 moved Chrome for Testing from 146 to 153; arm64 runs the chromium Debian shipped when each
+> image was built), and the backup must predate the first start on the newer image; a daily backup taken
+> after the upgrade does not qualify. An older Chrome silently deletes the IndexedDB of a profile a newer
+> Chrome has opened, which is where whatsapp-web.js keeps the WhatsApp login. The symptom: every
+> previously linked whatsapp-web.js session starts at a QR code instead of reconnecting, the log names no
+> cause (0.23.3 and 0.23.4 log only a generic `relink_required` warning), and upgrading again does not
+> bring the pairing back. Changing only the image tag, or `helm rollback` (which keeps the volume), skips
+> the restore and hits this. A session first paired on the newer image is not in that backup and must be
+> paired again either way. Baileys sessions are unaffected.
+
+> Restoring `sessions/` **and** `baileys/` is likewise required when rolling back past 0.23.5, on either
+> engine and either architecture. 0.23.5 renames each session's auth directory from the session name to
+> its UUID id at first boot (`session-<id>` under `SESSION_DATA_PATH`, `<id>` under `BAILEYS_AUTH_DIR`);
+> an older image looks for the name-keyed directory, finds nothing, and starts every session at a QR
+> code. The rename keeps nothing behind to fall back to, so the backup must again predate the first
+> start on 0.23.5. Restoring both directories from that backup returns every session to its previous
+> pairing.
 
 ---
 
@@ -558,6 +589,25 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 > The data directory is a Docker **named volume** (`openwa-data`) in the production
 > compose. Run the script where that volume is mounted — e.g. point `OPENWA_DATA_DIR`
 > at the volume's mountpoint, or run it inside a container with `/app/data` mounted.
+>
+> The shipped compose file and Helm chart mount the container root read-only, so the default
+> `./backups` (`/app/backups`) cannot be created there and the script refuses to start. Inside the
+> container, write to the data volume and then copy the archive off it, since an archive on the same
+> volume as the data does not survive losing that volume:
+>
+> ```bash
+> docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
+> docker cp openwa-api:/app/data/backups/. ./backups/
+> # Helm: kubectl exec <pod> -- env BACKUP_DIR=/app/data/backups ./scripts/backup.sh
+> #       kubectl cp <pod>:/app/data/backups ./backups
+> ```
+>
+> The script stages a full copy of the data in `TMPDIR` before archiving it. The compose file mounts
+> `/tmp` as a tmpfs charged to the container's memory limit, so the compose line points `TMPDIR` at
+> the data volume, which then needs free space for about the size of the data plus the archive;
+> staging in the tmpfs gets the running gateway OOM-killed. The Helm chart's `/tmp` is an `emptyDir`
+> on node disk, so the Helm lines leave it alone. A run killed outright, such as by a container
+> restart mid-backup, leaves its `tmp.*` staging directory behind in `TMPDIR`; delete it.
 >
 > The scripts resolve every other path the way the application does: an explicit environment value
 > first, then `./.env`, then `<data dir>/.env.generated`. Settings made through Dashboard >
@@ -617,6 +667,13 @@ docker compose down
 docker compose up -d
 curl -s -X POST -H "X-API-Key: <an-existing-key>" http://localhost:2785/api/auth/validate
 ```
+
+> **PostgreSQL restores are read as UTC.** From 0.23.6 the data connection binds, parses and defaults
+> every timestamp in UTC, and refuses to boot when its session is not on UTC
+> ([05 - Database Design](./05-database-design.md#timestamps-on-postgresql-are-utc)). A `database.sql`
+> taken from a gateway that ran off UTC before 0.23.6 holds that host's local wall time in the columns
+> the app wrote, so those rows read as shifted by the offset once restored. The 0.23.6 upgrade notes in
+> `CHANGELOG.md` carry the conversion and name the columns it must not touch.
 
 > `main.sqlite` carries the hashed API keys and audit log; `.api-key`, when retained by the original
 > installation, carries the plaintext bootstrap admin key. After restore, verify that both expected files

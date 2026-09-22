@@ -4,13 +4,18 @@ import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import * as crypto from 'crypto';
 import { setTimeout } from 'node:timers/promises';
 import { Webhook } from './entities/webhook.entity';
 import { WebhookOutboxService } from './webhook-outbox.service';
 import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
 import { recordWebhookDeliveryFailure } from './utils/record-delivery-failure';
-import { postWebhookPayload, recordTerminalFailure } from './utils/deliver-once';
+import {
+  buildDeliveryHeaders,
+  generateSignature,
+  postWebhookPayload,
+  recordTerminalFailure,
+  sanitizeCustomHeaders,
+} from './utils/deliver-once';
 import { createLogger } from '../../common/services/logger.service';
 import { DEFAULT_WEBHOOK_MEDIA_INLINE_MAX_BYTES, shedInlineMedia } from '../../common/utils/inline-media';
 import { incrementWebhookDeliveryFailures } from '../../common/metrics/webhook-delivery-metrics';
@@ -21,6 +26,7 @@ import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.
 import { redactSsrfError } from '../../common/security/ssrf-guard';
 import { HookManager } from '../../core/hooks';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
+import { isWebhookBeforeResult } from '../../core/hooks/hook-results';
 
 export interface WebhookPayload {
   event: string;
@@ -60,6 +66,14 @@ const DEFAULT_WEBHOOK_MAX_PAYLOAD_BYTES = 1024 * 1024;
 const DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS = 5000;
 
 /** Per-event-occurrence context threaded through the dispatch pipeline stages (was closure state). */
+/**
+ * The result of one delivery attempt. Reported, not thrown: every failure below is already handled
+ * in place, so nothing reaches a caller as an exception and a try/catch cannot tell a delivered
+ * event from a dead-lettered one. 'cancelled' is a plugin suppressing the dispatch on purpose: it
+ * is terminal like 'delivered' and must never be replayed, but nothing left the process.
+ */
+export type WebhookDeliveryOutcome = 'delivered' | 'enqueued' | 'cancelled' | 'failed';
+
 interface DispatchEventContext {
   sessionId: string;
   event: string;
@@ -73,6 +87,8 @@ interface DispatchEventContext {
  * Records terminally failed deliveries in webhook_delivery_failures. Webhook registration/CRUD
  * lives on WebhookService, which delegates dispatch here.
  */
+const isPlainObject = (value: unknown): boolean => typeof value === 'object' && value !== null && !Array.isArray(value);
+
 @Injectable()
 export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('WebhookDelivery');
@@ -89,6 +105,13 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
   >();
   /** Late bookkeeping (dead-letter rows) written by tasks the limiter already released — awaited on shutdown. */
   private readonly pendingBookkeeping = new Set<Promise<void>>();
+  /**
+   * Outbox rows this node still owns, by idempotency key and counted (the same key can be dispatched
+   * twice), from the moment the row is opened until its dispatch settles: parked in the limiter,
+   * holding a slot, or inside a direct retry loop. The reconciler skips these so a slow delivery is
+   * not replayed alongside itself.
+   */
+  private readonly locallyPending = new Map<string, number>();
 
   constructor(
     @InjectRepository(Webhook, 'data')
@@ -222,8 +245,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     // A subscribed webhook that a filter drops leaves no trace otherwise: dispatch() awaits an empty
     // array and returns, and the delivery-failure table only records deliveries that were ATTEMPTED.
     // That is fine when the filter is doing its job, and indistinguishable from it when it is not —
-    // a condition on a field the event's payload does not carry resolves to undefined and fails,
-    // which is how a `sender` filter silently swallows every message.ack. Debug rather than warn:
+    // an `is`/`contains`/`equals` condition on a field the event's payload does not carry resolves to
+    // undefined and fails, which is how a `sender is` filter silently swallows every message.ack
+    // (an `isNot` condition, or a boolean compared with false, passes instead). Debug rather than warn:
     // suppression is the normal outcome of a working filter, so this is a trace to switch on while
     // investigating, not an alarm.
     if (matching.length < subscribed.length) {
@@ -248,7 +272,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
   ): Promise<void> {
     const { sessionId, event } = ctx;
     const lastError = redactSsrfError(error, this.logger, 'webhook dispatch');
-    await recordWebhookDeliveryFailure(this.failureRepository, this.logger, {
+    const recorded = await recordWebhookDeliveryFailure(this.failureRepository, this.logger, {
       webhookId: webhook.id,
       sessionId,
       event,
@@ -259,7 +283,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       lastStatusCode: null,
       lastError,
     });
-    incrementWebhookDeliveryFailures();
+    if (recorded) {
+      incrementWebhookDeliveryFailures();
+    }
     try {
       await this.hookManager.execute(
         'webhook:error',
@@ -290,7 +316,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     deliveryId: string,
     idempotencyKey: string,
     ctx: DispatchEventContext,
-  ): Promise<{ finalPayload: WebhookPayload; body: string; headers: Record<string, string> } | null> {
+  ): Promise<{ finalPayload: WebhookPayload; body: string; headers: Record<string, string> } | 'cancelled' | null> {
     const { sessionId, event, baseData } = ctx;
     try {
       const payload: WebhookPayload = {
@@ -307,10 +333,16 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       // place, so reading the canonical timestamp off the hook result afterwards is not safe.
       const payloadTimestamp = payload.timestamp;
 
+      // A handler result without a plain-object payload is skipped, so the chain keeps the last usable
+      // payload (an earlier hook's redaction included) rather than the one it started from.
       const { continue: shouldContinue, data: hookResult } = await this.hookManager.execute(
         'webhook:before',
         { sessionId, event, payload },
-        { sessionId, source: 'WebhookService' },
+        {
+          sessionId,
+          source: 'WebhookService',
+          accept: isWebhookBeforeResult,
+        },
       );
 
       if (!shouldContinue) {
@@ -318,11 +350,23 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
           webhookId: webhook.id,
           action: 'webhook_cancelled_by_plugin',
         });
-        return null;
+        return 'cancelled';
       }
 
-      // Null/undefined hook results mean "no override", matching an object without payload.
-      const finalPayload = (hookResult as { payload?: WebhookPayload } | null | undefined)?.payload ?? payload;
+      // Null/undefined hook results mean "no override", matching an object without payload. A
+      // payload that is not a plain object (a primitive, which throws on the writes below, or an
+      // array, which drops them from the JSON) is not one either: send the original and say so.
+      const hookPayload = (hookResult as { payload?: unknown } | null | undefined)?.payload ?? payload;
+      const usable = isPlainObject(hookPayload);
+      if (!usable) {
+        this.logger.warn('A webhook:before hook returned a payload that is not an object; sending the original', {
+          webhookId: webhook.id,
+          event,
+          received: Array.isArray(hookPayload) ? 'array' : typeof hookPayload,
+          action: 'hook_payload_discarded',
+        });
+      }
+      const finalPayload = usable ? (hookPayload as WebhookPayload) : payload;
       // Re-assert EVERY identity field after the (untrusted) hook chain. A hook may rewrite data,
       // but event/sessionId/timestamp and the dedupe ids must remain the server's values: the
       // receiver verifies the signature over this body and compares it against the X-OpenWA-*
@@ -369,15 +413,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
         return null;
       }
 
-      const headers = {
-        ...this.sanitizeCustomHeaders(webhook.headers),
-        'Content-Type': 'application/json',
-        'User-Agent': 'OpenWA-Webhook/1.0.0',
-        'X-OpenWA-Event': event,
-        'X-OpenWA-Idempotency-Key': idempotencyKey,
-        'X-OpenWA-Delivery-Id': deliveryId,
-        'X-OpenWA-Retry-Count': '0',
-      };
+      const headers = buildDeliveryHeaders(webhook, event, idempotencyKey, deliveryId, body);
       return { finalPayload, body, headers };
     } catch (error) {
       await this.recordUndelivered(
@@ -392,23 +428,38 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * What became of one delivery attempt, reported rather than thrown.
+   *
+   * Every failure path here is already handled in place (a dead-letter row, a hook, a log), so none
+   * of them reach the caller as an exception. The reconciler has to tell a delivered event from a
+   * dead-lettered one to know whether the outbox row may be retired, and a caught throw cannot tell
+   * it: there is none. This mirrors the inbound twin, where `ingressEnqueue.enqueue` returns an
+   * outcome and the caller retires the payload only when it is not 'failed'.
+   */
   private async deliverOne(
     webhook: Webhook,
     deliveryId: string,
     idempotencyKey: string,
     ctx: DispatchEventContext,
-  ): Promise<void> {
+  ): Promise<WebhookDeliveryOutcome> {
     const preflight = await this.preflightDelivery(webhook, deliveryId, idempotencyKey, ctx);
+    if (preflight === 'cancelled') {
+      // A plugin suppressed this dispatch deliberately. There is no failure to record and nothing
+      // to retry: reporting it as failed made the reconciler replay a deliberately dropped event
+      // until the budget ran out, then mark it lost against a failure row that never existed.
+      return 'cancelled';
+    }
     if (!preflight) {
-      return;
+      // The remaining bail-outs record their own undelivered row before returning null.
+      return 'failed';
     }
     const { finalPayload, body, headers } = preflight;
     // Use queue if available, otherwise fallback to direct delivery
     if (this.queueEnabled && this.webhookQueue) {
-      await this.enqueueWithFallback(webhook, finalPayload, body, headers, deliveryId, idempotencyKey, ctx);
-    } else {
-      await this.deliverDirect(webhook, finalPayload, body, headers, deliveryId, ctx);
+      return this.enqueueWithFallback(webhook, finalPayload, body, headers, deliveryId, idempotencyKey, ctx);
     }
+    return this.deliverDirect(webhook, finalPayload, body, headers, deliveryId, ctx);
   }
 
   private async enqueueWithFallback(
@@ -419,18 +470,12 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     deliveryId: string,
     idempotencyKey: string,
     ctx: DispatchEventContext,
-  ): Promise<void> {
+  ): Promise<WebhookDeliveryOutcome> {
     const { sessionId, event } = ctx;
     try {
-      // Sign the exact pre-serialized body from preflight. The processor re-serializes the same
-      // payload object at delivery time (JSON key order survives the Redis round-trip), so the
-      // signature stays valid over the bytes the receiver sees.
-      const signature = webhook.secret ? this.generateSignature(body, webhook.secret) : '';
-
-      if (webhook.secret) {
-        headers['X-OpenWA-Signature'] = signature;
-      }
-
+      // The job's headers are the enqueue-time snapshot. The processor rebuilds them (and the
+      // signature) from the current webhook row on every attempt, so a secret or header rotated
+      // while the job waits is honoured.
       const jobData: WebhookJobData = {
         webhookId: webhook.id,
         url: webhook.url,
@@ -515,8 +560,13 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
           webhookId: webhook.id,
           action: 'webhook_queue_fallback_failed',
         });
+        return 'failed';
       }
+      // The queue never took it, but the fallback POST did.
+      return 'delivered';
     }
+    // Handed to BullMQ, which owns the retries and the dead-letter row from here.
+    return 'enqueued';
   }
 
   /** Direct delivery when the queue is disabled. */
@@ -527,7 +577,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     headers: Record<string, string>,
     deliveryId: string,
     ctx: DispatchEventContext,
-  ): Promise<void> {
+  ): Promise<WebhookDeliveryOutcome> {
     const { sessionId, event } = ctx;
     try {
       await this.deliverWebhook(webhook, finalPayload, headers, body);
@@ -557,7 +607,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
         webhookId: webhook.id,
         action: 'webhook_delivery_failed',
       });
+      return 'failed';
     }
+    return 'delivered';
   }
 
   /**
@@ -584,6 +636,28 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       deliveryId,
       payload: ctx.baseData,
     });
+    this.locallyPending.set(idempotencyKey, (this.locallyPending.get(idempotencyKey) ?? 0) + 1);
+    try {
+      await this.runLimited(webhook, deliveryId, idempotencyKey, ctx);
+    } finally {
+      const left = (this.locallyPending.get(idempotencyKey) ?? 1) - 1;
+      if (left > 0) this.locallyPending.set(idempotencyKey, left);
+      else this.locallyPending.delete(idempotencyKey);
+    }
+  }
+
+  /** True while a dispatch on this node still owns the outbox row for this key. */
+  isLocallyPending(idempotencyKey: string): boolean {
+    return this.locallyPending.has(idempotencyKey);
+  }
+
+  private async runLimited(
+    webhook: Webhook,
+    deliveryId: string,
+    idempotencyKey: string,
+    ctx: DispatchEventContext,
+  ): Promise<void> {
+    const { sessionId, event } = ctx;
     await this.dispatchLimiter
       .run(async () => {
         this.inFlightDeliveries.set(deliveryId, {
@@ -604,6 +678,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       })
       .catch(async error => {
         if (error instanceof Error && error.message === 'ConcurrencyLimiter queue full') {
+          // Shed before the task ran, so nothing was POSTed. The failure row reports the shed, but
+          // the outbox row stays 'pending' on purpose: retiring it would drop the only copy of an
+          // event the receiver provably never got. The sweep replays it once the backlog clears.
           await this.recordUndelivered(
             webhook,
             deliveryId,
@@ -617,7 +694,8 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
         if (error instanceof Error && error.message === 'ConcurrencyLimiter closed') {
           // Rejected by the shutdown drain before dispatching — record it like any other
           // undelivered delivery, and track the write so onModuleDestroy can await it (the
-          // limiter slot bookkeeping no longer covers this task).
+          // limiter slot bookkeeping no longer covers this task). Its outbox row stays 'pending':
+          // the POST never happened, so the next start's sweep is what finally delivers the event.
           const record = this.recordUndelivered(
             webhook,
             deliveryId,
@@ -651,9 +729,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     event: string,
     idempotencyKey: string,
     data: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<WebhookDeliveryOutcome> {
     const deliveryId = generateDeliveryId();
-    await this.deliverOne(webhook, deliveryId, idempotencyKey, { sessionId, event, baseData: data });
+    return this.deliverOne(webhook, deliveryId, idempotencyKey, { sessionId, event, baseData: data });
   }
 
   /**
@@ -715,7 +793,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       }
       // All direct-path retries exhausted — persist a durable failure record before giving up, mirroring
       // the queued processor's final-attempt path so the queue-disabled path isn't a blind spot.
-      await recordTerminalFailure(this.failureRepository, this.logger, {
+      const recorded = await recordTerminalFailure(this.failureRepository, this.logger, {
         webhookId: webhook.id,
         sessionId: payload.sessionId,
         event: payload.event,
@@ -725,31 +803,19 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
         attempts: attempt,
         error,
       });
-      incrementWebhookDeliveryFailures();
+      if (recorded) {
+        incrementWebhookDeliveryFailures();
+      }
       throw error;
     }
   }
 
-  /**
-   * Drop operator-supplied custom headers that target reserved names (Content-Type or any
-   * X-OpenWA-* header) so a webhook config cannot forge the signature/event/idempotency
-   * headers. Spread the result BEFORE the system headers so system always wins. Shared with
-   * WebhookService.test(), which must probe with headers identical to a real delivery's.
-   */
+  /** Shared with WebhookService.test(), which must probe with headers identical to a real delivery's. */
   sanitizeCustomHeaders(custom: Record<string, string> | null | undefined): Record<string, string> {
-    const safe: Record<string, string> = {};
-    for (const [key, value] of Object.entries(custom ?? {})) {
-      if (!/^(content-type|x-openwa-)/i.test(key)) {
-        safe[key] = value;
-      }
-    }
-    return safe;
+    return sanitizeCustomHeaders(custom);
   }
 
-  /** HMAC-SHA256 over the exact pre-serialized body, prefixed for receiver-side verification. */
   generateSignature(payload: string, secret: string): string {
-    const hmac = crypto.createHmac('sha256', secret);
-    hmac.update(payload);
-    return `sha256=${hmac.digest('hex')}`;
+    return generateSignature(payload, secret);
   }
 }

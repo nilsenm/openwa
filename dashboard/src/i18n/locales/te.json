@@ -7,10 +7,12 @@
   },
   "common": {
     "appName": "OpenWA",
+    "updateAvailable": "v{{version}} అందుబాటులో ఉంది",
     "loading": "లోడ్ అవుతోంది...",
     "cancel": "రద్దు చేయి",
     "delete": "తొలగించు",
     "create": "సృష్టించు",
+    "save": "Save",
     "close": "మూసివేయి",
     "showApiKey": "API కీని చూపు",
     "hideApiKey": "API కీని దాచు",
@@ -87,6 +89,8 @@
     "unreadBadge": "{{count}} చదవని సందేశం",
     "unreadBadge_other": "{{count}} చదవని సందేశాలు",
     "loadingMessages": "సందేశాలను లోడ్ చేస్తోంది...",
+    "loadingOlderMessages": "పాత సందేశాలను లోడ్ చేస్తోంది...",
+    "loadOlderMessagesError": "పాత సందేశాలను లోడ్ చేయడం విఫలమైంది. మళ్లీ ప్రయత్నించడానికి పైకి స్క్రోల్ చేయండి.",
     "noMessagesInChat": "ఇంకా సందేశాలు లేవు. ప్రారంభించడానికి మొదటి సందేశాన్ని పంపండి!",
     "downloadDocument": "డాక్యుమెంట్‌ను డౌన్‌లోడ్ చేయి",
     "actions": {
@@ -110,6 +114,7 @@
     "groupSubtitle": "సమూహం",
     "privateContactSubtitle": "ప్రైవేట్ పరిచయం",
     "deleteConfirm": "ఈ సందేశాన్ని అందరి కోసం తొలగించాలా?",
+    "promptButtons": "సందేశ ఎంపికలు",
     "messageDeleted": "🚫 ఈ సందేశం తొలగించబడింది",
     "messageMasked": "🔒 లింక్ చేసిన పరికరాల్లో WhatsApp దీన్ని దాచింది — మీ ప్రధాన ఫోన్‌లో చూడండి",
     "kind": {
@@ -159,6 +164,7 @@
       "send": "సందేశాన్ని పంపడం విఫలమైంది",
       "react": "సందేశానికి ప్రతిస్పందించడం విఫలమైంది",
       "delete": "సందేశాన్ని తొలగించడం విఫలమైంది",
+      "clickButton": "బటన్ క్లిక్ విఫలమైంది",
       "fileTooLarge": "ఫైల్ చాలా పెద్దది (గరిష్టం 18 MB)"
     },
     "loadMessagesError": "సందేశాలను లోడ్ చేయడం సాధ్యం కాలేదు. సర్వర్ లాగ్‌లను తనిఖీ చేయండి.",
@@ -210,6 +216,7 @@
     "noSessions": "ఎలాంటి సెషన్లు కనుగొనబడలేదు. ప్రారంభించడానికి ఒకదాన్ని సృష్టించండి.",
     "view": "చూడు",
     "disconnect": "డిస్‌కనెక్ట్ చేయి",
+    "disconnectFailed": "సెషన్‌ను డిస్‌కనెక్ట్ చేయడం సాధ్యం కాలేదు",
     "errorPrefix": "లోపం: {{message}}",
     "loadError": "డేటాను లోడ్ చేయడం విఫలమైంది",
     "charts": {
@@ -220,6 +227,7 @@
         "30d": "30 రో"
       },
       "overTime": "కాలక్రమంలో సందేశాలు",
+      "overTimeUtcDays": "కాలక్రమంలో సందేశాలు (UTC ప్రకారం రోజులు)",
       "byType": "రకం వారీగా సందేశాలు",
       "topChats": "టాప్ చాట్‌లు",
       "sent": "పంపినవి",
@@ -244,6 +252,7 @@
   "sessions": {
     "title": "సెషన్స్",
     "subtitle": "మీ వాట్సాప్ సెషన్లు మరియు QR కోడ్ కనెక్షన్లను నిర్వహించండి",
+    "feedDisconnected": "ప్రత్యక్ష నవీకరణలు డిస్‌కనెక్ట్ అయ్యాయి",
     "newSession": "కొత్త సెషన్",
     "searchPlaceholder": "సెషన్ల కోసం వెతకండి...",
     "filter": {
@@ -301,10 +310,28 @@
       "created": "సృష్టించబడింది",
       "lastActive": "చివరిసారి యాక్టివ్",
       "autoRejectCalls": "కాల్‌లను ఆటోమేటిక్‌గా తిరస్కరించు",
-      "autoRejectCallsHint": "ఇన్‌కమింగ్ కాల్‌లు మోగిన వెంటనే తిరస్కరించబడతాయి. call.received వెబ్‌హుక్ మాత్రం ముందుగా పంపబడుతుంది. తదుపరి కాల్ నుండి వర్తిస్తుంది — పునఃప్రారంభం అవసరం లేదు."
+      "autoRejectCallsHint": "ఇన్‌కమింగ్ కాల్‌లు మోగిన వెంటనే తిరస్కరించబడతాయి. call.received వెబ్‌హుక్ మాత్రం ముందుగా పంపబడుతుంది. తదుపరి కాల్ నుండి వర్తిస్తుంది, పునఃప్రారంభం అవసరం లేదు. Baileys ఇంజిన్‌లో మాత్రమే: whatsapp-web.js తో కాల్‌లను తిరస్కరించడం సాధ్యం కాదు."
+    },
+    "proxy": {
+      "title": "Proxy Configuration",
+      "status": "Current",
+      "enabled": "Use proxy",
+      "url": "Proxy URL",
+      "urlPlaceholder": "http://user:pass@proxy.example.com:8080",
+      "urlKeepPlaceholder": "Enter new URL to replace {{host}} (credentials not shown)",
+      "configured": "{{host}} ({{type}})",
+      "noProxy": "No proxy configured",
+      "hasCredentials": "Credentials are stored but not shown. Enter a full URL to change them.",
+      "hint": "Changes apply on the next session start, not to a running connection. The proxy must be real and reachable — an unreachable value blocks QR delivery and start returns 504.",
+      "createHint": "Only needed when your network cannot reach WhatsApp directly. Must be a real, reachable proxy.",
+      "invalidUrl": "Enter a valid http, https, socks4, or socks5 proxy URL.",
+      "saveSuccessTitle": "Proxy Saved",
+      "saveSuccess": "Proxy settings saved. They apply on the next session start.",
+      "saveError": "Failed to save proxy settings"
     },
     "actions": {
       "view": "చూడు",
+      "proxy": "Proxy",
       "start": "ప్రారంభించు",
       "stop": "ఆపివేయి",
       "reconnect": "మళ్లీ కనెక్ట్ చేయి",
@@ -320,7 +347,8 @@
       "actionRequiredTitle": "చర్య అవసరం",
       "actionRequiredDesc": "ఈ సెషన్‌కు మీ శ్రద్ధ అవసరం. ఏమి చేయాలో చూడటానికి సెషన్‌ను తెరవండి.",
       "failedTitle": "సెషన్ విఫలమైంది",
-      "failedDesc": "వాట్సాప్ సెషన్ ప్రారంభం కావడం విఫలమైంది. కారణాన్ని చూడటానికి సెషన్‌ను తెరవండి."
+      "failedDesc": "వాట్సాప్ సెషన్ ప్రారంభం కావడం విఫలమైంది. కారణాన్ని చూడటానికి సెషన్‌ను తెరవండి.",
+      "stopFailedTitle": "ఆపడం విఫలమైంది"
     },
     "card": {
       "phone": "ఫోన్",
@@ -357,6 +385,7 @@
       "phoneLabel": "ఫోన్ నంబర్",
       "phonePlaceholder": "ఉదాహరణకు, 919876543210",
       "phoneHint": "అంతర్జాతీయ ఆకృతిలో (కంట్రీ కోడ్ + నంబర్) సంఖ్యలు మాత్రమే (+, ఖాళీలు, లేదా డాష్‌లు లేకుండా).",
+      "relinkWarning": "whatsapp-web.js ఇంజిన్‌లో, ఇప్పటికే లింక్ చేసిన సెషన్ ఉన్న నంబర్‌కు కోడ్ అడిగితే WhatsApp ఆ పరికరం లింక్‌ను తొలగించవచ్చు. ఆ సెషన్ కొనసాగాలంటే QR ట్యాబ్‌ను వాడండి.",
       "invalidPhone": "చెల్లుబాటు అయ్యే ఫోన్ నంబర్‌ను నమోదు చేయండి: 6–15 సంఖ్యలు, ముందుగా కంట్రీ కోడ్, ఎలాంటి చిహ్నాలు లేకుండా.",
       "generateButton": "పెయిరింగ్ కోడ్‌ను రూపొందించండి",
       "generating": "పెయిరింగ్ కోడ్‌ను రూపొందిస్తోంది...",
@@ -371,7 +400,8 @@
     },
     "start": {
       "teardownPendingTitle": "సెషన్ ప్రారంభం",
-      "teardownPending": "ఈ సెషన్ యొక్క ఆధారాల విచ్ఛిన్నం ఇంకా స్థిరపడుతోంది. కొద్దిసేపు ఆగి మళ్లీ ప్రయత్నించండి."
+      "teardownPending": "ఈ సెషన్ యొక్క ఆధారాల విచ్ఛిన్నం ఇంకా స్థిరపడుతోంది. కొద్దిసేపు ఆగి మళ్లీ ప్రయత్నించండి.",
+      "errorTitle": "ప్రారంభం విఫలమైంది"
     },
     "restriction": {
       "reachout_timelock": "కొత్త చాట్‌లు నిరోధించబడ్డాయి",
@@ -409,9 +439,11 @@
       "fields": {
         "sender": "పంపినవారు",
         "recipient": "స్వీకర్త",
+        "chatId": "చాట్ ID",
         "body": "సందేశ విషయం",
         "type": "సందేశ రకం",
         "isGroup": "గ్రూప్ చాట్",
+        "kind": "Chat kind",
         "fromMe": "నేను పంపినది",
         "hasMedia": "మీడియా ఉంది",
         "mentions": "ప్రస్తావనలు"
@@ -435,7 +467,10 @@
     },
     "empty": {
       "title": "ఎలాంటి వెబ్‌హుక్స్ కాన్ఫిగర్ చేయబడలేదు",
-      "description": "నిజ-సమయ ఈవెంట్ నోటిఫికేషన్‌లను పొందడానికి ఒక వెబ్‌హుక్‌ను జోడించండి"
+      "description": "నిజ-సమయ ఈవెంట్ నోటిఫికేషన్‌లను పొందడానికి ఒక వెబ్‌హుక్‌ను జోడించండి",
+      "loadErrorTitle": "వెబ్‌హుక్స్‌ను లోడ్ చేయడం సాధ్యం కాలేదు",
+      "forbiddenTitle": "వెబ్‌హుక్స్‌కు యాక్సెస్ లేదు",
+      "forbiddenDesc": "వెబ్‌హుక్స్‌కు ఆపరేటర్ లేదా అడ్మిన్ పాత్ర ఉన్న API కీ అవసరం."
     },
     "toasts": {
       "created": "వెబ్‌హుక్ విజయవంతంగా సృష్టించబడింది",
@@ -456,9 +491,27 @@
     "eventDescriptions": {
       "message.received": "సందేశం వచ్చినప్పుడు",
       "message.sent": "సందేశం పంపబడినప్పుడు",
-      "session.connected": "సెషన్ కనెక్ట్ అయినప్పుడు",
-      "session.disconnected": "సెషన్ డిస్‌కనెక్ట్ అయినప్పుడు",
+      "message.ack": "సందేశం డెలివరీ లేదా చదివిన స్థితి మారినప్పుడు",
+      "message.failed": "పంపిన సందేశం డెలివరీ విఫలమైనప్పుడు",
+      "message.revoked": "సందేశం అందరికీ తొలగించబడినప్పుడు",
+      "message.reaction": "ప్రతిస్పందన జోడించబడినప్పుడు, మార్చబడినప్పుడు లేదా తీసివేయబడినప్పుడు",
+      "message.edited": "సందేశం సవరించబడినప్పుడు",
+      "session.status": "సెషన్ స్థితి మారినప్పుడు",
       "session.qr": "QR కోడ్ రూపొందించబడినప్పుడు",
+      "session.authenticated": "సెషన్ జత చేయబడి సిద్ధమైనప్పుడు",
+      "session.disconnected": "సెషన్ డిస్‌కనెక్ట్ అయినప్పుడు",
+      "session.reconnect_loop": "సెషన్ మళ్లీ కనెక్ట్ కావడంలో పదేపదే విఫలమైనప్పుడు",
+      "session.restriction": "WhatsApp ఖాతాను పరిమితం చేసినప్పుడు లేదా పరిమితిని తొలగించినప్పుడు",
+      "presence.update": "సబ్‌స్క్రైబ్ చేసిన చాట్ ఆన్‌లైన్‌కి వచ్చినప్పుడు, టైప్ చేస్తున్నప్పుడు లేదా ఆఫ్‌లైన్‌కి వెళ్ళినప్పుడు",
+      "group.join": "సభ్యులు గ్రూప్‌లో చేరినప్పుడు లేదా జోడించబడినప్పుడు",
+      "group.leave": "సభ్యులు గ్రూప్ నుండి నిష్క్రమించినప్పుడు లేదా తొలగించబడినప్పుడు",
+      "group.update": "గ్రూప్ పేరు, వివరణ లేదా సెట్టింగ్‌లు మారినప్పుడు",
+      "group.join_request": "ఈ సెషన్ నిర్వహించే గ్రూప్‌లో చేరడానికి ఎవరైనా అభ్యర్థించినప్పుడు",
+      "call.received": "ఇన్‌కమింగ్ కాల్ రింగ్ అవ్వడం మొదలైనప్పుడు",
+      "call.accepted": "కాల్‌కు సమాధానం ఇచ్చినప్పుడు",
+      "call.rejected": "కాల్ తిరస్కరించబడినప్పుడు",
+      "call.missed": "కాల్‌కు ఎవరూ సమాధానం ఇవ్వనప్పుడు",
+      "status.received": "కాంటాక్ట్ స్టేటస్ పోస్ట్ చేసినప్పుడు",
       "all": "అన్ని ఈవెంట్స్"
     }
   },
@@ -495,7 +548,10 @@
       "title": "టెంప్లేట్‌లు ఏవీ సేవ్ కాలేదు",
       "description": "సాధారణ ప్రత్యుత్తరాలు మరియు నోటిఫికేషన్‌లను వేగవంతం చేయడానికి పునర్వినియోగ టెంప్లేట్‌ను సృష్టించండి.",
       "noSessionsTitle": "సెషన్‌లు అందుబాటులో లేవు",
-      "noSessionsDesc": "టెంప్లేట్‌లను జోడించే ముందు WhatsApp సెషన్‌ను సృష్టించండి."
+      "noSessionsDesc": "టెంప్లేట్‌లను జోడించే ముందు WhatsApp సెషన్‌ను సృష్టించండి.",
+      "loadErrorTitle": "టెంప్లేట్‌లను లోడ్ చేయడం సాధ్యం కాలేదు",
+      "forbiddenTitle": "టెంప్లేట్‌లకు యాక్సెస్ లేదు",
+      "forbiddenDesc": "టెంప్లేట్‌లకు ఆపరేటర్ లేదా అడ్మిన్ పాత్ర ఉన్న API కీ అవసరం."
     },
     "toasts": {
       "created": "టెంప్లేట్ విజయవంతంగా సృష్టించబడింది",
@@ -533,7 +589,8 @@
       "role": "పాత్ర",
       "status": "స్థితి",
       "lastUsed": "చివరిగా ఉపయోగించినది",
-      "actions": "చర్యలు"
+      "actions": "చర్యలు",
+      "sessions": "సెషన్లు"
     },
     "statuses": {
       "active": "యాక్టివ్",
@@ -554,7 +611,19 @@
     "actions": {
       "copy": "కాపీ",
       "revoke": "రద్దు చేయి",
-      "delete": "తొలగించు"
+      "delete": "తొలగించు",
+      "editSessions": "సెషన్లను సవరించు"
+    },
+    "sessions": {
+      "label": "సెషన్ యాక్సెస్",
+      "hint": "ఈ కీ ఉపయోగించగల సెషన్లను ఎంచుకోండి.",
+      "all": "అన్ని సెషన్లు",
+      "empty": "ఇంకా సెషన్లు లేవు. సెషన్లు ఉన్న తర్వాత ఈ కీ అన్నింటికీ యాక్సెస్ పొందుతుంది.",
+      "restricted": "{{count}} ఎంచుకున్నారు",
+      "editTitle": "సెషన్ యాక్సెస్‌ను సవరించు",
+      "save": "సేవ్",
+      "choose": "సెషన్లను ఎంచుకోండి",
+      "leaveAll": "అన్ని సెషన్లకు వదిలేయండి"
     }
   },
   "logs": {
@@ -600,6 +669,12 @@
     "loadingGroups": "గ్రూప్‌లను లోడ్ చేస్తోంది...",
     "noGroupsFound": "ఎలాంటి గ్రూప్‌లు కనుగొనబడలేదు",
     "selectGroupHint": "మీ వాట్సాప్ నుండి ఒక గ్రూప్‌ను ఎంచుకోండి",
+    "selectAllGroups": "అన్నీ ఎంచుకోండి",
+    "selectMatchingGroups": "సరిపోలినవి ఎంచుకోండి",
+    "clearGroupSelection": "క్లియర్ చేయండి",
+    "groupsSelectedCount": "ఎంచుకున్నవి: {{count}}/{{max}}",
+    "noGroupsMatch": "మీ శోధనకు సరిపోయే గ్రూప్‌లు లేవు",
+    "forwardUsesFirstGroup": "ఫార్వర్డ్ ఎంచుకున్న మొదటి గ్రూప్‌ను మాత్రమే, ఫార్వర్డ్ చేసే చాట్‌గా ఉపయోగిస్తుంది.",
     "phoneHint": "ఖాళీలు (spaces) లేకుండా అంతర్జాతీయ ఆకృతిని ఉపయోగించండి",
     "messageType": "సందేశం రకం",
     "types": {
@@ -623,6 +698,7 @@
     "removeFile": "ఫైల్‌ను తొలగించు",
     "fileReadError": "ఫైల్ చదవడం విఫలమైంది",
     "fileTooLarge": "ఫైల్ చాలా పెద్దది (గరిష్టం 18 MB)",
+    "recipientsFileTooLarge": "గ్రహీతల ఫైల్ చాలా పెద్దది (గరిష్టం 2 MB)",
     "caption": "క్యాప్షన్",
     "filename": "ఫైల్ పేరు",
     "captionPlaceholder": "క్యాప్షన్ ఎంటర్ చేయండి...",
@@ -650,22 +726,35 @@
     "forwardMessageId": "సందేశ ID",
     "forwardMessageIdHint": "ఫార్వార్డ్ చేయాల్సిన సందేశం యొక్క ID",
     "bulkRecipients": "గ్రహీతలు",
+    "bulkRecipientsUpload": "CSV/TXT అప్‌లోడ్ చేయండి",
     "bulkRecipientsPlaceholder": "+62812345678",
     "bulkRecipientsHint": "ఒక్కో లైన్‌లో ఒక ఫోన్ నంబర్ లేదా చాట్ ID (గరిష్టంగా 100)",
     "bulkRecipientsCount": "గ్రహీతలు: {{count}}",
     "bulkDelay": "సందేశాల మధ్య విరామం (ms)",
     "bulkDelayHint": "1000–60000 ms (డిఫాల్ట్ 3000)",
+    "bulkMediaKind": "ఇలా పంపండి",
+    "bulkMediaHint": "అటాచ్‌మెంట్ ఉన్నప్పుడు సందేశం దాని క్యాప్షన్‌గా మారుతుంది. ఎంచుకున్న ఫైల్ అభ్యర్థనలోనే పంపబడుతుంది, కాబట్టి పెద్ద ఫైల్‌లను చాలా మంది గ్రహీతలకు పంపడానికి పబ్లిక్ మీడియా URL అవసరం.",
+    "bulkMediaTooLarge": "ఈ ఫైల్‌ను {{count}} గ్రహీతలకు నేరుగా పంపడానికి ఇది చాలా పెద్దది: ఈ సంఖ్యలో ఒక్కో ఫైల్ గరిష్ఠంగా {{size}} ఉండవచ్చు. దానికి బదులుగా పబ్లిక్ మీడియా URLని ఉపయోగించండి లేదా తక్కువ మంది గ్రహీతలకు పంపండి.",
+    "bulkMediaUrlInvalid": "http:// లేదా https://తో మొదలయ్యే పూర్తి చిరునామాను ఉపయోగించండి, ఉదా: https://example.com/file.pdf.",
+    "bulkCaptionTooLong": "అటాచ్‌మెంట్ ఉన్నప్పుడు సందేశం దాని క్యాప్షన్‌గా పంపబడుతుంది, దాని పరిమితి {{max}} అక్షరాలు (ప్రస్తుతం {{count}}).",
+    "bulkAudioNoCaption": "ఆడియో శీర్షిక లేకుండా పంపబడుతుంది, కాబట్టి ఈ వచనం పంపబడదు. సందేశాన్ని ఖాళీ చేయండి లేదా వేరే రకాన్ని ఎంచుకోండి.",
     "send": "సందేశం పంపు",
     "sending": "పంపుతోంది...",
+    "sendingProgress": "పంపుతోంది {{current}}/{{total}}...",
     "viewOnly": "చూడటానికి మాత్రమే",
     "responseEmpty": "API రెస్పాన్స్ చూడటానికి ఒక సందేశాన్ని పంపండి",
     "successLabel": "విజయం",
     "failedLabel": "విఫలమైంది",
+    "groupsSentSummary": "{{sent}}/{{total}} పంపబడ్డాయి",
+    "groupSendCancelled": "{{count}}, రద్దు చేయబడ్డాయి",
+    "groupSendStopped": "{{count}}, HTTP {{status}} తర్వాత ఆపబడింది",
     "response": {
       "timestamp": "సమయము",
       "messageId": "సందేశం ID",
       "batchId": "బ్యాచ్ ID",
-      "error": "లోపం"
+      "error": "లోపం",
+      "groups": "గ్రూప్‌లు",
+      "notSent": "పంపబడలేదు"
     },
     "sendFailed": "సందేశాన్ని పంపడం విఫలమైంది",
     "notOnWhatsApp": "ఈ నంబర్ WhatsAppలో నమోదు కాలేదు",
@@ -887,6 +976,7 @@
       "title": "ఇన్‌స్టాన్స్‌లు",
       "description": "ఈ ఇంటిగ్రేషన్ కోసం ఖాతా వారీగా ఇన్‌స్టాన్స్‌లను ప్రొవిజన్ చేయండి. ప్రతి ఇన్‌స్టాన్స్‌కు దాని స్వంత సైనింగ్ సీక్రెట్ మరియు ఇన్‌గ్రెస్ URL ఉంటుంది.",
       "create": "ఇన్‌స్టాన్స్‌ను సృష్టించండి",
+      "save": "Save",
       "empty": "ఇంకా ఇన్‌స్టాన్స్‌లు లేవు. ఇన్‌గ్రెస్ URL మరియు సీక్రెట్ పొందడానికి ఒకటి సృష్టించండి.",
       "loadError": "ఇన్‌స్టాన్స్‌లను లోడ్ చేయడం విఫలమైంది.",
       "allSessions": "అన్ని సెషన్‌లు",

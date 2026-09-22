@@ -98,9 +98,9 @@ export class BaileysCatalog {
   }
 
   /**
-   * ponytail: walks the whole cursor chain on every call (no cursor cache), so page N costs the
-   * full catalog. WhatsApp caps catalogs at ~500 products; if profiling shows the walk matters,
-   * cache pages keyed by cursor and serve offsets from the cache.
+   * Walks the whole cursor chain on every call (no cursor cache), so page N costs the full
+   * catalog. WhatsApp caps catalogs at ~500 products; if profiling shows the walk matters, cache
+   * pages keyed by cursor and serve offsets from the cache.
    *
    * The budget is computed once and shared by every page: a per-query deadline would multiply by
    * the page count, making a ten-page walk slower than the 60s stall it replaces.
