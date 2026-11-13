@@ -1,4 +1,4 @@
-﻿name: Sync Upstream
+name: Sync Upstream
 
 # Trae los cambios del codigo abierto (rmyndharis/OpenWA) y los mergea a tu fork (lesotur).
 on:
@@ -13,7 +13,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           token: ${{ secrets.PAT }}
           fetch-depth: 0
