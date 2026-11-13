@@ -36,6 +36,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { writeFileAtomic } = require('./atomic-write');
 
 const DEFAULT_BAILEYS = path.join(__dirname, '..', 'node_modules', '@whiskeysockets', 'baileys');
 const NEWSLETTER_PATH = path.join('lib', 'Socket', 'newsletter.js');
@@ -81,7 +82,7 @@ const PARSE_REPLACE = `    // ${MARKER} — its input is { name, description } a
 function applyNewsletterCreatePatch(baileysDir = DEFAULT_BAILEYS) {
   const file = path.join(baileysDir, NEWSLETTER_PATH);
   if (!fs.existsSync(file)) {
-    return { skipped: true, reason: `${NEWSLETTER_PATH} not found — nothing to patch` };
+    throw new Error(`@whiskeysockets/baileys ${NEWSLETTER_PATH} not found at ${file}`);
   }
   const source = fs.readFileSync(file, 'utf8');
   if (source.includes(MARKER)) {
@@ -95,7 +96,7 @@ function applyNewsletterCreatePatch(baileysDir = DEFAULT_BAILEYS) {
         'before removing this patcher',
     );
   }
-  fs.writeFileSync(file, source.replace(PARSE_FIND, PARSE_REPLACE), 'utf8');
+  writeFileAtomic(file, source.replace(PARSE_FIND, PARSE_REPLACE));
   return { note: 'made the newsletter-create parse tolerate an absent picture, keeping the new channel id' };
 }
 
@@ -118,8 +119,8 @@ if (require.main === module) run();
 
 /**
  * The stand-down branch above as a predicate, for the startup guard (engine-patch-status.ts).
- * Unreadable reads as applied: a tree we cannot inspect is not evidence of a broken one, and the
- * apply function treats a missing newsletter.js as nothing to patch rather than a fault.
+ * Unreadable reads as applied: a tree we cannot inspect is not evidence of a broken one, and a
+ * missing newsletter.js already fails the image build, where the apply function refuses it.
  */
 function isApplied(baileysDir = DEFAULT_BAILEYS) {
   try {

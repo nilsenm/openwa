@@ -1,7 +1,7 @@
-import { Injectable, Optional } from '@nestjs/common';
+import { ForbiddenException, Injectable, Optional } from '@nestjs/common';
 import { ApiKey } from './entities/api-key.entity';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
-import { ContactDirectory } from '../../engine/identity/jid-candidates';
+import { ContactDirectory, resolveJidCandidates } from '../../engine/identity/jid-candidates';
 import {
   ChatScope,
   ChatScopeDirectory,
@@ -35,6 +35,17 @@ export class ChatScopeService {
     return isChatScopeRestricted(apiKey?.allowedChats);
   }
 
+  /**
+   * Refuse a restricted key that names no chat on a route whose chat is an optional `?chatId=`. The
+   * guard fences the chat id when it is present; this closes the case where it is missing or blank,
+   * which the route would otherwise read as "every chat".
+   */
+  requireChat(apiKey: Pick<ApiKey, 'allowedChats'> | null | undefined, chatId: string | undefined): void {
+    if (this.isRestricted(apiKey) && !chatId?.trim()) {
+      throw new ForbiddenException('chatId is required for a key restricted to selected chats');
+    }
+  }
+
   /** The literal scope for a key (no lookups), or `null` when unrestricted. */
   scopeFor(apiKey?: Pick<ApiKey, 'allowedChats'> | null): ChatScope | null {
     return buildChatScope(apiKey?.allowedChats ?? null);
@@ -42,15 +53,42 @@ export class ChatScopeService {
 
   /**
    * Whether a single requested `chatId` is inside the key's fence. Expands the REQUESTED id once
-   * through the lid table (at most two lookups) instead of expanding the whole allowlist.
+   * through the lid table (at most two lookups) instead of expanding the whole allowlist. A caller that
+   * checks several ids for one key passes the scope it compiled once with {@link scopeFor} for that same
+   * key; left out, the key is compiled here, and `null` is an unrestricted key.
    */
-  allows(apiKey: Pick<ApiKey, 'allowedChats'> | null | undefined, chatId: string): Promise<boolean> {
-    return chatIdAllowed(this.scopeFor(apiKey), chatId, this.singleDirectory());
+  allows(
+    apiKey: Pick<ApiKey, 'allowedChats'> | null | undefined,
+    chatId: string,
+    scope: ChatScope | null = this.scopeFor(apiKey),
+  ): Promise<boolean> {
+    return chatIdAllowed(scope, chatId, this.singleDirectory());
+  }
+
+  /**
+   * Every stored form of one chat or sender id: the neutral dialects of a phone plus the lids mapped to
+   * it, or the phone behind a lid. The same expansion the message list applies to its `chatId` and `from`
+   * filters, so a caller-supplied filter finds the same rows on every surface: the id as given is kept too,
+   * because a row stored under a spelling the expansion does not fold (a group or lid id with another case or
+   * device suffix) must still match the filter that names it.
+   */
+  async candidatesFor(id: string): Promise<string[]> {
+    return [...new Set([id, ...(await resolveJidCandidates(id, this.singleDirectory()))])];
   }
 
   /** The allowlist expanded once with the lid table (batched), for filtering a whole list. */
-  scopeForFilter(apiKey: Pick<ApiKey, 'allowedChats'> | null | undefined): Promise<ChatScope | null> {
+  scopeForFilter(apiKey?: Pick<ApiKey, 'allowedChats'> | null): Promise<ChatScope | null> {
     return buildExpandedChatScope(apiKey?.allowedChats ?? null, this.batchDirectory());
+  }
+
+  /**
+   * The expanded allowlist as a plain id array, for surfaces that filter at the query level
+   * (search's SQL `IN`), or `undefined` when the key is unrestricted. Same expansion as
+   * {@link scopeForFilter}: both stored dialects of every entry, lid twins included.
+   */
+  async idsForFilter(apiKey?: Pick<ApiKey, 'allowedChats'> | null): Promise<string[] | undefined> {
+    const scope = await this.scopeForFilter(apiKey);
+    return scope ? [...scope.allowed] : undefined;
   }
 
   /** The subset of `items` whose chat id is inside the key's fence (unrestricted ⇒ unchanged). */

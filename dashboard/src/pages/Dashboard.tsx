@@ -14,34 +14,55 @@ import {
   useStatsOverviewQuery,
 } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
+import { isSessionStarted } from '../utils/sessionActions';
 import './Dashboard.css';
+import { formatLastActive, formatSessionStatus } from '../utils/sessionDisplay';
 
-// recharts is heavy (~150kB gzip); load the analytics section on demand so it never bloats the
-// main/login bundle and only ships when the dashboard actually renders.
+// recharts is heavy (~116 kB gzip); load the analytics section on demand so it never bloats the
+// main/login bundle, and only for an unscoped admin key: /stats/messages refuses every other key.
 const DashboardCharts = lazy(() => import('../components/DashboardCharts').then(m => ({ default: m.DashboardCharts })));
+
+// How often the overview re-reads the sessions and their statistics while it stays open. It holds no socket, so without
+// this a session dropping changed nothing here until the window lost and regained focus. Paused while the tab is hidden.
+const SESSION_REFRESH_MS = 30_000;
 
 export function Dashboard() {
   const { t } = useTranslation();
   useDocumentTitle(t('dashboard.title'));
   const navigate = useNavigate();
-  const { canWrite } = useRole();
+  const { canWrite, isAdmin, scoped } = useRole();
+  // The cross-session statistics also refuse a session-scoped key, whatever its role.
+  const canReadStats = isAdmin && !scoped;
   const toast = useToast();
-  const { data: sessions = [], isLoading: loadingSessions, error: sessionsError } = useSessionsQuery();
-  const { data: stats } = useSessionStatsQuery();
-  const { data: webhooks, isError: webhooksFailed } = useWebhooksQuery();
-  // /stats/overview is ADMIN-only; for a non-admin key it 403s → overview stays undefined and the
-  // message cards fall back to '—' without breaking the (un-gated) session cards.
-  const { data: overview } = useStatsOverviewQuery();
+  const {
+    data: sessions = [],
+    isLoading: loadingSessions,
+    error: sessionsError,
+    isLoadingError: sessionsNeverLoaded,
+  } = useSessionsQuery(SESSION_REFRESH_MS);
+  const { data: stats } = useSessionStatsQuery(SESSION_REFRESH_MS);
+  // GET /webhooks is OPERATOR-only and /stats/overview ADMIN-only. A key without the role is not sent
+  // them, since the gateway audits every refusal as a failed authentication; their cards show the
+  // unavailable placeholder.
+  const { data: webhooks } = useWebhooksQuery(canWrite);
+  const { data: overview } = useStatsOverviewQuery(canReadStats);
   const stopMutation = useStopSessionMutation();
   const unavailable = '—';
   const messagesToday = overview ? overview.messages.today.sent + overview.messages.today.received : unavailable;
   const totalMessages = overview ? overview.messages.sent + overview.messages.received : unavailable;
   const loading = loadingSessions;
-  const error =
-    sessionsError instanceof Error ? sessionsError.message : sessionsError ? t('dashboard.loadError') : null;
-  // GET /webhooks is OPERATOR-only, so a viewer key always fails it: a failed read is not zero webhooks.
+  // Statistics that are unread or refused do not mean no session is connected: the list says which are.
+  const readyCount = stats?.ready ?? sessions.filter(session => session.status === 'ready').length;
+  // Only a read that never succeeded replaces the page: a failed background refetch keeps its cached
+  // data (as the webhook card below does), so the last good view stays on screen.
+  const error = sessionsNeverLoaded
+    ? sessionsError instanceof Error
+      ? sessionsError.message
+      : t('dashboard.loadError')
+    : null;
+  // A viewer is not sent the webhook read, and a pending or failed read is not zero webhooks either.
   // A failed background refetch keeps the cached list, which still counts.
-  const webhookCount = webhooksFailed && !webhooks ? unavailable : (webhooks ?? []).length;
+  const webhookCount = !canWrite || !webhooks ? unavailable : webhooks.length;
 
   const handleDisconnect = async (id: string) => {
     try {
@@ -57,7 +78,7 @@ export function Dashboard() {
       // it overstates what an operator reads as "connected". READY is the only status where the
       // session can actually send and receive.
       label: t('dashboard.stats.activeSessions'),
-      value: stats?.ready ?? 0,
+      value: readyCount,
       icon: MessageSquare,
       detail: stats ? t('dashboard.stats.sessionsDetail', { running: stats.active, total: stats.total }) : undefined,
     },
@@ -65,17 +86,6 @@ export function Dashboard() {
     { label: t('dashboard.stats.webhooksConfigured'), value: webhookCount, icon: Webhook },
     { label: t('dashboard.stats.totalMessages'), value: totalMessages, icon: Activity },
   ];
-
-  const formatLastActive = (date?: string | null) => {
-    if (!date) return t('common.never');
-    const diff = Date.now() - new Date(date).getTime();
-    if (diff < 60000) return t('common.justNow');
-    if (diff < 3600000) return t('common.minAgo', { count: Math.floor(diff / 60000) });
-    if (diff < 86400000) return t('common.hoursAgo', { count: Math.floor(diff / 3600000) });
-    return new Date(date).toLocaleDateString();
-  };
-
-  const formatStatus = (status: string) => t(`sessionStatus.${status}`, { defaultValue: status });
 
   if (loading) {
     return (
@@ -92,7 +102,13 @@ export function Dashboard() {
     return (
       <div className="dashboard" style={{ padding: '2rem' }}>
         <div
-          style={{ background: 'rgba(239, 68, 68, 0.12)', padding: '1rem', borderRadius: '8px', color: 'var(--error)' }}
+          role="alert"
+          style={{
+            background: 'rgba(239, 68, 68, 0.12)',
+            padding: '1rem',
+            borderRadius: '8px',
+            color: 'var(--error-text)',
+          }}
         >
           {t('dashboard.errorPrefix', { message: error })}
         </div>
@@ -106,8 +122,8 @@ export function Dashboard() {
         title={t('dashboard.title')}
         subtitle={t('dashboard.subtitle')}
         badge={
-          <span className={`status-badge ${stats && stats.ready > 0 ? 'connected' : 'disconnected'}`}>
-            {stats && stats.ready > 0 ? t('common.connected') : t('common.disconnected')}
+          <span className={`status-badge ${readyCount > 0 ? 'connected' : 'disconnected'}`}>
+            {readyCount > 0 ? t('common.connected') : t('common.disconnected')}
           </span>
         }
       />
@@ -126,15 +142,17 @@ export function Dashboard() {
         ))}
       </div>
 
-      <Suspense fallback={null}>
-        <DashboardCharts />
-      </Suspense>
+      {canReadStats && (
+        <Suspense fallback={null}>
+          <DashboardCharts />
+        </Suspense>
+      )}
 
       <section className="sessions-section">
         <div className="section-header">
           <h2>{t('dashboard.sessionsOverview')}</h2>
           <span className="section-subtitle">
-            {t('dashboard.showingSessions', { shown: sessions.length, total: stats?.total ?? 0 })}
+            {t('dashboard.showingSessions', { shown: sessions.length, total: stats?.total ?? sessions.length })}
           </span>
         </div>
 
@@ -160,14 +178,14 @@ export function Dashboard() {
                   </span>
                 </div>
                 <span className="phone">{session.phone || '—'}</span>
-                <span className={`status-pill ${session.status}`}>{formatStatus(session.status)}</span>
-                <span className="last-active">{formatLastActive(session.lastActive)}</span>
+                <span className={`status-pill ${session.status}`}>{formatSessionStatus(t, session.status)}</span>
+                <span className="last-active">{formatLastActive(t, session.lastActive)}</span>
                 <div className="actions">
                   <button className="btn-sm" onClick={() => navigate('/sessions')}>
                     {t('dashboard.view')}
                   </button>
                   {/* Stopping a session is an operator write; a read-only key would only collect a 403. */}
-                  {canWrite && ['ready', 'initializing', 'qr_ready'].includes(session.status) && (
+                  {canWrite && isSessionStarted(session) && (
                     <button className="btn-sm danger" onClick={() => handleDisconnect(session.id)}>
                       {t('dashboard.disconnect')}
                     </button>

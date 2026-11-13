@@ -31,8 +31,8 @@
  *
  * Run locally: `npm run check:sdk-docs`.
  */
-import { readFileSync, readdirSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -111,8 +111,11 @@ export function harvestShipped(dir = RESOURCE_DIR) {
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .replace(/^\s*\/\/.*$/gm, '');
     const body = source.slice(source.indexOf('export class'));
+    // A method may be `async`, or an arrow function assigned to a property (`remove = (id) =>`): each ships.
     const methods = [
-      ...body.matchAll(/^ {2}(?!constructor\b|private\b|readonly\b|static\b)([a-zA-Z][A-Za-z0-9]*)\s*[(<]/gm),
+      ...body.matchAll(
+        /^ {2}(?!constructor\b|private\b|readonly\b|static\b)(?:async\s+)?([a-zA-Z][A-Za-z0-9]*)\s*(?:[(<]|=\s*(?:async\s*)?(?:[(<]|[A-Za-z_]\w*\s*=>))/gm,
+      ),
     ];
     shipped.set(file.replace(/\.ts$/, ''), [...new Set(methods.map(m => m[1]))]);
   }
@@ -222,6 +225,6 @@ function main() {
   );
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main();
 }

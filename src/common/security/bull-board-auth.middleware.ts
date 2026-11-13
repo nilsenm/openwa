@@ -1,12 +1,14 @@
 import { Injectable, NestMiddleware, UnauthorizedException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Request, Response, NextFunction } from 'express';
-import { AuthService } from '../../modules/auth/auth.service';
+import { AuthService, UnresolvedApiKeyException } from '../../modules/auth/auth.service';
 import { ApiKeyRole } from '../../modules/auth/entities/api-key.entity';
 import { AuditService } from '../../modules/audit/audit.service';
 import { AuditAction } from '../../modules/audit/entities/audit-log.entity';
+import { allowUnauthenticatedAuditRow } from '../../modules/audit/auth-failure-audit-limiter';
 import { KeyRateLimiter, readIpRateLimitConfig } from '../../modules/mcp/mcp-rate-limit';
 import { limiterKeyForIp, resolveClientIp } from '../utils/ip';
+import { presentedApiKey } from './bearer-token';
 import { setRequestActor } from '../services/request-context';
 
 /**
@@ -28,6 +30,7 @@ import { setRequestActor } from '../services/request-context';
  *  - 401/403 rejections are recorded as WARN API_KEY_AUTH_FAILED, mirroring the REST guard and the
  *    MCP mount. The pre-auth IP throttle above is the flood bound — a throttled 429 is NOT audited,
  *    so a probing flood cannot drown the audit table either.
+ *    A 401 row also draws on a per-IP budget shared with the REST guard (auth-failure-audit-limiter).
  *  - An authenticated non-GET/HEAD request is recorded as INFO QUEUE_BOARD_MUTATED with method+path.
  *    This is a boundary trace of queue-mutation attempts reaching the Bull Board router (the UI's
  *    retry/remove/pause actions are POSTs); it deliberately does NOT model Bull Board's internal
@@ -66,7 +69,7 @@ export class BullBoardAuthMiddleware implements NestMiddleware {
 
       const rawKey = this.extractKey(req);
       if (!rawKey) {
-        throw new UnauthorizedException('API key is required to access the queue dashboard');
+        throw new UnresolvedApiKeyException('API key is required to access the queue dashboard');
       }
 
       const apiKey = await this.authService.validateApiKey(rawKey, clientIp);
@@ -117,13 +120,18 @@ export class BullBoardAuthMiddleware implements NestMiddleware {
       // Audit the rejected/denied attempt for a forensic trail, like the REST guard and the MCP
       // mount do. A throttle overrun (HttpException 429) is deliberately NOT audited: the limiter
       // already rejected it, and logging each throttled hit would let a flood write unbounded rows.
-      if (err instanceof UnauthorizedException || err instanceof ForbiddenException) {
-        void this.auditService?.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
-          ipAddress: this.getClientIp(req),
-          method: req.method,
-          path: this.auditPath(req),
-          errorMessage: err instanceof Error ? err.message : String(err),
-        });
+      // A 401 that resolved no key draws on the per-IP budget it shares with the REST guard; any
+      // rejection of a stored key, 401 or 403, is always recorded.
+      if (this.auditService && (err instanceof UnauthorizedException || err instanceof ForbiddenException)) {
+        const clientIp = this.getClientIp(req);
+        if (!(err instanceof UnresolvedApiKeyException) || allowUnauthenticatedAuditRow(clientIp)) {
+          void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
+            ipAddress: clientIp,
+            method: req.method,
+            path: this.auditPath(req),
+            errorMessage: err.message,
+          });
+        }
       }
       // Forward to Nest's exception layer so the response uses the standard format. A throttle overrun
       // surfaces here as an HttpException(429) → rendered as a standard 429 by the global exception filter.
@@ -138,14 +146,8 @@ export class BullBoardAuthMiddleware implements NestMiddleware {
   }
 
   private extractKey(req: Request): string | undefined {
-    const header = req.headers['x-api-key'];
-    if (typeof header === 'string' && header) return header;
-
-    const authHeader = req.headers['authorization'];
-    if (authHeader?.startsWith('Bearer ')) return authHeader.slice(7);
-
     // No ?apiKey query fallback — an admin key in the URL leaks into logs/history.
-    return undefined;
+    return presentedApiKey(req.headers);
   }
 
   private getClientIp(req: Request): string {

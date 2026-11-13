@@ -27,7 +27,10 @@ func (s *ChatsService) List(ctx context.Context, sessionID string, query *ListCh
 func (s *ChatsService) SubscribePresence(ctx context.Context, sessionID string, body SubscribePresenceRequest) (*SuccessResult, error) {
 	var out SuccessResult
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/presence/subscribe", nil, body, &out)
-	return &out, err
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // GetPresence returns the last presence reported for a chat, or nil when none has been — the chat
@@ -50,19 +53,24 @@ func (s *ChatsService) MarkUnread(ctx context.Context, sessionID string, body Ma
 	return s.post(ctx, sessionID, "/unread", body)
 }
 
-// Delete deletes a chat.
+// Delete deletes a chat. On success the gateway also deletes its stored copy of
+// the chat's messages (rows, inline and archived media, search entries); export
+// the history first if you need it.
 func (s *ChatsService) Delete(ctx context.Context, sessionID string, body DeleteChatRequest) (*SuccessResult, error) {
 	return s.post(ctx, sessionID, "/delete", body)
 }
 
 // Archive archives or unarchives a chat. A false Success means the engine
-// declined — on Baileys a chat with no known history cannot be archived.
+// declined — on Baileys an id the session knows no chat for. A known chat with
+// no message in memory or stored is archived without one.
 func (s *ChatsService) Archive(ctx context.Context, sessionID string, body ArchiveChatRequest) (*SuccessResult, error) {
 	return s.post(ctx, sessionID, "/archive", body)
 }
 
 // Pin pins a chat to the top of the list, or unpins it. A false Success means
-// WhatsApp declined — an account may pin only three chats at a time.
+// WhatsApp declined: an account may pin only three chats at a time. Only
+// whatsapp-web.js reports that refusal; Baileys cannot observe the cap and
+// always answers true.
 func (s *ChatsService) Pin(ctx context.Context, sessionID string, body PinChatRequest) (*SuccessResult, error) {
 	return s.post(ctx, sessionID, "/pin", body)
 }
@@ -79,7 +87,9 @@ func (s *ChatsService) Mute(ctx context.Context, sessionID string, body MuteChat
 
 // ClearMessages deletes every message in a chat, keeping the chat itself. A
 // false Success means the engine declined — an unknown chat, or on Baileys a
-// chat with no known history.
+// chat with no message in memory or stored. On success the gateway also deletes its stored
+// copy of the chat's messages (rows, inline and archived media, search
+// entries); export the history first if you need it.
 func (s *ChatsService) ClearMessages(ctx context.Context, sessionID, chatID string) (*SuccessResult, error) {
 	var out SuccessResult
 	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/messages"

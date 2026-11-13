@@ -3,6 +3,9 @@ import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { type createLogger } from '../../common/services/logger.service';
 
+/** Per-engine teardown deadline. Shutdown tears engines down in parallel, so it counts once. See shutdown-budget.ts. */
+export const ENGINE_TEARDOWN_TIMEOUT_MS = 10_000;
+
 /**
  * The credential-teardown / initial-status fences extracted from SessionEngineLifecycle. Plain
  * class (NOT a NestJS provider — the lifecycle's constructor signature is frozen by specs), built
@@ -44,6 +47,21 @@ export class SessionLifecycleFences {
   }
 
   /**
+   * Graceful destroy(), escalating to forceDestroy() when it throws or hits its deadline, like stop()
+   * does. For teardowns that leave the engine unreachable afterwards (it is removed from the Map), a
+   * failed graceful destroy would otherwise leave a live browser with no handle to kill it by.
+   * Resolves `false` only when both attempts failed. Not for shutdown(): the process is exiting.
+   */
+  async destroyWithEscalation(sessionId: string, engine: IWhatsAppEngine): Promise<boolean> {
+    if (await this.teardownEngineSafely(sessionId, engine, e => e.destroy(), 'destroy')) return true;
+    this.logger.warn(`Graceful destroy failed for session ${sessionId}; escalating to force-destroy`, {
+      sessionId,
+      action: 'destroy_escalate_force_destroy',
+    });
+    return this.teardownEngineSafely(sessionId, engine, e => e.forceDestroy(), 'force-destroy');
+  }
+
+  /**
    * Run an engine teardown (destroy/disconnect), isolating + time-bounding failures so a stuck
    * Chromium/socket can neither hang nor abort the caller. Always resolves — the caller is then free
    * to reconcile the engines Map and proceed with DB cleanup regardless of teardown outcome.
@@ -73,7 +91,7 @@ export class SessionLifecycleFences {
       await Promise.race([
         raw,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`engine.${label}() timed out`)), 10_000);
+          timer = setTimeout(() => reject(new Error(`engine.${label}() timed out`)), ENGINE_TEARDOWN_TIMEOUT_MS);
         }),
       ]);
       return true;
@@ -158,8 +176,9 @@ export class SessionLifecycleFences {
    * Wait for the captured `engine`'s exact in-flight `updateStatus(INITIALIZING)` write to settle.
    * Called by every retiring lifecycle control (stop/logout/delete/forceKill) AFTER the stop mark is
    * set and reconnect cancelled, and BEFORE teardown / the final DISCONNECTED write / parent-row
-   * deletion. This keeps the control action the final persisted owner: a delayed INITIALIZING write
-   * always settles first, so it can never land after the DISCONNECTED write or the row removal.
+   * deletion. A write that settles within the deadline precedes the control's final mutation.
+   * Retirement proceeds at the deadline; a late initial-status reply separately checks its captured
+   * engine before announcing, so it cannot emit after that engine has retired.
    *
    * Identity-checked on the engine object: a control action that captured engine A awaits ONLY A's
    * pending promise, never a replacement B's entry (and never deletes it). A bounded wait mirrors
@@ -171,8 +190,10 @@ export class SessionLifecycleFences {
     if (!pending || pending.engine !== engine) return;
 
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // A rejected write has settled too, and start()'s catch owns reporting it: the retiring control
+    // must still reach its teardown and final write.
     const settled = await Promise.race([
-      pending.promise.then(() => true),
+      pending.promise.catch(() => undefined).then(() => true),
       new Promise<boolean>(resolve => {
         timer = setTimeout(() => resolve(false), 10_000);
       }),
@@ -192,9 +213,12 @@ export class SessionLifecycleFences {
    * concurrency slot and makes a later start() see the session as "already started"; forceDestroy()
    * (not the graceful destroy()) is used because such an engine's browser/CDP connection is typically
    * already broken, so a graceful close would only time out before the process is reaped.
+   *
+   * The eviction is identity-checked (deleteIfLive): if a replacement engine is already registered
+   * for `id`, it stays. The passed engine is force-destroyed either way, since it is dead or abandoned.
    */
   evictAndForceDestroy(id: string, engine: IWhatsAppEngine): void {
-    this.engines.delete(id);
+    this.engines.deleteIfLive(id, engine);
     void this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
   }
 }

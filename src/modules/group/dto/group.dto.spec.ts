@@ -6,19 +6,19 @@ import {
   CreateGroupDto,
   GroupSubjectDto,
   GroupDescriptionDto,
+  GroupMemberLabelDto,
   JoinGroupDto,
   GroupSettingsDto,
   MembershipRequestActionDto,
   SetGroupPictureDto,
   GROUP_PARTICIPANTS_MAX,
 } from './group.dto';
+import { GLOBAL_VALIDATION_OPTIONS } from '../../../config/app-validation';
 
-// Mirror the global ValidationPipe: whitelist + forbidNonWhitelisted from src/main.ts, AND the
-// enableImplicitConversion transform option from src/config/app-validation.ts. The transform
-// option has to be applied here too — without it a spec exercises a stricter pipe than the one
+// Built from the options the global ValidationPipe uses (src/config/app-validation.ts), including the
+// enableImplicitConversion transform option: without it a spec exercises a stricter pipe than the one
 // that actually runs, so a payload this file rejects can still be accepted in production.
-const PIPE_OPTS = { whitelist: true, forbidNonWhitelisted: true };
-const PIPE_TRANSFORM_OPTS = { enableImplicitConversion: true };
+const { transformOptions: PIPE_TRANSFORM_OPTS, ...PIPE_OPTS } = GLOBAL_VALIDATION_OPTIONS;
 
 function errorsFor<T extends object>(cls: new () => T, payload: unknown): Promise<ValidationError[]> {
   return validate(plainToInstance(cls, payload as object, PIPE_TRANSFORM_OPTS), PIPE_OPTS);
@@ -40,6 +40,9 @@ describe('group DTO validation', () => {
     // A base64 that is only a data-URI prefix strips to nothing, so the url is what would be sent.
     const prefixOnly = { url: 'cdn/group.jpg', base64: 'data:image/jpeg;base64,', mimetype: 'image/jpeg' };
     expect((await errorsFor(SetGroupPictureDto, prefixOnly)).length).toBeGreaterThan(0);
+    // base64 wins when both are set, so a url alongside it must not switch off its type check.
+    const arrayBase64 = { url: 'https://a.example/x.jpg', base64: ['QUJD'], mimetype: 'image/jpeg' };
+    expect((await errorsFor(SetGroupPictureDto, arrayBase64)).some(e => e.property === 'base64')).toBe(true);
   });
 
   it('accepts a valid participants body (regression for #190)', async () => {
@@ -91,16 +94,70 @@ describe('group DTO validation', () => {
     expect((await errorsFor(GroupDescriptionDto, { description: 'a'.repeat(1025) })).length).toBeGreaterThan(0);
   });
 
+  it('bounds the member label at 30 characters, and an empty one clears it', async () => {
+    expect(await errorsFor(GroupMemberLabelDto, { label: '' })).toHaveLength(0);
+    expect(await errorsFor(GroupMemberLabelDto, { label: 'a'.repeat(30) })).toHaveLength(0);
+    expect((await errorsFor(GroupMemberLabelDto, { label: 'a'.repeat(31) })).map(e => e.property)).toEqual(['label']);
+  });
+
+  // Baileys sends label.slice(0, 30), which counts UTF-16 code units. @MaxLength would take both of these,
+  // and Baileys would then drop the tail behind a 200, the second one through the middle of an emoji.
+  it('counts the member label in UTF-16 code units, the unit Baileys cuts it at', async () => {
+    expect(await errorsFor(GroupMemberLabelDto, { label: '😀'.repeat(15) })).toHaveLength(0);
+    expect((await errorsFor(GroupMemberLabelDto, { label: '😀'.repeat(16) })).length).toBeGreaterThan(0);
+    expect((await errorsFor(GroupMemberLabelDto, { label: 'a' + '😀'.repeat(15) })).length).toBeGreaterThan(0);
+  });
+
+  // A number is read as its decimal string, as on every @ToStrictString field.
+  it.each([
+    ['missing', {}],
+    ['a boolean', { label: true }],
+    ['an object', { label: { text: 'Site A' } }],
+    ['null', { label: null }],
+    ['an array', { label: ['Site A'] }],
+  ])('refuses a member label that is %s', async (_name, payload) => {
+    expect((await errorsFor(GroupMemberLabelDto, payload)).map(e => e.property)).toEqual(['label']);
+  });
+
+  it('publishes the member label cap in the contract', () => {
+    const published = Reflect.getMetadata('swagger/apiModelProperties', GroupMemberLabelDto.prototype, 'label') as {
+      maxLength?: number;
+    };
+    expect(published.maxLength).toBe(30);
+  });
+
   it('requires a non-empty invite code on JoinGroupDto', async () => {
     expect(await errorsFor(JoinGroupDto, { inviteCode: 'AbCdEfGhIjKl' })).toHaveLength(0);
     expect((await errorsFor(JoinGroupDto, { inviteCode: '' })).length).toBeGreaterThan(0);
     expect((await errorsFor(JoinGroupDto, {})).length).toBeGreaterThan(0);
   });
 
+  it('caps the invite code at 128 characters, as the contract publishes', async () => {
+    const published = Reflect.getMetadata('swagger/apiModelProperties', JoinGroupDto.prototype, 'inviteCode') as {
+      maxLength?: number;
+    };
+    expect(published.maxLength).toBe(128);
+    expect(await errorsFor(JoinGroupDto, { inviteCode: 'a'.repeat(128) })).toHaveLength(0);
+    const tooLong = await errorsFor(JoinGroupDto, { inviteCode: 'a'.repeat(129) });
+    expect(tooLong.map(e => e.property)).toEqual(['inviteCode']);
+  });
+
+  it('SetGroupPictureDto accepts only an image mimetype, so a non-image payload is refused with 400', async () => {
+    for (const mimetype of ['image/jpeg', 'image/png']) {
+      expect(await errorsFor(SetGroupPictureDto, { base64: 'QUJD', mimetype })).toHaveLength(0);
+    }
+    for (const mimetype of ['application/pdf', 'text/plain', 'jpeg']) {
+      const errors = await errorsFor(SetGroupPictureDto, { base64: 'QUJD', mimetype });
+      expect(errors.map(e => e.property)).toEqual(['mimetype']);
+    }
+  });
+
   it('GroupSettingsDto accepts an empty body and any subset of fields (at-least-one is a service rule)', async () => {
     expect(await errorsFor(GroupSettingsDto, {})).toHaveLength(0);
     expect(await errorsFor(GroupSettingsDto, { announce: true })).toHaveLength(0);
     expect(await errorsFor(GroupSettingsDto, { announce: false, locked: true, ephemeralSeconds: 0 })).toHaveLength(0);
+    expect(await errorsFor(GroupSettingsDto, { memberAddMode: 'admins' })).toHaveLength(0);
+    expect(await errorsFor(GroupSettingsDto, { memberAddMode: 'all' })).toHaveLength(0);
   });
 
   it('GroupSettingsDto rejects wrong field types and a negative timer', async () => {
@@ -108,12 +165,16 @@ describe('group DTO validation', () => {
     expect((await errorsFor(GroupSettingsDto, { locked: 1 })).length).toBeGreaterThan(0);
     expect((await errorsFor(GroupSettingsDto, { ephemeralSeconds: -1 })).length).toBeGreaterThan(0);
     expect((await errorsFor(GroupSettingsDto, { ephemeralSeconds: 1.5 })).length).toBeGreaterThan(0);
+    for (const memberAddMode of ['everyone', '', 1]) {
+      expect((await errorsFor(GroupSettingsDto, { memberAddMode })).length).toBeGreaterThan(0);
+    }
   });
 
   it('GroupSettingsDto rejects an explicit null (400) instead of applying it as a value', async () => {
     expect((await errorsFor(GroupSettingsDto, { announce: null })).length).toBeGreaterThan(0);
     expect((await errorsFor(GroupSettingsDto, { locked: null })).length).toBeGreaterThan(0);
     expect((await errorsFor(GroupSettingsDto, { ephemeralSeconds: null })).length).toBeGreaterThan(0);
+    expect((await errorsFor(GroupSettingsDto, { memberAddMode: null })).length).toBeGreaterThan(0);
   });
 
   it('GroupSettingsDto still rejects unknown properties (forbidNonWhitelisted intact)', async () => {

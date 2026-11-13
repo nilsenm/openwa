@@ -24,14 +24,19 @@ async function run(tool: AnyToolDescriptor, input: unknown): Promise<unknown> {
 }
 
 describe('sessionTools', () => {
+  // engineLoaded, not isActive: a session a live peer node runs has no engine in this process, and
+  // an MCP call is never forwarded to the owner, so isActive would report it as stopped.
   it('SessionFindAll scopes by the key allowedSessions and maps entities to DTOs', async () => {
-    const findAll = jest.fn().mockResolvedValue([{ id: 's1', name: 'main', status: 'ready' }]);
-    const isActive = jest.fn().mockReturnValue(true);
-    const out = (await run(makeTools({ findAll, isActive } as unknown as SessionService).get('SessionFindAll')!, {
-      limit: 5,
-    })) as Array<{ id: string; engineLoaded: boolean }>;
+    const row = { id: 's1', name: 'main', status: 'ready' };
+    const findAll = jest.fn().mockResolvedValue([row]);
+    const isActive = jest.fn().mockReturnValue(false);
+    const engineLoaded = jest.fn().mockReturnValue(true);
+    const out = (await run(
+      makeTools({ findAll, isActive, engineLoaded } as unknown as SessionService).get('SessionFindAll')!,
+      { limit: 5 },
+    )) as Array<{ id: string; engineLoaded: boolean }>;
     expect(findAll).toHaveBeenCalledWith(null, { limit: 5, offset: undefined });
-    expect(isActive).toHaveBeenCalledWith('s1');
+    expect(engineLoaded).toHaveBeenCalledWith(row);
     expect(out).toEqual([expect.objectContaining({ id: 's1', engineLoaded: true })]);
   });
 
@@ -53,14 +58,18 @@ describe('sessionTools', () => {
   });
 
   it('SessionFindOne delegates to findOne and maps to the response DTO', async () => {
-    const findOne = jest.fn().mockResolvedValue({ id: 's1', name: 'main', status: 'ready' });
+    const row = { id: 's1', name: 'main', status: 'ready' };
+    const findOne = jest.fn().mockResolvedValue(row);
     const isActive = jest.fn().mockReturnValue(false);
-    const out = (await run(makeTools({ findOne, isActive } as unknown as SessionService).get('SessionFindOne')!, {
-      sessionId: 's1',
-    })) as { id: string; engineLoaded: boolean };
+    const engineLoaded = jest.fn().mockReturnValue(true);
+    const out = (await run(
+      makeTools({ findOne, isActive, engineLoaded } as unknown as SessionService).get('SessionFindOne')!,
+      { sessionId: 's1' },
+    )) as { id: string; engineLoaded: boolean };
     expect(findOne).toHaveBeenCalledWith('s1');
+    expect(engineLoaded).toHaveBeenCalledWith(row);
     expect(out.id).toBe('s1');
-    expect(out.engineLoaded).toBe(false);
+    expect(out.engineLoaded).toBe(true);
   });
 
   it('SessionGetChats delegates to getChats with paging', async () => {
@@ -92,14 +101,32 @@ describe('sessionTools', () => {
     expect(out).toEqual({ success: true });
   });
 
-  it('SessionGetPresence delegates to getPresence and passes the result through', async () => {
-    const getPresence = jest.fn().mockResolvedValue({ presence: 'online' });
+  // The store keeps the time the report arrived as unix milliseconds; the REST route (ChatPresenceResponseDto)
+  // answers it as a date-time, so the tool does too and a client reads one shape on both surfaces.
+  it('SessionGetPresence delegates to getPresence and answers observedAt as a date-time', async () => {
+    const report = {
+      chatId: '628111@c.us',
+      participants: [{ id: '628111@c.us', state: 'available' }],
+      groupOnlineCount: 3,
+      observedAt: Date.UTC(2026, 10, 10, 1, 2, 3),
+    };
+    const getPresence = jest.fn().mockResolvedValue(report);
     const out = await run(makeTools({ getPresence } as unknown as SessionService).get('SessionGetPresence')!, {
       sessionId: 's1',
       chatId: '628111@c.us',
     });
     expect(getPresence).toHaveBeenCalledWith('s1', '628111@c.us');
-    expect(out).toEqual({ presence: 'online' });
+    const wire = JSON.parse(JSON.stringify(out)) as Record<string, unknown>;
+    expect(wire).toEqual({ ...report, observedAt: '2026-11-10T01:02:03.000Z' });
+  });
+
+  it('SessionGetPresence answers null when nothing has been reported', async () => {
+    const getPresence = jest.fn().mockResolvedValue(null);
+    const out = await run(makeTools({ getPresence } as unknown as SessionService).get('SessionGetPresence')!, {
+      sessionId: 's1',
+      chatId: '628111@c.us',
+    });
+    expect(out).toBeNull();
   });
 
   it('SessionMarkChatRead maps the sendSeen result to a success field', async () => {

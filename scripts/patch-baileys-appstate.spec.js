@@ -68,9 +68,21 @@ test('refuses when the decode site appears more than once', () => {
   assert.throws(() => applyAppStatePatch(dir), /found 2/);
 });
 
-test('skips a tree that has no chats.js rather than throwing', () => {
+test('refuses a tree that has no chats.js rather than skipping it', () => {
+  // A moved or renamed chats.js is an upstream layout change: skipping it let the fatal image-build
+  // run pass and ship the unbounded loop. postinstall's --best-effort run still only warns.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'baileys-absent-'));
-  const result = applyAppStatePatch(dir);
-  assert.equal(result.skipped, true);
-  assert.match(result.reason, /not found/);
+  assert.throws(() => applyAppStatePatch(dir), /not found/);
+});
+
+test('applies to a copy of the installed Baileys, or finds it applied there already', () => {
+  // The fixtures above are built from this patcher's own find strings, so they pass just the same once the
+  // library stops containing them. A copy of the installed file does not.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'baileys-appstate-installed-'));
+  const file = path.join('lib', 'Socket', 'chats.js');
+  fs.mkdirSync(path.join(dir, path.dirname(file)), { recursive: true });
+  fs.copyFileSync(path.join(__dirname, '..', 'node_modules', '@whiskeysockets', 'baileys', file), path.join(dir, file));
+  applyAppStatePatch(dir);
+  assert.equal(isApplied(dir), true);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

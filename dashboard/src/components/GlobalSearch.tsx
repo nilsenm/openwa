@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { searchApi, type SearchHit } from '../services/api';
 import { renderHighlightedSnippet, buildSearchParams } from '../utils/search-highlight';
+import { isComposingKey } from '../utils/composition';
 import { useTranslation } from 'react-i18next';
 import './GlobalSearch.css';
 
 interface GlobalSearchProps {
   /** Called when the user clicks a result — the parent navigates to that chat/message. */
   onHit: (hit: SearchHit) => void;
-  /** When set, the scope toggle defaults to this session (optional). */
+  /** When set, offers a toggle that limits the search to this session (off by default). */
   currentSessionId?: string;
 }
 
@@ -19,6 +20,9 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
   const [q, setQ] = useState('');
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [total, setTotal] = useState(0);
+  // Where the next page starts on the server: hits already listed are dropped from a page, so this can
+  // run ahead of hits.length, and "more" stays up only while the server has rows past it.
+  const [nextOffset, setNextOffset] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scopeCurrent, setScopeCurrent] = useState(false);
@@ -45,6 +49,7 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
       if (!params) {
         setHits([]);
         setTotal(0);
+        setNextOffset(0);
         setError(null);
         setLoading(false);
         return;
@@ -54,16 +59,26 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
       try {
         const res = await searchApi.search(params);
         if (id !== requestId.current) return;
-        setHits(prev => (append ? [...prev, ...res.hits] : res.hits));
+        // A message indexed since the last page shifts the offset, so the next page can repeat a hit.
+        setHits(prev => {
+          if (!append) return res.hits;
+          const seen = new Set(prev.map(h => h.messageId));
+          return [...prev, ...res.hits.filter(h => !seen.has(h.messageId))];
+        });
         setTotal(res.total);
+        setNextOffset(offset + res.hits.length);
       } catch (e: unknown) {
         if (id !== requestId.current) return;
         const status = (e as { status?: number }).status;
         if (status === 501) setError(t('search.unavailable'));
         else if (status === 503) setError(t('search.error'));
         else setError(t('search.error'));
-        setHits([]);
-        setTotal(0);
+        // A failed next page keeps the pages already shown, and "more" stays on as the retry.
+        if (!append) {
+          setHits([]);
+          setTotal(0);
+          setNextOffset(0);
+        }
       } finally {
         if (id === requestId.current) setLoading(false);
       }
@@ -78,6 +93,7 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
       requestId.current += 1;
       setHits([]);
       setTotal(0);
+      setNextOffset(0);
       setError(null);
       setLoading(false);
       return;
@@ -116,12 +132,16 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
   // replaced by the loading row, which would otherwise leave focus on nothing.
   const loadMore = () => {
     inputRef.current?.focus();
-    void run(q, hits.length, true);
+    void run(q, nextOffset, true);
   };
 
   return (
     <div
       className="global-search"
+      // Focus back inside before the close below runs (a quick Tab out and back) cancels it.
+      onFocus={() => {
+        if (blurTimer.current) clearTimeout(blurTimer.current);
+      }}
       // Close only when focus leaves the whole widget: tabbing from the input to the scope toggle or
       // the "more" button must keep the results open, or the button unmounts before it can be used.
       onBlur={e => {
@@ -132,7 +152,7 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
       // "more") and is consumed, so a page-level Escape handler (the Chats page closes the open
       // conversation) leaves it alone.
       onKeyDown={e => {
-        if (e.key !== 'Escape' || e.nativeEvent.isComposing) return;
+        if (e.key !== 'Escape' || isComposingKey(e.nativeEvent)) return;
         // A pending debounce would reopen the results the user just dismissed. Cancelling it is the
         // key's whole effect, so it is consumed too, even before any results have opened.
         const cancelledSearch = timer.current !== null;
@@ -167,7 +187,6 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
           {!loading && error && <div className="global-search-state">{error}</div>}
           {!loading && !error && hits.length === 0 && <div className="global-search-state">{t('search.empty')}</div>}
           {!loading &&
-            !error &&
             hits.map(h => (
               <button
                 key={h.messageId}
@@ -182,7 +201,8 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
                 }}
               >
                 <div className="global-search-hit-meta">
-                  {h.chatId} · {new Date(h.timestamp * 1000).toLocaleString()}
+                  {/* bdi: the id and the time read left to right even inside right-to-left text. */}
+                  <bdi>{h.chatId}</bdi> · <bdi>{new Date(h.timestamp * 1000).toLocaleString()}</bdi>
                 </div>
                 <div className="global-search-hit-snippet">
                   {renderHighlightedSnippet(h.snippet).map((seg, i) =>
@@ -191,11 +211,11 @@ export function GlobalSearch({ onHit, currentSessionId }: GlobalSearchProps) {
                 </div>
               </button>
             ))}
-          {!loading && !error && hits.length < total && (
+          {!loading && nextOffset < total && (
             // preventDefault on mousedown keeps focus in the input, so a mouse click does not start the
             // close timer; click still fires for the mouse and for Enter/Space.
             <button className="global-search-more" onMouseDown={e => e.preventDefault()} onClick={loadMore}>
-              {t('search.results', { count: total })}
+              {t('search.loadMore', { shown: hits.length, total })}
             </button>
           )}
         </div>

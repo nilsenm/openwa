@@ -3,6 +3,7 @@ import type { Response } from 'express';
 import { ApiTags, ApiOperation, ApiParam, ApiResponse } from '@nestjs/swagger';
 import { StatusDeletedResponseDto, StatusListResponseDto, StatusResultDto } from './dto/status-response.dto';
 import { StatusService } from './status.service';
+import { retryAfterWhenBusy, storedFileAttachment } from '../../common/storage/storage-transfer';
 import { SendTextStatusDto } from './dto/send-text-status.dto';
 import { SendImageStatusDto, SendVideoStatusDto, SendVoiceStatusDto } from './dto/send-media-status.dto';
 import { RequireRole } from '../auth/decorators/auth.decorators';
@@ -12,6 +13,7 @@ import {
   MEDIA_TOO_LARGE_413,
   MEDIA_URL_PROXY_503,
   SESSION_NOT_STARTED_404,
+  STATUS_POST_503,
 } from '../../common/openapi/engine-status-responses';
 
 @ApiTags('status')
@@ -23,7 +25,7 @@ export class StatusController {
   @ApiOperation({ summary: 'Get all contact status updates' })
   @ApiResponse({
     status: 200,
-    description: 'Status updates visible to the session, grouped by contact.',
+    description: 'Status updates visible to the session, newest first.',
     type: StatusListResponseDto,
   })
   async getStatuses(@Param('sessionId') sessionId: string) {
@@ -47,26 +49,29 @@ export class StatusController {
   @ApiOperation({ summary: 'Stream a stored status media file' })
   @ApiResponse({
     status: 200,
-    description: 'The status image/video bytes.',
+    description: 'The status image, video or voice note (audio) bytes.',
     content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
   })
   @ApiResponse({ status: 404, description: 'No stored media (text status, omitted, or expired).' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'On S3 storage, the gateway already has 50 media downloads open across the status and chat media ' +
+      'routes. Retry once the Retry-After header (1 second) has passed.',
+  })
   async getStatusMedia(
     @Param('sessionId') sessionId: string,
     @Param('statusId') statusId: string,
     @Res({ passthrough: true }) res: Response,
   ): Promise<StreamableFile> {
-    const { buffer, mimetype } = await this.statusService.getStatusMedia(sessionId, statusId);
+    const { mimetype, ...source } = await this.statusService
+      .getStatusMedia(sessionId, statusId)
+      .catch(retryAfterWhenBusy(res));
     // attachment + nosniff together, mirroring the chat-media route: the mimetype is already
     // reduced to an inert set by the service, and forcing a download means even a mistake there
     // cannot render as active content on the API origin. The dashboard fetches status media as a
     // blob (fetch ignores Content-Disposition), so nothing depends on inline display here.
-    res.set({
-      'Content-Type': mimetype,
-      'X-Content-Type-Options': 'nosniff',
-      'Content-Disposition': 'attachment',
-    });
-    return new StreamableFile(buffer);
+    return storedFileAttachment(res, source, mimetype);
   }
 
   @Post('send-text')
@@ -80,6 +85,7 @@ export class StatusController {
     type: StatusResultDto,
   })
   @ApiResponse({ status: 400, description: 'Invalid request, or the post was blocked by a plugin.' })
+  @ApiResponse({ status: 503, description: STATUS_POST_503 })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
   async sendTextStatus(@Param('sessionId') sessionId: string, @Body() dto: SendTextStatusDto) {
@@ -107,7 +113,7 @@ export class StatusController {
       'post was blocked by a plugin.',
   })
   @ApiResponse({ status: 413, description: MEDIA_TOO_LARGE_413 })
-  @ApiResponse({ status: 503, description: MEDIA_URL_PROXY_503 })
+  @ApiResponse({ status: 503, description: `${MEDIA_URL_PROXY_503} ${STATUS_POST_503}` })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
   async sendImageStatus(@Param('sessionId') sessionId: string, @Body() dto: SendImageStatusDto) {
@@ -134,7 +140,7 @@ export class StatusController {
       'post was blocked by a plugin.',
   })
   @ApiResponse({ status: 413, description: MEDIA_TOO_LARGE_413 })
-  @ApiResponse({ status: 503, description: MEDIA_URL_PROXY_503 })
+  @ApiResponse({ status: 503, description: `${MEDIA_URL_PROXY_503} ${STATUS_POST_503}` })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
   async sendVideoStatus(@Param('sessionId') sessionId: string, @Body() dto: SendVideoStatusDto) {
@@ -162,7 +168,7 @@ export class StatusController {
       'post was blocked by a plugin.',
   })
   @ApiResponse({ status: 413, description: MEDIA_TOO_LARGE_413 })
-  @ApiResponse({ status: 503, description: MEDIA_URL_PROXY_503 })
+  @ApiResponse({ status: 503, description: `${MEDIA_URL_PROXY_503} ${STATUS_POST_503}` })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
   async sendVoiceStatus(@Param('sessionId') sessionId: string, @Body() dto: SendVoiceStatusDto) {
@@ -179,7 +185,12 @@ export class StatusController {
   @ApiResponse({ status: 200, description: 'Status deleted.', type: StatusDeletedResponseDto })
   @ApiResponse({
     status: 403,
-    description: "Key lacks OPERATOR role, or (whatsapp-web.js) the id is not one of the account's own statuses",
+    description:
+      "Key lacks OPERATOR role; on whatsapp-web.js, the id is not one of the account's own statuses; on " +
+      'Baileys, the status was not posted by this session in the last 24 hours (it was posted from the phone ' +
+      "or from another node, or before the session's engine was last created by a restart, a stop and start, " +
+      'or a reconnect the gateway runs itself), so its recipients are unknown and the revoke cannot be ' +
+      'addressed to them.',
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
@@ -188,7 +199,9 @@ export class StatusController {
     description:
       'The whatsapp-web.js page connection died mid-request, so the revoke did not complete. Safe ' +
       'to retry: revoking an already-revoked status converges. The status POST routes deliberately ' +
-      'do NOT answer this, because a replayed post would publish the status a second time.',
+      'do NOT answer this for whatsapp-web.js, because a replayed post would publish the status a second ' +
+      'time. On Baileys, also when WhatsApp rate-limits the revoke (code 429) or times out a query it ' +
+      'awaits (code 408).',
   })
   async deleteStatus(@Param('sessionId') sessionId: string, @Param('id') statusId: string) {
     await this.statusService.deleteStatus(sessionId, statusId);

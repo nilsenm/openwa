@@ -1,12 +1,9 @@
-import {
-  BadRequestException,
-  HttpException,
-  PayloadTooLargeException,
-  ServiceUnavailableException,
-} from '@nestjs/common';
+import { BadRequestException, HttpException, PayloadTooLargeException } from '@nestjs/common';
+import { EngineNotSentError, markNothingSent } from '../errors/engine-not-sent.error';
 import { SsrfBlockedError, withSafeFetch } from '../security/ssrf-guard';
 import { urlFetchProxy } from '../security/proxy-dispatcher';
 import { createLogger } from '../services/logger.service';
+import { positiveIntFromEnv } from '../utils/env-int';
 
 const logger = createLogger('RemoteMedia');
 
@@ -16,14 +13,10 @@ const DEFAULT_MEDIA_MAX_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MEDIA_TIMEOUT_MS = 30_000;
 
 /**
- * Read a positive-integer knob. Boot validation rejects a malformed value for every key read here,
- * so the fallback covers unset and empty only: `parseInt` accepts the leading digits of a
- * unit-suffixed value and would silently take `50mb` as 50.
+ * Cap on a custom link preview's image, URL or base64: 5 MiB. A preview image is a thumbnail, so the
+ * 50 MiB media default would let one text send pull a video-sized body into memory.
  */
-function positiveIntFromEnv(name: string, fallback: number): number {
-  const parsed = Number.parseInt(process.env[name] ?? '', 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
+export const LINK_PREVIEW_THUMBNAIL_MAX_BYTES = 5 * 1024 * 1024;
 
 /**
  * Fetch remote media as a Buffer for sending, with an SSRF host guard, a byte cap, and a timeout.
@@ -46,17 +39,27 @@ function positiveIntFromEnv(name: string, fallback: number): number {
  * instead: undici reports a proxy that refuses, cannot be resolved or fails its handshake with the
  * same `fetch failed` as an unreachable target, so the two cannot be told apart, and blaming the
  * caller's URL for an operator's proxy outage would send the client to fix a link that works. Once a
- * response has arrived the target was reached, and its failures stay 400/413.
+ * response has arrived the target was reached, and its failures stay 400/413. The 503 is an
+ * `EngineNotSentError`: the fetch runs before WhatsApp is asked, so a paced send gives its admission
+ * back. For the same reason every 400 and 413 here, and the SSRF block, carries `markNothingSent`: a keyed
+ * send frees its `Idempotency-Key` for them, as it does for the 503.
  *
  * `sessionProxyUrl` is the egress proxy of the session the fetch is attributed to, or undefined for
  * a direct one. It is required rather than optional so a new call site cannot leave a proxied
  * session's fetch going direct by omission; `urlFetchProxy` applies the operator's opt-out.
+ *
+ * `opts.maxBytes` lowers the cap for a caller that needs less (a link preview's thumbnail). It only
+ * tightens: a smaller MEDIA_DOWNLOAD_MAX_BYTES still wins.
  */
 export async function loadRemoteMediaBuffer(
   url: string,
   sessionProxyUrl: string | undefined,
+  opts: { maxBytes?: number } = {},
 ): Promise<{ data: Buffer; mimetype: string }> {
-  const maxBytes = positiveIntFromEnv('MEDIA_DOWNLOAD_MAX_BYTES', DEFAULT_MEDIA_MAX_BYTES);
+  const maxBytes = Math.min(
+    opts.maxBytes ?? Number.POSITIVE_INFINITY,
+    positiveIntFromEnv('MEDIA_DOWNLOAD_MAX_BYTES', DEFAULT_MEDIA_MAX_BYTES),
+  );
   const timeoutMs = positiveIntFromEnv('MEDIA_DOWNLOAD_TIMEOUT_MS', DEFAULT_MEDIA_TIMEOUT_MS);
 
   // Always guarded (media SSRF is independent of the webhook opt-out); withSafeFetch validates the
@@ -103,15 +106,15 @@ export async function loadRemoteMediaBuffer(
     },
     { proxyUrl },
   ).catch((error: unknown) => {
-    if (error instanceof HttpException || error instanceof SsrfBlockedError) throw error;
+    if (error instanceof HttpException || error instanceof SsrfBlockedError) throw markNothingSent(error);
     // Matched by name: the abort reason is a DOMException, which need not share this realm's Error.
     const name = (error as { name?: unknown } | null)?.name;
     const proxyHop = proxyUrl !== undefined && !responded;
     if (name === 'TimeoutError' || name === 'AbortError') {
       if (proxyHop) {
-        throw new ServiceUnavailableException(`Media fetch through the session proxy timed out after ${timeoutMs} ms`);
+        throw new EngineNotSentError(`Media fetch through the session proxy timed out after ${timeoutMs} ms`);
       }
-      throw new BadRequestException(`Media fetch timed out after ${timeoutMs} ms`);
+      throw markNothingSent(new BadRequestException(`Media fetch timed out after ${timeoutMs} ms`));
     }
     // undici reports a failed connection as TypeError('fetch failed') and a body cut off mid-read
     // as TypeError('terminated'). Their cause can name the resolved address or the proxy, so it is
@@ -120,8 +123,8 @@ export async function loadRemoteMediaBuffer(
     if (error instanceof TypeError && (error.message === 'fetch failed' || error.message === 'terminated')) {
       const cause: unknown = error.cause;
       logger.warn('Media fetch failed', { cause: cause instanceof Error ? cause.message : error.message });
-      if (proxyHop) throw new ServiceUnavailableException('Media fetch through the session proxy failed');
-      throw new BadRequestException('Media fetch failed');
+      if (proxyHop) throw new EngineNotSentError('Media fetch through the session proxy failed');
+      throw markNothingSent(new BadRequestException('Media fetch failed'));
     }
     throw error;
   });

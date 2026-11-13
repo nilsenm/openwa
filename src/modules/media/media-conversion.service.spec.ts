@@ -70,6 +70,37 @@ describe('MediaConversionService', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
+  describe('input load', () => {
+    // A download resolved before the gate was a 50 MiB buffer for every request that had not reached a
+    // slot, held until the gate answered 503: peak memory was the number of requests, not the cap.
+    it('downloads at most as many inputs at once as it converts', async () => {
+      let downloading = 0;
+      let peak = 0;
+      jest.spyOn(loadRemoteMedia, 'loadRemoteMediaBuffer').mockImplementation(async () => {
+        downloading++;
+        peak = Math.max(peak, downloading);
+        await new Promise(resolve => setTimeout(resolve, 15));
+        downloading--;
+        return { data: Buffer.from('input'), mimetype: 'audio/mpeg' };
+      });
+      runFfmpeg.mockImplementation(async () => {
+        await new Promise(resolve => setTimeout(resolve, 15));
+        return Buffer.from('converted-bytes');
+      });
+      const service = makeService(config({ 'mediaConversion.concurrency': 2 }));
+
+      const outcomes = await Promise.allSettled(
+        Array.from({ length: 30 }, () => service.convertToVoice(SESSION, { url: 'https://media.example/a.mp3' })),
+      );
+
+      expect(peak).toBeLessThanOrEqual(2);
+      expect(outcomes.filter(o => o.status === 'fulfilled')).toHaveLength(10);
+      const refused = outcomes.filter((o): o is PromiseRejectedResult => o.status === 'rejected');
+      expect(refused).toHaveLength(20);
+      expect(refused.every(o => o.reason instanceof ServiceUnavailableException)).toBe(true);
+    });
+  });
+
   describe('availability', () => {
     it('refuses with 503 when conversion is switched off, without probing for the binary', async () => {
       const service = makeService(config({ 'mediaConversion.enabled': false }));
@@ -108,6 +139,17 @@ describe('MediaConversionService', () => {
       ]);
 
       expect(probeFfmpeg).toHaveBeenCalledTimes(1);
+    });
+
+    // A probe that timed out on a loaded host, or hit EAGAIN, says nothing lasting about the binary.
+    it('probes again after a failed probe instead of reporting unavailable until restart', async () => {
+      probeFfmpeg.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      const service = makeService(config());
+
+      await expect(service.isAvailable()).resolves.toBe(false);
+      await expect(service.isAvailable()).resolves.toBe(true);
+      await expect(service.isAvailable()).resolves.toBe(true);
+      expect(probeFfmpeg).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -174,14 +216,26 @@ describe('MediaConversionService', () => {
         expect(load).toHaveBeenCalledWith('https://example.com/note.m4a', 'socks4://stored.invalid:1080');
       });
 
-      // Ids are generated uuids; anything else matches no row, and asking Postgres would raise on
-      // the cast rather than answer.
-      it('does not query the row for a session id that cannot be one', async () => {
+      it('uses the saved proxy for an imported safe-string session id', async () => {
+        const load = loadSpy();
+        const service = makeService(config(), { row: { proxyUrl: 'socks5://stored.invalid:1080' } });
+        await service.convertToVoice('legacy-session', { url: 'https://example.com/note.m4a' });
+        expect(findOne).toHaveBeenCalledWith({ where: { id: 'legacy-session' }, select: { proxyUrl: true } });
+        expect(load).toHaveBeenCalledWith('https://example.com/note.m4a', 'socks5://stored.invalid:1080');
+      });
+
+      it('keeps direct fetch behavior for an unknown safe-string id', async () => {
         const load = loadSpy();
         const service = makeService();
+        await service.convertToVoice('missing-session', { url: 'https://example.com/note.m4a' });
+        expect(findOne).toHaveBeenCalledTimes(1);
+        expect(load).toHaveBeenCalledWith('https://example.com/note.m4a', undefined);
+      });
 
-        await service.convertToVoice('not-a-uuid', { url: 'https://example.com/note.m4a' });
-
+      it('does not query a NUL-bearing session id', async () => {
+        const load = loadSpy();
+        const service = makeService();
+        await service.convertToVoice('session\0name', { url: 'https://example.com/note.m4a' });
         expect(findOne).not.toHaveBeenCalled();
         expect(load).toHaveBeenCalledWith('https://example.com/note.m4a', undefined);
       });
@@ -226,6 +280,36 @@ describe('MediaConversionService', () => {
       });
 
       expect((runFfmpeg.mock.calls[0] as [Buffer])[0]).toEqual(Buffer.from('inline'));
+    });
+
+    it.each(['convertToVoice', 'convertToVideo'] as const)(
+      '%s uses the URL when a data URI carries no base64 bytes',
+      async method => {
+        const load = jest
+          .spyOn(loadRemoteMedia, 'loadRemoteMediaBuffer')
+          .mockResolvedValue({ data: Buffer.from('remote-media'), mimetype: 'audio/mpeg' });
+        const service = makeService(config(), { registry: registryWith('socks5://live.invalid:1080') });
+
+        await service[method](SESSION, {
+          base64: 'data:audio/mpeg;base64,',
+          url: 'https://example.com/media',
+        });
+
+        expect((runFfmpeg.mock.calls[0] as [Buffer])[0]).toEqual(Buffer.from('remote-media'));
+        expect(load).toHaveBeenCalledWith('https://example.com/media', 'socks5://live.invalid:1080');
+      },
+    );
+
+    it('keeps nonempty base64 ahead of a stale URL', async () => {
+      const load = jest.spyOn(loadRemoteMedia, 'loadRemoteMediaBuffer');
+
+      await makeService().convertToVoice(SESSION, {
+        base64: 'data:audio/mpeg;base64,aW5saW5l',
+        url: 'https://example.com/ignored',
+      });
+
+      expect((runFfmpeg.mock.calls[0] as [Buffer])[0]).toEqual(Buffer.from('inline'));
+      expect(load).not.toHaveBeenCalled();
     });
 
     it('rejects base64 above the media cap with 413, before any conversion', async () => {
@@ -281,6 +365,19 @@ describe('MediaConversionService', () => {
       await expect(service.convertToVoice(SESSION, { base64: 'AAAA' })).rejects.toThrow(/Invalid data found/);
     });
 
+    // A spawn that fails (EAGAIN, EMFILE, a binary removed by an upgrade) is the host's fault, not the
+    // caller's, so it answers the documented 503 and the binary is probed again on the next call.
+    it('answers 503, not 400, when ffmpeg cannot be started, and probes again', async () => {
+      runFfmpeg.mockRejectedValue(new ffmpeg.FfmpegSpawnError('Could not run ffmpeg: spawn ffmpeg EAGAIN'));
+      const service = makeService(config());
+
+      await expect(service.convertToVoice(SESSION, { base64: 'AAAA' })).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      await service.isAvailable();
+      expect(probeFfmpeg).toHaveBeenCalledTimes(2);
+    });
+
     // A programming error must not be relabelled as the caller's fault.
     it('lets an unexpected error through rather than reporting it as a bad request', async () => {
       runFfmpeg.mockRejectedValue(new TypeError('boom'));
@@ -319,6 +416,18 @@ describe('MediaConversionService', () => {
       }
       await Promise.all(inflight);
       expect(runFfmpeg).toHaveBeenCalledTimes(5);
+    });
+  });
+
+  describe('shutdown', () => {
+    // The shutdown hook is what kills the detached ffmpeg groups when app.close() runs, ahead of the
+    // process.exit that ShutdownService ends in.
+    it('kills the running ffmpeg groups when the application shuts down', () => {
+      const kill = jest.spyOn(ffmpeg, 'killRunningConversions').mockImplementation(() => undefined);
+
+      makeService().onApplicationShutdown();
+
+      expect(kill).toHaveBeenCalledTimes(1);
     });
   });
 });

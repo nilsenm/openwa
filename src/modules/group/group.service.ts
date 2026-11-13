@@ -1,12 +1,30 @@
 import { Injectable, BadRequestException, HttpException, HttpStatus, NotFoundException } from '@nestjs/common';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { GroupMemberAddMode, IWhatsAppEngine, MediaInput } from '../../engine/interfaces/whatsapp-engine.interface';
-import { assertBase64WithinMediaCap, stripBase64DataUri } from '../message/media-cap.util';
-import { chatKind } from '../../engine/identity/wa-id';
+import { resolveMediaBody } from '../message/media-cap.util';
+import { chatKind, toNeutralJid } from '../../engine/identity/wa-id';
 import { isAddressableParticipant } from '../../engine/identity/wa-id';
 import { SetGroupPictureDto } from './dto/group.dto';
 import { paginate, ListOptions } from '../../common/utils/paginate';
 import { SendPacingService } from '../message/send-pacing.service';
+import { createLogger } from '../../common/services/logger.service';
+import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
+
+/**
+ * Whether a failed paced write provably contacted nobody, so its reserved budget can go back: a
+ * client or refusal status (400 bad input, 403 refused, 404 no such group, 409 not ready), a 501
+ * for an operation the engine lacks, or a 503 WhatsApp rate limit (EngineThrottledError), which
+ * WhatsApp turned away before it ran. Anything else (a 503 deadline that abandoned an IQ still in
+ * flight, a dropped socket, a dead page) leaves the outcome unknown, and WhatsApp may already have
+ * added the participants, so the batch stays charged.
+ */
+function contactedNobody(error: unknown): boolean {
+  return (
+    error instanceof HttpException &&
+    (error.getStatus() < 500 || error instanceof EngineNotSupportedError || error instanceof EngineThrottledError)
+  );
+}
 
 /**
  * Owns engine access for group operations. Controllers depend on this service instead of
@@ -15,6 +33,8 @@ import { SendPacingService } from '../message/send-pacing.service';
  */
 @Injectable()
 export class GroupService {
+  private readonly logger = createLogger('GroupService');
+
   constructor(
     private readonly engines: EngineRegistry,
     private readonly pacing: SendPacingService,
@@ -45,16 +65,20 @@ export class GroupService {
     }
   }
 
+  /** Every group before a caller applies authorization and pagination. */
+  listGroups(sessionId: string) {
+    return this.getEngine(sessionId).getGroups();
+  }
+
   getGroups(sessionId: string, opts: ListOptions = {}) {
     // getEngine throws synchronously (sync 400 guard); the engine returns the full set and we
     // bound the HTTP response window via paginate().
-    return this.getEngine(sessionId)
-      .getGroups()
-      .then(groups => paginate(groups, opts.limit, opts.offset));
+    return this.listGroups(sessionId).then(groups => paginate(groups, opts.limit, opts.offset));
   }
 
   async getGroupInfo(sessionId: string, groupId: string) {
-    const group = await this.getEngine(sessionId).getGroupInfo(groupId);
+    const target = this.groupTarget(groupId);
+    const group = await this.getEngine(sessionId).getGroupInfo(target);
     if (!group) {
       throw new NotFoundException(`Group ${groupId} not found`);
     }
@@ -67,10 +91,15 @@ export class GroupService {
    */
   async createGroup(sessionId: string, name: string, participants: string[]) {
     this.assertAddressableParticipants(participants);
-    const coldCount = await this.pacing.assertReachoutAllowed(sessionId, participants);
-    const group = await this.getEngine(sessionId).createGroup(name, participants);
-    this.pacing.chargeGroupReachouts(sessionId, coldCount);
-    return group;
+    const reservation = await this.pacing.assertReachoutAllowed(sessionId, participants);
+    try {
+      return await this.getEngine(sessionId).createGroup(name, participants);
+    } catch (error) {
+      // A refusal invited nobody, so the reserved budget goes back (whatsapp-web.js always 501s here).
+      // An outcome-unknown failure stays charged.
+      if (contactedNobody(error)) this.pacing.refundGroupReachouts(sessionId, reservation);
+      throw error;
+    }
   }
 
   /**
@@ -79,30 +108,40 @@ export class GroupService {
    * draws on the same cold-reachout budget a first message does.
    */
   async addParticipants(sessionId: string, groupId: string, participants: string[]) {
+    const group = this.groupTarget(groupId);
     this.assertAddressableParticipants(participants);
-    const coldCount = await this.pacing.assertReachoutAllowed(sessionId, participants);
-    const result = await this.getEngine(sessionId).addParticipants(groupId, participants);
-    this.pacing.chargeGroupReachouts(sessionId, coldCount);
-    return result;
+    const reservation = await this.pacing.assertReachoutAllowed(sessionId, participants);
+    try {
+      return await this.getEngine(sessionId).addParticipants(group, participants);
+    } catch (error) {
+      // A refused add contacted nobody. Per-participant failures an engine reports without throwing
+      // stay charged: the batch was attempted. So does an outcome-unknown failure.
+      if (contactedNobody(error)) this.pacing.refundGroupReachouts(sessionId, reservation);
+      throw error;
+    }
   }
 
   removeParticipants(sessionId: string, groupId: string, participants: string[]) {
+    const group = this.groupTarget(groupId);
     this.assertAddressableParticipants(participants);
-    return this.getEngine(sessionId).removeParticipants(groupId, participants);
+    return this.getEngine(sessionId).removeParticipants(group, participants);
   }
 
   promoteParticipants(sessionId: string, groupId: string, participants: string[]) {
+    const group = this.groupTarget(groupId);
     this.assertAddressableParticipants(participants);
-    return this.getEngine(sessionId).promoteParticipants(groupId, participants);
+    return this.getEngine(sessionId).promoteParticipants(group, participants);
   }
 
   demoteParticipants(sessionId: string, groupId: string, participants: string[]) {
+    const group = this.groupTarget(groupId);
     this.assertAddressableParticipants(participants);
-    return this.getEngine(sessionId).demoteParticipants(groupId, participants);
+    return this.getEngine(sessionId).demoteParticipants(group, participants);
   }
 
   getGroupMembershipRequests(sessionId: string, groupId: string) {
-    return this.getEngine(sessionId).getGroupMembershipRequests(groupId);
+    const group = this.groupTarget(groupId);
+    return this.getEngine(sessionId).getGroupMembershipRequests(group);
   }
 
   /**
@@ -113,33 +152,47 @@ export class GroupService {
    * feeds a named requester straight to `requesterIds.map(createWid)`.
    */
   approveGroupMembershipRequests(sessionId: string, groupId: string, participants?: string[]) {
+    const group = this.groupTarget(groupId);
     if (participants) this.assertAddressableParticipants(participants);
-    return this.getEngine(sessionId).approveGroupMembershipRequests(groupId, participants);
+    return this.getEngine(sessionId).approveGroupMembershipRequests(group, participants);
   }
 
   rejectGroupMembershipRequests(sessionId: string, groupId: string, participants?: string[]) {
+    const group = this.groupTarget(groupId);
     if (participants) this.assertAddressableParticipants(participants);
-    return this.getEngine(sessionId).rejectGroupMembershipRequests(groupId, participants);
+    return this.getEngine(sessionId).rejectGroupMembershipRequests(group, participants);
   }
 
   setGroupSubject(sessionId: string, groupId: string, subject: string) {
-    return this.getEngine(sessionId).setGroupSubject(groupId, subject);
+    const group = this.groupTarget(groupId);
+    return this.getEngine(sessionId).setGroupSubject(group, subject);
   }
 
   setGroupDescription(sessionId: string, groupId: string, description: string) {
-    return this.getEngine(sessionId).setGroupDescription(groupId, description);
+    const group = this.groupTarget(groupId);
+    return this.getEngine(sessionId).setGroupDescription(group, description);
+  }
+
+  setGroupMemberLabel(sessionId: string, groupId: string, label: string): Promise<void> {
+    this.assertGroupId(groupId);
+    // Baileys relays the label as a group message only to a jid whose domain is exactly `g.us`; any
+    // other spelling the check accepts (`120363@G.US`, a trailing space) went out as a 1:1 message.
+    return this.getEngine(sessionId).setGroupMemberLabel(toNeutralJid(groupId), label);
   }
 
   leaveGroup(sessionId: string, groupId: string) {
-    return this.getEngine(sessionId).leaveGroup(groupId);
+    const group = this.groupTarget(groupId);
+    return this.getEngine(sessionId).leaveGroup(group);
   }
 
   getGroupInviteCode(sessionId: string, groupId: string) {
-    return this.getEngine(sessionId).getGroupInviteCode(groupId);
+    const group = this.groupTarget(groupId);
+    return this.getEngine(sessionId).getGroupInviteCode(group);
   }
 
   revokeGroupInviteCode(sessionId: string, groupId: string) {
-    return this.getEngine(sessionId).revokeGroupInviteCode(groupId);
+    const group = this.groupTarget(groupId);
+    return this.getEngine(sessionId).revokeGroupInviteCode(group);
   }
 
   /**
@@ -148,14 +201,22 @@ export class GroupService {
    * client error it is.
    */
   getGroupJoinInfo(sessionId: string, inviteCode: string) {
-    if (!inviteCode?.trim()) {
-      throw new BadRequestException('An invite code is required');
-    }
-    return this.getEngine(sessionId).getGroupJoinInfo(inviteCode.trim());
+    const code = this.requireInviteCode(inviteCode);
+    return this.getEngine(sessionId).getGroupJoinInfo(code);
   }
 
+  /** Same rule as the preview, so a code that previews also joins. */
   joinGroupViaInviteCode(sessionId: string, inviteCode: string) {
-    return this.getEngine(sessionId).joinGroupViaInviteCode(inviteCode);
+    const code = this.requireInviteCode(inviteCode);
+    return this.getEngine(sessionId).joinGroupViaInviteCode(code);
+  }
+
+  private requireInviteCode(inviteCode: string): string {
+    const code = inviteCode?.trim();
+    if (!code) {
+      throw new BadRequestException('An invite code is required');
+    }
+    return code;
   }
 
   /**
@@ -166,40 +227,50 @@ export class GroupService {
    * belongs replaced or permanently deleted the account's own avatar and answered 200, while
    * whatsapp-web.js refused the same input through requireGroupChat. Guarded here rather than in either
    * adapter so both engines agree, and so no engine ever sees the wrong kind of id.
+   *
+   * The member label uses it too: Baileys relays that label as a message to whatever jid it is given, so
+   * a 1:1 id would send a group protocol message to a person.
+   *
+   * One `@` only: the kind is read after the last one, while Baileys reads the domain after the first, so
+   * `628123456789@c.us@g.us` passed here as a group and Baileys relayed it on its 1:1 path.
    */
   private assertGroupId(groupId: string): void {
-    if (chatKind(groupId) !== 'group') {
+    if (chatKind(groupId) !== 'group' || groupId.indexOf('@') !== groupId.lastIndexOf('@')) {
       throw new BadRequestException(`${groupId} is not a group id`);
     }
+  }
+
+  /**
+   * The group a route names, as `<id>@g.us`, or a 400 when the id names no group. Baileys addresses a group query to
+   * whatever jid it is handed, so a person's id would be sent a group request, and whatsapp-web.js only finds out
+   * after a page call; a spelling with another case or surrounding space is made canonical here for both. It runs
+   * before the session's engine is looked up, as the check of the picture routes does.
+   */
+  private groupTarget(groupId: string): string {
+    this.assertGroupId(groupId);
+    return toNeutralJid(groupId);
   }
 
   /** Read the group's picture URL, or null when it has none. Groups reuse the profile-picture read. */
   getGroupPicture(sessionId: string, groupId: string): Promise<string | null> {
     this.assertGroupId(groupId);
-    return this.getEngine(sessionId).getProfilePicture(groupId);
+    return this.getEngine(sessionId).getProfilePicture(toNeutralJid(groupId));
   }
 
   setGroupPicture(sessionId: string, groupId: string, dto: SetGroupPictureDto): Promise<void> {
     this.assertGroupId(groupId);
-    const base64 = stripBase64DataUri(dto.base64);
-    if (!dto.url && !base64) {
-      throw new BadRequestException('Either url or base64 must be provided');
-    }
-    if (base64 && !dto.mimetype) {
-      throw new BadRequestException('mimetype is required when using base64 data');
-    }
-    assertBase64WithinMediaCap(base64);
-    const media: MediaInput = {
-      mimetype: dto.mimetype || 'image/jpeg',
-      // base64 wins over url when both are present, mirroring setProfilePicture.
-      data: base64 || dto.url!,
-    };
-    return this.getEngine(sessionId).setGroupPicture(groupId, media);
+    // base64 wins over url when both are present, mirroring setProfilePicture.
+    const media: MediaInput = resolveMediaBody(dto, {
+      fallbackMimetype: 'image/jpeg',
+      requireMimetypeForBase64: true,
+      checkUrl: true,
+    });
+    return this.getEngine(sessionId).setGroupPicture(toNeutralJid(groupId), media);
   }
 
   deleteGroupPicture(sessionId: string, groupId: string): Promise<void> {
     this.assertGroupId(groupId);
-    return this.getEngine(sessionId).deleteGroupPicture(groupId);
+    return this.getEngine(sessionId).deleteGroupPicture(toNeutralJid(groupId));
   }
 
   /** Read the group's announce/locked/ephemeral/member-add settings; 404s (via getGroupInfo) when unknown. */
@@ -223,9 +294,12 @@ export class GroupService {
    * leave a silently half-applied patch behind when the ephemeral call then throws.
    *
    * A failure on the FIRST applied field propagates unchanged (nothing was applied, so the patch
-   * simply failed). A failure on a LATER field means the group is now in a mixed state, so the
+   * simply failed, except for a 503: a WhatsApp timeout can still land the change). A failure on a
+   * LATER field means the group is now in a mixed state, so the
    * error names the failed field and the ones already applied — the caller can reconcile instead
-   * of guessing which subset took effect. The wrapped error keeps the underlying HTTP status.
+   * of guessing which subset took effect. The wrapped error keeps the underlying HTTP status, and
+   * carries the underlying message only for an HTTP error; any other failure is logged here and
+   * reported as an internal error.
    */
   async updateGroupSettings(
     sessionId: string,
@@ -243,21 +317,22 @@ export class GroupService {
         'At least one of announce, locked, ephemeralSeconds, memberAddMode must be provided',
       );
     }
+    const group = this.groupTarget(groupId);
     const engine = this.getEngine(sessionId);
     const steps: Array<[field: string, apply: () => Promise<unknown>]> = [];
     if (ephemeralSeconds !== undefined) {
-      steps.push(['ephemeralSeconds', () => engine.setGroupEphemeral(groupId, ephemeralSeconds)]);
+      steps.push(['ephemeralSeconds', () => engine.setGroupEphemeral(group, ephemeralSeconds)]);
     }
     // After ephemeralSeconds, per the ordering rule above: this field is supported on both engines,
     // so it carries no deterministic refusal and must not displace the one field that does.
     if (memberAddMode !== undefined) {
-      steps.push(['memberAddMode', () => engine.setGroupMemberAddMode(groupId, memberAddMode)]);
+      steps.push(['memberAddMode', () => engine.setGroupMemberAddMode(group, memberAddMode)]);
     }
     if (announce !== undefined) {
-      steps.push(['announce', () => engine.setGroupMessagesAdminsOnly(groupId, announce)]);
+      steps.push(['announce', () => engine.setGroupMessagesAdminsOnly(group, announce)]);
     }
     if (locked !== undefined) {
-      steps.push(['locked', () => engine.setGroupInfoAdminsOnly(groupId, locked)]);
+      steps.push(['locked', () => engine.setGroupInfoAdminsOnly(group, locked)]);
     }
 
     const applied: string[] = [];
@@ -268,7 +343,16 @@ export class GroupService {
       } catch (error) {
         if (applied.length === 0) throw error;
         const status = error instanceof HttpException ? error.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
-        const detail = error instanceof Error ? error.message : String(error);
+        let detail = 'internal error';
+        if (error instanceof HttpException) {
+          detail = error.message;
+        } else {
+          this.logger.error(
+            'Group settings step failed after a partial apply',
+            error instanceof Error ? error.stack : String(error),
+            { sessionId, groupId, field, applied: applied.join(',') },
+          );
+        }
         throw new HttpException(
           `Group settings only partially applied: '${field}' failed (${detail}); already applied: ${applied.join(
             ', ',

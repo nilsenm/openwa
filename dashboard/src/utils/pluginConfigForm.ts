@@ -25,9 +25,42 @@ export function emptyForField(field: PluginConfigField): unknown {
   }
 }
 
+/**
+ * The form value of a stored config key, or the field's blank when it holds none. A field rendered as a select (a
+ * choice list on any type but boolean) keeps a stored null, which the select shows as a blank option; every other
+ * field reads null as unset, so its default shows.
+ */
+export function seedForField(field: PluginConfigField, config: Record<string, unknown>, key: string): unknown {
+  const isSelect = field.type !== 'boolean' && !!field.enum?.length;
+  return isSelect && key in config ? config[key] : (config[key] ?? emptyForField(field));
+}
+
 /** Coerce a text-input value to the field's type. A cleared number becomes undefined (so the key is
- *  omitted) rather than '' — the inverse of {@link emptyForField} for number fields. */
+ *  omitted) rather than '' — the inverse of {@link emptyForField} for number fields. A cleared secret
+ *  does too: the gateway keeps a stored secret for an empty string, so the save sends null for it
+ *  ({@link fillClearedFields}), the one value that removes it. */
 export function coerceFieldInput(field: PluginConfigField, raw: string): unknown {
   if (field.type === 'number') return raw === '' ? undefined : Number(raw);
+  if (field.secret && raw === '') return undefined;
   return raw;
+}
+
+/**
+ * Fill each cleared top-level field for the save. The gateway merges the PUT body over the stored
+ * config and JSON drops an undefined key, so an omitted field keeps its old value: send the field's
+ * default instead, or null when it has none and a value is stored. A field that was never stored
+ * stays omitted.
+ */
+export function fillClearedFields(
+  values: Record<string, unknown>,
+  stored: Record<string, unknown>,
+  properties: Record<string, PluginConfigField>,
+): Record<string, unknown> {
+  const out = { ...values };
+  for (const [key, field] of Object.entries(properties)) {
+    if (out[key] !== undefined) continue;
+    if (field.default !== undefined) out[key] = field.default;
+    else if (stored[key] != null) out[key] = null;
+  }
+  return out;
 }

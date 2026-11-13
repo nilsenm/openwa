@@ -18,19 +18,22 @@ See `docs/03-system-architecture.md` for the bigger picture.
 
 ## Getting started
 
-OpenWA targets **Node.js 22+**.
+OpenWA targets **Node.js 22.19 or newer** (`engines.node`); the dashboard unit tests need **22.22.2+ on 22, 24.15+ on 24 or 26+** (jsdom). On Linux x64/arm64 hosts using glibc, source installs also need **glibc 2.34 or newer** for the shipped `better-sqlite3` prebuild, even with PostgreSQL. Use Ubuntu 22.04+, Debian 12+, RHEL 9+ or the published Docker image on an older host; `npm rebuild better-sqlite3 --build-from-source` does not replace the preferred prebuild. See [startup troubleshooting](docs/12-troubleshooting-faq.md#issue-source-install-fails-with-a-glibc_2xx-not-found-error).
 
 ```bash
-# backend
-npm install
-cp .env.example .env        # adjust as needed
-npm run start:dev           # hot-reload, default port 2785
-
-# dashboard (separate terminal)
-cd dashboard && npm install && npm run dev
+npm ci
+npm run dev   # API on 2785, dashboard (Vite) on 2886
 ```
 
+Dashboard dependencies install with the root ones (postinstall). `npm run start:dev` runs the API
+alone. Use `npm install` only when intentionally changing dependencies.
+
 Default storage is SQLite, so no external services are required to run locally.
+
+No `.env` is needed: the first boot writes `data/.env.generated` with these defaults. Create a
+`.env` only to pin values. If you copy `.env.example` for that, change its `NODE_ENV=production`
+to `NODE_ENV=development`, or the dev server runs with production behaviour (no Swagger UI,
+generic validation errors, JSON logs).
 
 ## Before opening a pull request
 
@@ -57,7 +60,11 @@ npm run i18n:check && npm run build && npm run test:unit
 
 If you changed a DTO, a route, or an `@ApiResponse`, also run `npm run openapi:export` and
 commit the snapshot, then `npm run openapi:check` and `npm run check:contract-shapes`. The
-hand-written SDK types are compared against the schemas and will fail CI by field name.
+hand-written SDK types are compared against the schemas and will fail CI by field name. A new
+route also needs a method in each of the five SDKs and a row in `docs/18-sdk-design.md`, or an
+entry in the unexposed list of `sdk/README.md`, which `npm run check:sdk-routes`,
+`check:sdk-coverage`, `check:sdk-events` and `check:sdk-docs` verify, as CI's lint job does
+with `npm run check:versions`.
 
 - Add or update tests for behavior changes. Backend specs are colocated as `*.spec.ts`
   and run under Jest; dashboard tests are colocated as `*.test.ts` and run under

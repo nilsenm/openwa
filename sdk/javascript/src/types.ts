@@ -49,7 +49,9 @@ export interface ParticipantResult {
  * The group membership writes. A partial refusal does NOT fail the batch — the request answers 200
  * and reports the per-participant outcome here, so `success` alone hides a member that was rejected.
  */
-export interface ParticipantsResult extends SuccessResult {
+export interface ParticipantsResult {
+  success: boolean;
+  message: string;
   results: ParticipantResult[];
 }
 
@@ -65,7 +67,11 @@ export interface SessionResponse {
   lastActive?: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Only present when `status === 'failed'` (terminal failure) or `status === 'action_required'` (operator must intervene). */
+  /**
+   * Human-readable reason while `status` is `'failed'` or `'action_required'`, or `'initializing'` from the
+   * fifth attempt of a reconnect the engine runs itself (Baileys), or while a reconnect waits to retry after a
+   * failed relaunch (either engine); `null` otherwise.
+   */
   lastError?: string | null;
   /**
    * A limit WhatsApp itself has placed on the account, or `null` when there is none. Distinct from
@@ -74,10 +80,14 @@ export interface SessionResponse {
    */
   restriction?: AccountRestriction | null;
   /**
-   * Whether the gateway holds a live engine for this session right now — the precondition `stop`,
-   * `logout` and `force-kill` require and `start` refuses. Not derivable from `status`:
-   * `disconnected` covers both a session mid automatic-reconnect (engine present) and one stopped
-   * with no engine. Absent from a gateway that predates the field.
+   * Whether the gateway holds a live engine for this session: an engine in the answering process
+   * or, in a multi-node deployment, a live claim by the node running it. On the node running the
+   * session, `true` means `stop`, `logout` and `force-kill` can act and `start` is refused. For a
+   * session another node runs, those routes act only when request routing (`NODE_URL` on every
+   * node) forwards them; without it, other nodes answer 409 to `start` and `stop` and 400 to
+   * `logout` and `force-kill`. Not derivable from `status`: `disconnected` covers both a session
+   * mid automatic-reconnect (engine present) and one stopped with no engine. Absent from a gateway
+   * that predates the field.
    */
   engineLoaded: boolean;
 }
@@ -86,11 +96,12 @@ export interface SessionResponse {
  * A restriction WhatsApp has in force on a session's account.
  *
  * `reachout_timelock` leaves the session connected and existing chats working — only starting new
- * conversations is blocked — whereas `tos_block` and `proxy_block` refuse the connection itself and
- * therefore cannot coexist with a `ready` status.
+ * conversations is blocked — whereas `tos_block`, `proxy_block` and `passkey_required` stop a link or
+ * the connection itself and therefore cannot coexist with a `ready` status. `passkey_required` means
+ * WhatsApp asked for a passkey to finish linking a device, which the Baileys engine cannot answer.
  */
 export interface AccountRestriction {
-  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block';
+  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block' | 'passkey_required';
   /** The engine's own token for the cause, verbatim (`TOS_BLOCK`, `BIZ_QUALITY`, …). */
   code: string;
   /** ISO timestamp when enforcement ends, when WhatsApp states one. */
@@ -163,6 +174,7 @@ export interface GroupJoinInfo {
  * server always reports a concrete `reconnectBaseDelay` and `autoRejectCalls`.
  */
 export interface SessionConfig {
+  /** Baileys only: whatsapp-web.js stores the flag but cannot reject a call, so calls keep ringing there. */
   autoRejectCalls: boolean;
   maxReconnectAttempts: number | null;
   reconnectBaseDelay: number;
@@ -174,6 +186,7 @@ export interface SessionConfig {
  * number can express.
  */
 export interface UpdateSessionConfigRequest {
+  /** Baileys only: whatsapp-web.js stores the flag but cannot reject a call, so calls keep ringing there. */
   autoRejectCalls?: boolean | null;
   maxReconnectAttempts?: number | null;
   reconnectBaseDelay?: number | null;
@@ -197,6 +210,7 @@ export interface CreateSessionRequest {
   name: string;
   config?: Record<string, unknown>;
   proxyUrl?: string;
+  /** @deprecated Ignored by the gateway; the `proxyUrl` scheme selects the protocol. */
   proxyType?: 'http' | 'https' | 'socks4' | 'socks5';
 }
 
@@ -223,7 +237,7 @@ export interface SessionStatsOverview {
   ready: number;
   disconnected: number;
   byStatus: Record<string, number>;
-  memoryUsage?: { heapUsed: number; heapTotal: number; rss: number };
+  memoryUsage: { heapUsed: number; heapTotal: number; rss: number };
 }
 
 // ── Message ───────────────────────────────────────────────────────
@@ -248,11 +262,19 @@ export interface SendTextRequest {
    */
   linkPreview?: boolean;
   /**
-   * Attach a preview you supply yourself instead of one fetched from the URL. Nothing is fetched, so
-   * this works even for a URL the gateway cannot reach. **Baileys only** — whatsapp-web.js takes a
-   * boolean and answers 501. Cannot be combined with `linkPreview: false`.
+   * Attach a preview you supply yourself instead of one fetched from the URL. The page is not
+   * fetched, so this works even for a URL the gateway cannot reach. `thumbnailUrl` (fetched under the
+   * media SSRF rules) or `thumbnailBase64` (wins when both are set) adds an image, at most 5 MiB,
+   * rendered as the large card. **Baileys only** — whatsapp-web.js takes a boolean and answers 501.
+   * Cannot be combined with `linkPreview: false`.
    */
-  customLinkPreview?: { url: string; title: string; description?: string };
+  customLinkPreview?: {
+    url: string;
+    title: string;
+    description?: string;
+    thumbnailUrl?: string;
+    thumbnailBase64?: string;
+  };
   /**
    * Quote an earlier message, turning this send into a reply. Engine-specific: whatsapp-web.js
    * matches the serialized message id, Baileys the raw message key id of a message it has already
@@ -268,7 +290,10 @@ export interface SendMediaRequest {
   /** Requires `mimetype`. */
   base64?: string;
   mimetype?: string;
-  /** Required for documents; max 255 chars. */
+  /**
+   * Shown only on document sends; defaults to `file` when omitted (whatsapp-web.js first tries the URL basename).
+   * Max 255 chars.
+   */
   filename?: string;
   /** Max 1024 chars. */
   caption?: string;
@@ -474,6 +499,16 @@ export interface SendPollRequest {
 }
 
 export interface ListMessagesQuery {
+  type?: MessageType;
+  /** Inclusive message-time lower bound, Unix epoch milliseconds. */
+  since?: number;
+  /** Exclusive message-time upper bound, Unix epoch milliseconds. */
+  until?: number;
+  direction?: MessageDirection;
+  /** Newest first; timestamp excludes rows without known message time. Default createdAt. */
+  orderBy?: 'createdAt' | 'timestamp';
+  /** Exact WhatsApp message reference within the selection. */
+  messageId?: string;
   chatId?: Jid;
   from?: Jid;
   limit?: number;
@@ -508,9 +543,16 @@ export interface MessageRecord {
   body?: string | null;
   type: string;
   direction: MessageDirection;
-  /** Chat display name, when the session resolves one for the chat. */
+  /**
+   * Push name of the sender as the engine reported it (their saved contact name when it reported no push
+   * name); in a group this is the member who posted, not the group subject. Null when no name was known.
+   */
   chatName?: string | null;
-  /** Author display name for an inbound group message. */
+  /**
+   * JID of the sender of a group, status or broadcast-list message (`from` is the group, `status@broadcast`
+   * or the list id there; on Baileys a received list message is filed under the sender, so `from` is the
+   * sender too). Null on 1:1 messages and outgoing echoes.
+   */
   author?: string | null;
   /** Storage key of the archived media copy, when chat-media archiving wrote one. */
   mediaPath?: string | null;
@@ -523,10 +565,6 @@ export interface MessageRecord {
   createdAt: string;
 }
 
-/**
- * A message read live from WhatsApp by `messages.history()`. This is the engine
- * payload (richer and differently shaped than the persisted {@link MessageRecord}).
- */
 /**
  * The engine-normalized message kinds — persisted rows, `message.received`/`message.sent`
  * payloads and the websocket all use these values (raw engine tokens are normalized at the
@@ -550,6 +588,10 @@ export type MessageType =
   | 'masked'
   | 'unknown';
 
+/**
+ * A message read live from WhatsApp by `messages.history()`. This is the engine
+ * payload (richer and differently shaped than the persisted {@link MessageRecord}).
+ */
 export interface ChatHistoryMessage {
   id: string;
   from: Jid;
@@ -565,6 +607,10 @@ export interface ChatHistoryMessage {
   kind: ChatKind;
   /** Disappearing-messages timer on the chat, in seconds. Absent when the chat has none set. */
   ephemeralDuration?: number;
+  /** True when the sender forwarded this message rather than writing it. Absent otherwise. */
+  isForwarded?: boolean;
+  /** How many times the message has been forwarded. Set with `isForwarded`. */
+  forwardingScore?: number;
   /** For group messages, the participant who sent it (`from` is the group JID). */
   author?: Jid;
   mentionedIds?: Jid[];
@@ -604,6 +650,7 @@ export interface ChatHistoryMessage {
     sizeBytes?: number;
   };
   quotedMessage?: { id: string; body: string };
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
   /** Present on `order` messages only: the placed cart, plus the single-order token for its items. */
   order?: { orderId: string; token?: string };
@@ -613,6 +660,8 @@ export interface ChatHistoryMessage {
 
 /** Paginated payload returned by `GET /sessions/:id/messages`. */
 export interface MessageListResponse {
+  /** Unknown message-time rows in the selected scope; present for time selections only. */
+  unknownTimestampTotal?: number;
   messages: MessageRecord[];
   total: number;
 }
@@ -628,6 +677,21 @@ export interface ReactionSender {
 export interface ReactionRecord {
   emoji: string;
   senders: ReactionSender[];
+}
+
+export interface MessageReceiptParticipant {
+  participant: Jid;
+  /** Unix timestamp in seconds. */
+  timestamp: number;
+}
+
+export interface MessageReceiptsResponse {
+  delivery: MessageReceiptParticipant[];
+  deliveryRemaining?: number;
+  read: MessageReceiptParticipant[];
+  readRemaining?: number;
+  played: MessageReceiptParticipant[];
+  playedRemaining?: number;
 }
 
 // ── Bulk ──────────────────────────────────────────────────────────
@@ -695,9 +759,8 @@ export interface BatchMessageResult {
 export type BatchMessageStatus = 'pending' | 'sent' | 'failed' | 'cancelled';
 
 /**
- * Response from `GET /messages/batch/:batchId` (batch status polling) and
- * `POST /messages/batch/:batchId/cancel`. Distinct from
- * {@link BulkMessageResponse} (the send-bulk acknowledgement).
+ * Response from `GET /messages/batch/:batchId` (batch status polling). Distinct from
+ * {@link BulkMessageResponse} (the send-bulk acknowledgement) and {@link BatchCancelResponse}.
  */
 export interface BatchStatusResponse {
   batchId: string;
@@ -708,6 +771,13 @@ export interface BatchStatusResponse {
   completedAt?: string | null;
 }
 
+/** Response from `POST /messages/batch/:batchId/cancel`: the batch state without per-recipient `results`. */
+export interface BatchCancelResponse {
+  batchId: string;
+  status: BatchLifecycleStatus;
+  progress: BatchProgress;
+}
+
 /** Lifecycle of a whole batch — the `status` of {@link BatchStatusResponse}. */
 export type BatchLifecycleStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
 
@@ -715,32 +785,47 @@ export type BatchLifecycleStatus = 'pending' | 'processing' | 'completed' | 'fai
 
 export interface ContactRecord {
   id: Jid;
-  name?: string | null;
-  number?: string | null;
+  /** The name from the account's own addressbook. Absent for a contact that was never saved. */
+  name?: string;
+  /**
+   * MSISDN digits, without a leading + or any separators, for a `<phone>@c.us` contact. For a `<lid>@lid`
+   * contact it depends on the engine: Baileys carries the phone's digits when the phone is known and an empty
+   * string when it is not; whatsapp-web.js carries the lid's digits, which are not a phone number.
+   */
+  number: string;
   /** The name the contact set on their own account. Both engines emit this as `pushName`. */
-  pushName?: string | null;
-  isMyContact?: boolean;
+  pushName?: string;
+  /** Whether the entry exists in the account's addressbook. */
+  isMyContact: boolean;
   /**
    * Whether the account has blocked this contact. Reflects the account's real blocklist on both
    * engines. When the blocklist query fails the field stays at its default rather than reporting
    * "nobody is blocked", and the gateway logs a warning — so a `false` is not proof the contact is
    * unblocked if the link is unhealthy.
    */
-  isBlocked?: boolean;
-  profilePicUrl?: string | null;
+  isBlocked: boolean;
+  /**
+   * A cached picture URL. Only Baileys can fill it (whatsapp-web.js never sets it) and it is often
+   * absent there too, so its absence does not say whether the contact has a picture.
+   */
+  profilePicUrl?: string;
 }
 
 export interface CheckNumberResponse {
   number: string;
   exists: boolean;
-  whatsappId?: string | null;
+  /**
+   * The chat id WhatsApp holds for the number, in the neutral `<phone>@c.us` form on both engines (it can
+   * differ from the digits supplied), or `null` when the number is not registered.
+   */
+  whatsappId: string | null;
 }
 
 export interface ProfilePictureResponse {
   url: string | null;
 }
 
-/** Batch profile-picture lookup: a map of contact id → picture URL (null when the lookup failed). */
+/** Batch profile-picture lookup: a map of contact id → picture URL (null when the lookup failed). An id skipped after a lookup timed out is absent from the map; ask for it again. */
 export interface ProfilePicturesResponse {
   pictures: Record<string, string | null>;
 }
@@ -748,6 +833,16 @@ export interface ProfilePicturesResponse {
 export interface ContactPhoneResponse {
   contactId: Jid;
   phone: string | null;
+}
+
+export interface ContactLidResponse {
+  /** The number exactly as supplied in the path. */
+  number: string;
+  /**
+   * The `<lid>@lid` WhatsApp holds for the number, or `null` when it holds none. An unregistered number answers
+   * `null` too; `contacts.check` tells the two apart.
+   */
+  lid: string | null;
 }
 
 // ── Group ─────────────────────────────────────────────────────────
@@ -760,11 +855,13 @@ export interface GroupParticipant {
   isSuperAdmin: boolean;
 }
 
-/** Item returned by `GET /sessions/:id/groups` (the slim list shape). */
+/** Item returned by `GET /sessions/:id/groups` (the slim list shape), and the `groups.create` response. */
 export interface GroupSummary {
   id: Jid;
   name: string;
+  /** Only in a `groups.create` response, never in `groups.list`; `groups.get` carries the participants. */
   participantsCount?: number;
+  /** Only in a `groups.create` response, never in `groups.list`; `groups.get` carries each participant's role. */
   isAdmin?: boolean;
   /** JID of the parent community, or null if standalone. */
   linkedParentJID?: string | null;
@@ -783,7 +880,7 @@ export interface GroupInfo {
   locked?: boolean;
   /** Who may add participants. Absent when the engine did not report it. */
   memberAddMode?: 'all' | 'admins';
-  owner?: Jid | null;
+  owner?: Jid;
   /** Unix timestamp in seconds. */
   createdAt?: number;
   participants: GroupParticipant[];
@@ -822,6 +919,11 @@ export interface GroupSubjectRequest {
 export interface GroupDescriptionRequest {
   /** May be empty to clear. */
   description: string;
+}
+
+export interface GroupMemberLabelRequest {
+  /** At most 30 UTF-16 code units (an astral emoji counts as two). May be empty to clear. */
+  label: string;
 }
 
 export interface InviteCodeResponse {
@@ -886,11 +988,12 @@ export interface SetProfilePictureRequest {
 
 // ── Webhook ───────────────────────────────────────────────────────
 
-/** Events a webhook may subscribe to. Use `*` to receive all. */
+/** Events a webhook may subscribe to. Use `*` to receive all except `message.receipt`, which must be named. */
 export type WebhookEvent =
   | 'message.received'
   | 'message.sent'
   | 'message.ack'
+  | 'message.receipt'
   | 'message.failed'
   | 'message.revoked'
   | 'message.reaction'
@@ -902,6 +1005,8 @@ export type WebhookEvent =
   | 'session.reconnect_loop'
   | 'session.restriction'
   | 'presence.update'
+  | 'event.response'
+  | 'poll.vote'
   | 'call.accepted'
   | 'call.rejected'
   | 'call.missed'
@@ -912,6 +1017,19 @@ export type WebhookEvent =
   | 'call.received'
   | 'status.received'
   | '*';
+
+/**
+ * The JSON body of a webhook delivery (docs/06 section 6.6). `event` is `'test'` for a delivery
+ * sent by the test endpoint. Verify the raw body with `verifyWebhookSignature` before parsing it.
+ */
+export interface WebhookDelivery<TData = Record<string, unknown>> {
+  event: Exclude<WebhookEvent, '*'> | 'test';
+  timestamp: string;
+  sessionId: string;
+  idempotencyKey: string;
+  deliveryId: string;
+  data: TData;
+}
 
 export interface WebhookFilterCondition {
   field: string;
@@ -939,7 +1057,10 @@ export interface CreateWebhookRequest {
   secret?: string;
   headers?: Record<string, string>;
   filters?: WebhookFilters | null;
-  /** 0–5; default 3. Server DTO field is `retryCount`. */
+  /**
+   * Total delivery attempts per event including the first, 0 to 5 (0 and 1 both mean one attempt); default 3 on
+   * create, while an update that omits it keeps the current value. Server DTO field is `retryCount`.
+   */
   retryCount?: number;
 }
 
@@ -970,7 +1091,7 @@ export interface WebhookTestResult {
   error?: string;
 }
 
-/** A webhook delivery abandoned after every retry, as listed by the delivery-failure log. */
+/** A webhook delivery the gateway gave up on or could not dispatch, as listed by the delivery-failure log. */
 export interface WebhookDeliveryFailure {
   id: string;
   webhookId: string;
@@ -980,13 +1101,51 @@ export interface WebhookDeliveryFailure {
   /** The idempotency key the receiver would have deduped on. */
   idempotencyKey?: string | null;
   deliveryId?: string | null;
-  /** Total attempts made before giving up. */
+  /** Attempts made before giving up; 0 when the delivery was not given up after retries (see `deliveryFailures`). */
   attempts: number;
   /** Last HTTP status when the failure was a non-2xx response; null for a network or timeout error. */
   lastStatusCode?: number | null;
   lastError: string;
-  /** ISO timestamp of when the delivery was finally abandoned. */
+  /** ISO timestamp of when the row was recorded. */
   createdAt: string;
+  /**
+   * True when the row still holds the event data and its webhook still exists in the same session: a terminal
+   * row (`attempts > 0`) recorded while the gateway's `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` is above 0, until
+   * that window passes. {@link WebhooksResource.redriveDeliveryFailures} replays it while that webhook is active
+   * and subscribed to the event.
+   */
+  replayable: boolean;
+}
+
+/** Body of {@link WebhooksResource.redriveDeliveryFailures}. An empty body takes the least-retried eligible rows. */
+export interface RedriveWebhookDeliveriesRequest {
+  /** Only rows of this session (within the key's allowedSessions). */
+  sessionId?: string;
+  /** Only rows of this webhook. */
+  webhookId?: string;
+  /** Only these failure rows (ids from `deliveryFailures`), at most 500. */
+  ids?: string[];
+  /** Max rows replayed by this call (1-500, default 100). */
+  limit?: number;
+}
+
+/** Outcome of {@link WebhooksResource.redriveDeliveryFailures}. */
+export interface WebhookRedriveResult {
+  /** Rows replayed by this call: delivered plus enqueued. */
+  redriven: number;
+  /** Delivered by a direct POST; their failure rows were removed. */
+  delivered: number;
+  /** Reserved for compatibility; operator redrive always returns zero. */
+  enqueued: number;
+  /** Replays that failed again; their rows stay, with attempts raised by one. */
+  failed: number;
+  /**
+   * Selected rows not replayed: a hook cancelled the replay, or the row or its webhook changed during the call.
+   * Rows of a removed, disabled or unsubscribed webhook are left out before the batch and not counted.
+   */
+  skipped: number;
+  /** Rows the redrive would still take after this call: replayable, in scope, with an active subscribed webhook. */
+  remaining: number;
 }
 
 // ── Chat (session-scoped chat operations) ─────────────────────────
@@ -998,6 +1157,7 @@ export interface ChatSummary {
   unreadCount: number;
   /** Preview text of the last message (the server returns a plain string, not an object). */
   lastMessage?: string;
+  lastMessageType?: MessageType;
   /** Unix seconds of the last activity. */
   timestamp: number;
   kind: ChatKind;
@@ -1059,8 +1219,8 @@ export interface SubscribePresenceRequest {
 export interface MarkChatReadRequest extends MarkChatRequest {
   /**
    * Specific message IDs to acknowledge. Baileys acknowledges individual messages, so without this
-   * only the newest message the engine still holds in memory gets a receipt: a burst leaves its
-   * earlier messages unread forever, and a restarted session has no message to acknowledge at all.
+   * only the newest received message gets a receipt (the one the engine holds in memory, else the
+   * newest received one the gateway stored): a burst leaves its earlier messages unread forever.
    * Callers that persist inbound message IDs should send them here. Ignored by whatsapp-web.js,
    * whose own sendSeen is chat-level. At most 100 per request; an empty array is rejected.
    */
@@ -1123,7 +1283,10 @@ export interface SendTextStatusRequest {
   recipients?: string[];
   /** Hex background color, e.g. `#25D366`. */
   backgroundColor?: string;
-  /** WhatsApp status font family: 0 (default), 1, 2, 6 (bold), 7, 8, 9, 10. */
+  /**
+   * WhatsApp status font family: 0 (default), 1, 2, 6 (bold), 7, 8, 9, 10. whatsapp-web.js honors only
+   * 0 to 7 and posts 8, 9 and 10 in the default font.
+   */
   font?: 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10;
 }
 
@@ -1131,7 +1294,11 @@ export interface SendTextStatusRequest {
 export interface StatusMediaInput {
   url?: string;
   base64?: string;
-  /** Optional explicit mimetype (inferred from URL/bytes when omitted). */
+  /**
+   * MIME type of the media. When omitted the server uses the route's default (`image/jpeg`, `video/mp4` or
+   * `audio/ogg; codecs=opus`), which also overrides a URL's Content-Type; the bytes are never inspected. Set
+   * it for base64 and for any media of another type.
+   */
   mimetype?: string;
 }
 
@@ -1169,25 +1336,32 @@ export interface SendVoiceStatusRequest {
 
 export interface HealthResponse {
   status: string;
-  timestamp?: string;
+  timestamp: string;
   version?: string;
 }
 
+export interface HealthDependencyStatus {
+  status: 'up' | 'down';
+}
+
 export interface HealthReadyDetails {
-  mainDatabase?: string;
-  dataDatabase?: string;
+  mainDatabase?: HealthDependencyStatus;
+  dataDatabase?: HealthDependencyStatus;
 }
 
 export interface HealthReadyResponse {
   status: string;
-  details?: HealthReadyDetails;
+  details: HealthReadyDetails;
 }
 
 // ── Auth ──────────────────────────────────────────────────────────
 
 export interface AuthValidateResponse {
   valid: boolean;
-  role?: string;
+  /** The key's role; present only when the key is valid. */
+  role?: 'admin' | 'operator' | 'viewer';
+  engineType?: string;
+  scoped?: boolean;
 }
 
 // ── Template ──────────────────────────────────────────────────────
@@ -1238,7 +1412,7 @@ export interface ChannelRecord {
   /** Invite code from the channel link. */
   inviteCode?: string;
   subscriberCount?: number;
-  /** Channel picture URL. Populated by Baileys; whatsapp-web.js omits it. */
+  /** Channel picture URL. Not currently filled by either engine. */
   picture?: string;
   verified?: boolean;
   /** Channel creation time as reported by the engine. Populated by Baileys; whatsapp-web.js omits it. */
@@ -1260,7 +1434,7 @@ export interface ChannelMessageRecord {
 }
 
 export interface ChannelMessageQuery {
-  /** Max messages to return (default 50). */
+  /** Max messages to return (default 50, max 100: a larger value is cut to 100). */
   limit?: number;
 }
 
@@ -1274,7 +1448,8 @@ export interface SubscribeChannelRequest {
 export interface CatalogInfo {
   id: string;
   name: string;
-  description?: string | null;
+  description?: string;
+  /** Counts at most the first 51 products on Baileys. */
   productCount: number;
   url: string;
 }
@@ -1289,11 +1464,13 @@ export interface CatalogProductsQuery {
 export interface CatalogProduct {
   id: string;
   name: string;
-  description?: string | null;
-  price: number;
-  currency: string;
-  priceFormatted: string;
-  imageUrl?: string | null;
+  description?: string;
+  /** Absent when the product has no price. */
+  price?: number;
+  currency?: string;
+  /** Absent when `price` is. */
+  priceFormatted?: string;
+  imageUrl?: string;
   url: string;
   isAvailable: boolean;
   retailerId?: string;
@@ -1324,10 +1501,24 @@ export interface SendProductRequest {
 
 // ── Search ────────────────────────────────────────────────────────
 
+/**
+ * How `q` matches: `word` (the server default) matches whole words; `contains` matches any part of a
+ * word, ignoring case and accents. `contains` needs `SEARCH_CONTAINS_ENABLED=true` and a finished index
+ * build on the server (501 otherwise) and at least one term of 3+ characters with at most 64 characters
+ * across its terms (400 otherwise); it ranks the 1000 most recently stored matches, so `total` is at
+ * most 1000.
+ */
+export type SearchMatch = 'word' | 'contains';
+
 /** Query parameters for `GET /search`. Only `q` is required; all filters are optional. */
 export interface SearchParams {
-  /** Search term (required, non-empty — the server rejects empty/whitespace with 400). */
+  /**
+   * Search term (required, non-empty — the server rejects empty/whitespace with 400). At most 1000
+   * characters and 32 words, punctuation included; the server answers 400 above either.
+   */
   q: string;
+  /** Match mode; the server defaults to `word`. */
+  match?: SearchMatch;
   /** Restrict to a single session. */
   sessionId?: string;
   /** Restrict to a single chat id. */
@@ -1342,9 +1533,9 @@ export interface SearchParams {
   dateFrom?: number;
   /** Epoch-ms upper bound (inclusive). */
   dateTo?: number;
-  /** Max hits to return. */
+  /** Max hits to return (default 50; capped at the server's SEARCH_LIMIT_MAX, 100 by default). */
   limit?: number;
-  /** Pagination offset. */
+  /** Pagination offset (at most 100000; the server answers 400 above). */
   offset?: number;
 }
 

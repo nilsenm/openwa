@@ -1,4 +1,4 @@
-import { evaluateFilters } from './filter-evaluator';
+import { evaluateFilters, prepareFilterLidResolver } from './filter-evaluator';
 import { WebhookFilters } from './filter-types';
 
 const msg = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -12,6 +12,63 @@ const msg = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
 });
 
 const filters = (...conditions: WebhookFilters['conditions']): WebhookFilters => ({ conditions });
+
+describe('prepareFilterLidResolver', () => {
+  it('batches and deduplicates both sides of registered identity conditions', async () => {
+    const f = filters(
+      { field: 'sender', operator: 'is', value: ['4:2@LID', '111@c.us'] },
+      { field: 'recipient', operator: 'isNot', value: ['4@lid'] },
+      { field: 'mentions', operator: 'is', value: ['4@lid'] },
+      { field: 'body', operator: 'contains', value: '5@lid' },
+      { field: 'unregistered', operator: 'is', value: ['6@lid'] },
+    );
+    const read = jest.fn().mockResolvedValue({ '1': '111', '2': '222', '3': '333', '4': '444' });
+    const resolve = await prepareFilterLidResolver(
+      [f, f],
+      'message.received',
+      { author: '1:7@lid', from: 'g@g.us', to: '2@lid', mentionedIds: ['3@lid', '111@c.us'] },
+      read,
+    );
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledWith(['1', '4', '2', '3']);
+    expect(resolve?.('1@lid')).toBe('111');
+    expect(resolve?.('9@lid')).toBeNull();
+  });
+
+  it('resolves a LID held only in the rule value when the payload uses a phone', async () => {
+    const f = filters({ field: 'sender', operator: 'is', value: ['1@lid'] });
+    const resolve = await prepareFilterLidResolver([f], 'message.received', msg(), () =>
+      Promise.resolve({ '1': '111' }),
+    );
+    expect(evaluateFilters(f, 'message.received', msg(), resolve)).toBe(true);
+  });
+
+  it('does not query for text, absent, malformed or other-family conditions', async () => {
+    const read = jest.fn();
+    const bad = { conditions: [null] } as unknown as WebhookFilters;
+    const text = filters({ field: 'body', operator: 'contains', value: '1@lid' });
+    await prepareFilterLidResolver([undefined, null, bad, text], 'message.received', msg(), read);
+    await prepareFilterLidResolver(
+      [filters({ field: 'sender', operator: 'is', value: ['1@lid'] })],
+      'session.ready',
+      msg(),
+      read,
+    );
+    expect(read).not.toHaveBeenCalled();
+    expect(await prepareFilterLidResolver([text], 'message.received', msg())).toBeUndefined();
+  });
+
+  it('leaves unavailable and prototype-named identities unresolved', async () => {
+    const f = filters({ field: 'sender', operator: 'is', value: ['111'] });
+    const resolve = await prepareFilterLidResolver([f], 'message.received', msg({ from: '1@lid' }), () =>
+      Promise.reject(new Error('unavailable')),
+    );
+    expect(resolve?.('1@lid')).toBeNull();
+    expect(resolve?.('__proto__@lid')).toBeNull();
+    expect(resolve?.('constructor@lid')).toBeNull();
+    expect(evaluateFilters(f, 'message.received', msg({ from: '1@lid' }), resolve)).toBe(false);
+  });
+});
 
 describe('evaluateFilters', () => {
   it('passes when filters are absent or empty (additive/optional)', () => {
@@ -154,6 +211,26 @@ describe('evaluateFilters', () => {
   // engine emits and regardless of how the filter is written (bare digits or a JID).
 
   describe('engine-neutral id matching', () => {
+    it.each(['sender', 'mentions'])('preserves raw LID identity in %s conditions', field => {
+      const resolve = () => '628999';
+      const matches = (actual: string, candidate: string, operator: 'is' | 'isNot' = 'is') =>
+        evaluateFilters(
+          filters({ field, operator, value: [candidate] }),
+          'message.received',
+          msg({ from: actual, mentionedIds: [actual] }),
+          resolve,
+        );
+      expect(matches('111@lid', '222@lid')).toBe(false);
+      expect(matches('111@lid', '222@lid', 'isNot')).toBe(true);
+      expect(matches('111:7@lid', '111:2@LID')).toBe(true);
+      expect(matches('111:7@lid', '111:2@LID', 'isNot')).toBe(false);
+      expect(matches('111@lid', '+62 (89) 99')).toBe(true);
+      expect(matches('628999:7@s.whatsapp.net', '111@lid')).toBe(true);
+      expect(matches('111@lid', '628999:7@s.whatsapp.net')).toBe(true);
+      expect(matches('628999@c.us', '628999:7@s.whatsapp.net')).toBe(true);
+      expect(matches('111@lid', '628888@c.us')).toBe(false);
+    });
+
     it('matches the same user across @c.us and @s.whatsapp.net', () => {
       const f = filters({ field: 'sender', operator: 'is', value: ['111@c.us'] });
       expect(evaluateFilters(f, 'message.received', msg({ from: '111@s.whatsapp.net' }))).toBe(true);
@@ -243,27 +320,34 @@ describe('evaluateFilters', () => {
       expect(evaluateFilters(deny, 'message.received', msg({ chatId: '999@g.us' }))).toBe(true);
     });
 
-    // The ack and failure events carry no conversation at all: their payload is the shape the
-    // projector builds, `{ id, messageId, status, ack }`. A chatId condition therefore SUPPRESSES
-    // them rather than scoping them, which is a real surprise for anyone allowlisting a group, so
-    // it is pinned here and warned about in docs/06 rather than left to be discovered.
-    it('suppresses message.ack and message.failed, whose payload carries no conversation', () => {
+    // The ack and failure events carry the conversation whenever the engine's update names the
+    // chat (both engines do on the live path), so a chatId condition SCOPES them like any other
+    // message event. When the chat is unknown the generic absent-field rule decides instead: `is`
+    // suppresses and `isNot` passes. Both directions are pinned here and stated in docs/06.
+    it('scopes message.ack and message.failed to the chat their payload carries', () => {
       // Real pairings: deliveryStatusToAck maps delivered to 2 and failed to -1, and message.failed
       // is a copy of the same object, so the fixture must not invent a status/ack pair of its own.
-      const ackPayload = { id: 'M1', messageId: 'M1', status: 'delivered', ack: 2 };
-      const failedPayload = { id: 'M1', messageId: 'M1', status: 'failed', ack: -1 };
+      const ackPayload = { id: 'M1', messageId: 'M1', status: 'delivered', ack: 2, chatId: '120@g.us' };
+      const failedPayload = { id: 'M1', messageId: 'M1', status: 'failed', ack: -1, chatId: '120@g.us' };
       const allow = filters({ field: 'chatId', operator: 'is', value: ['120@g.us'] });
-      expect(evaluateFilters(allow, 'message.ack', ackPayload)).toBe(false);
-      expect(evaluateFilters(allow, 'message.failed', failedPayload)).toBe(false);
+      expect(evaluateFilters(allow, 'message.ack', ackPayload)).toBe(true);
+      expect(evaluateFilters(allow, 'message.failed', failedPayload)).toBe(true);
 
-      // And the exclusion direction delivers them, for the same reason: the field is not there.
+      // The exclusion direction now keeps that chat's acks and failures out.
       const deny = filters({ field: 'chatId', operator: 'isNot', value: ['120@g.us'] });
-      expect(evaluateFilters(deny, 'message.ack', ackPayload)).toBe(true);
-      expect(evaluateFilters(deny, 'message.failed', failedPayload)).toBe(true);
-      // An absent boolean reads as false, so `is false` passes both as well.
+      expect(evaluateFilters(deny, 'message.ack', ackPayload)).toBe(false);
+      expect(evaluateFilters(deny, 'message.failed', failedPayload)).toBe(false);
+    });
+
+    it('still applies the absent-field rule to an ack whose chat is unknown', () => {
+      const noChat = { id: 'M1', messageId: 'M1', status: 'delivered', ack: 2 };
+      const allow = filters({ field: 'chatId', operator: 'is', value: ['120@g.us'] });
+      const deny = filters({ field: 'chatId', operator: 'isNot', value: ['120@g.us'] });
+      expect(evaluateFilters(allow, 'message.ack', noChat)).toBe(false);
+      expect(evaluateFilters(deny, 'message.ack', noChat)).toBe(true);
+      // An absent boolean reads as false, so `is false` passes it as well.
       const notGroup = filters({ field: 'isGroup', operator: 'is', value: false });
-      expect(evaluateFilters(notGroup, 'message.ack', ackPayload)).toBe(true);
-      expect(evaluateFilters(notGroup, 'message.failed', failedPayload)).toBe(true);
+      expect(evaluateFilters(notGroup, 'message.ack', noChat)).toBe(true);
     });
 
     it('scopes message.revoked / edited payloads that only carry chatId', () => {

@@ -1,5 +1,4 @@
-import { EventEmitter } from 'events';
-import { MessageMedia, type Client, type Message } from 'whatsapp-web.js';
+import { type Client, type Message } from 'whatsapp-web.js';
 import {
   CallLinkType,
   IWhatsAppEngine,
@@ -8,6 +7,7 @@ import {
   MessageResult,
   MediaInput,
   IncomingMessage,
+  InboundTicket,
   Contact,
   Group,
   GroupInfo,
@@ -18,6 +18,7 @@ import {
   PollInput,
   ContactCard,
   MessageReaction,
+  MessageReceipts,
   Label,
   Channel,
   ChannelMessage,
@@ -35,16 +36,22 @@ import {
   GroupJoinInfo,
 } from '../interfaces/whatsapp-engine.interface';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
-import { resolveAuthTimeoutMs } from '../engine-init-timeout';
 import { isChannelJid } from '../identity/wa-id';
 import { LidMappingStore } from '../identity/lid-mapping-store.service';
 import { createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
+import { markNothingSent } from '../../common/errors/engine-not-sent.error';
 import { WwebjsGroups } from './wwebjs-groups';
 import { type WwebjsEngineHost } from './wwebjs-host';
 import { registerWwebjsMessageEvents } from './wwebjs-message-events';
-import { WwebjsMessaging, declaredOnlyMedia } from './wwebjs-messaging';
+import {
+  WwebjsMessaging,
+  declaredMediaSize,
+  declaredOnlyMedia,
+  downloadCappedMedia,
+  type PageMediaDownload,
+} from './wwebjs-messaging';
 import { WwebjsContacts } from './wwebjs-contacts';
 import { WwebjsProfile } from './wwebjs-profile';
 import { WwebjsLabels } from './wwebjs-labels';
@@ -54,17 +61,17 @@ import { WwebjsChats } from './wwebjs-chats';
 import { WwebjsCatalog } from './wwebjs-catalog';
 import { registerWwebjsGroupEvents } from './wwebjs-group-events';
 import { WwebjsOnboardingWatcher } from './wwebjs-onboarding';
-import { WwebjsLifecycle } from './wwebjs-lifecycle';
+import { PAGE_RELOADING_MESSAGE, WwebjsLifecycle } from './wwebjs-lifecycle';
 import { WwebjsReadyReconcile } from './wwebjs-reconcile';
 import { WwebjsStuckAuth } from './wwebjs-stuck-auth';
 import { WwebjsCalls } from './wwebjs-calls';
 import {
   capInboundMedia,
-  coerceDeclaredSize,
   inboundMediaConcurrency,
   inboundMediaMaxBytes,
   inboundMediaTimeoutMs,
   isMediaDownloadEnabled,
+  runUnderGlobalMediaGate,
   withInboundDownloadTimeout,
 } from './inbound-media-cap';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
@@ -94,42 +101,13 @@ export interface WhatsAppWebJsConfig {
 // status can import it without loading whatsapp-web.js (engine lazy-loading). The lifecycle delegate
 // imports resolveWebVersionPin for use in initialize().
 
-// resolveAuthTimeoutMs now lives in ../engine-init-timeout, next to the outer init deadline derived
-// from it: that deadline is engine-agnostic, so deriving it here made the session lifecycle import
-// this adapter just to size a timeout. Re-exported because callers still reach it through the engine
-// they are configuring.
-export { resolveAuthTimeoutMs };
+export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
+  readonly contactPhoneLookupPersistence = 'seed' as const;
 
-// extractLinkedParentJID moved to ./wwebjs-groups with the group operations; re-exported because
-// existing callers (the adapter spec) still import it from here.
-export { extractLinkedParentJID } from './wwebjs-groups';
-
-// Messaging helpers moved to ./wwebjs-messaging with the messaging operations; re-exported because
-// existing callers (the adapter spec) still import them from here.
-export { isHttpUrl, loadRemoteMedia, extractWwebjsCall, wwebjsAckToDeliveryStatus } from './wwebjs-messaging';
-
-// Proxy launch helpers moved to ./wwebjs-proxy; re-exported because existing callers (the adapter
-// spec) still import them from here.
-export { isSupportedProxyUrl, buildProxyLaunchConfig } from './wwebjs-proxy';
-
-// The onboarding-modal probe moved to ./wwebjs-onboarding with its label resolution; re-exported
-// because existing callers (the adapter spec) still import it from here.
-export { probeOnboardingModal, collectDialogDiagnostics } from './wwebjs-onboarding';
-
-// Connection lifecycle moved to ./wwebjs-lifecycle (with the navigation re-inject constants) and the
-// readiness reconciliation to ./wwebjs-reconcile; re-exported because existing callers (the adapter
-// spec) still import them from here.
-export {
-  isExecutionContextDestroyedError,
-  NAVIGATION_REINJECT_GRACE_MS,
-  NAVIGATION_EPISODE_CAP_MS,
-} from './wwebjs-lifecycle';
-export { READY_RECONCILE_TIMEOUT_MS, READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS } from './wwebjs-reconcile';
-
-export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
   private readonly logger = createLogger('WhatsAppWebJsAdapter');
-  // Bound concurrent inbound media downloads: downloadMedia() materialises the full base64 blob, so an
-  // unbounded burst could stack many multi-MB allocations.
+  // Bound concurrent inbound media downloads: each one holds the whole decrypted file in the browser
+  // page and, when within the cap, its base64 in Node, so an unbounded burst could stack many multi-MB
+  // allocations.
   // The queue is UNBOUNDED. A cap equal to the active slots made admission a constant
   // (active + queued) whatever the batch size, so a burst lost the media of everything past the
   // eighth — the same defect repaired on the Baileys side. Parking costs one held Message per
@@ -155,9 +133,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private readonly onboardingWatcher: WwebjsOnboardingWatcher;
 
   // Connection-lifecycle state is owned by the lifecycle delegate (./wwebjs-lifecycle); these
-  // accessors alias it by reference so the host closures below — and an unmodified spec poking
-  // `adapter.client` / `adapter.status` / `adapter.tearingDown` / … through a cast — keep working
-  // byte-identically. The live-call cache below is the same pattern for ./wwebjs-calls.
+  // accessors alias it by reference so the host closures below, and a spec poking `adapter.client`,
+  // `adapter.status` or `adapter.tearingDown` through a cast, all see the delegate's state.
   private get client(): Client | null {
     return this.lifecycle.client;
   }
@@ -191,31 +168,33 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private set disconnectReported(value: boolean) {
     this.lifecycle.disconnectReported = value;
   }
-  /** Ringing call ids and their expiry, owned by the calls delegate, which uses them to announce each
-   *  call once; lifecycle teardown clears them. The adapter keeps this alias for the spec, which reads
-   *  `adapter.liveCalls` through a cast. */
-  private get liveCalls(): Map<string, number> {
-    return this.calls.liveCalls;
-  }
 
   constructor(private readonly config: WhatsAppWebJsConfig) {
-    super();
     // API-surface clusters live in ./wwebjs-* delegates; the public methods below forward to them.
     // The host is one object literal shared by every delegate, and closures (not a `this` reference)
     // keep the delegates' surface exactly this narrow. Built in the constructor, not as a field
     // initializer: `config` is a parameter property, which field initializers read before assignment.
     this.host = {
       ensureReady: () => this.ensureReady(),
-      getClient: () => this.client!,
+      // A delegate reads the client after ensureReady() and often after awaits of its own (a recipient
+      // lookup, a media fetch, a chat lookup). A teardown in that gap leaves the client set but closing,
+      // or nulls it, so readiness is checked again here: the retryable 409 instead of a closed-target or
+      // TypeError 500 that a send also counts toward the send breaker.
+      getClient: () => {
+        this.ensureReady();
+        return this.client!;
+      },
       logger: this.logger,
       isPageTransportError: error => this.isPageTransportError(error),
       reportIfPageTransportError: (error, context) => this.reportIfPageTransportError(error, context),
+      reportOnceGone: (error, context) => this.lifecycle.reportOnceGone(error, context),
       ensureNotChannelRecipient: chatId => this.ensureNotChannelRecipient(chatId),
-      getNumberId: number => this.getNumberId(number),
-      capInboundMediaFor: (msg, maxBytesOverride) => this.capInboundMediaFor(msg, maxBytesOverride),
+      // The raw answer, `@lid` included: the send resolver addresses a migrated contact by it, while the
+      // public getNumberId reports the neutral phone id.
+      getNumberId: number => this.contacts.lookupNumberId(number),
+      capInboundMediaFor: (msg, maxBytesOverride, ticket) => this.capInboundMediaFor(msg, maxBytesOverride, ticket),
       config: this.config,
       getCallbacks: () => this.callbacks,
-      getSelfWid: () => this.client?.info?.wid?._serialized,
     };
     this.groups = new WwebjsGroups(this.host);
     this.messaging = new WwebjsMessaging(this.host);
@@ -237,6 +216,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       setStatus: status => this.lifecycle.setStatus(status),
       getCallbacks: () => this.callbacks,
       markReadyFromClientInfo: () => this.lifecycle.markReadyFromClientInfo(),
+      wasFreshPairing: () => this.lifecycle.qrShown,
       recoverFromStuckAuth: () => this.recoverFromStuckAuth(),
     });
     this.stuckAuth = new WwebjsStuckAuth({
@@ -266,7 +246,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       logger: this.logger,
       config: this.config,
       getCallbacks: () => this.callbacks,
-      emitState: status => this.emit('stateChanged', status),
       scheduleReadyReconcile: () => this.reconcile.scheduleReadyReconcile(),
       clearReadyReconcile: () => this.reconcile.clearReadyReconcile(),
       startOnboardingWatcher: () => this.onboardingWatcher.startOnboardingWatcher(),
@@ -278,14 +257,18 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   /**
-   * Download inbound media safely. downloadMedia() can't be size-bounded at the source, so (1) pre-gate
-   * on the sender-declared size and skip the download entirely when it exceeds the cap, and (2) run the
-   * download through the concurrency limiter for backpressure. Resolves an envelope whenever it has one
-   * to build: the payload, or the declared-only marker when no blob is available.
+   * Download inbound media safely. The page decrypts the whole file before anything can measure it, so
+   * (1) pre-gate on the sender-declared size and skip the download entirely when it exceeds the cap,
+   * (2) let the page drop a decrypted payload over the cap before encoding it (downloadMediaInPage),
+   * and (3) run the download through the concurrency limiter for backpressure. Resolves an envelope
+   * whenever it has one to build: the payload, or the declared-only marker when no blob is available.
+   * With a ticket (PostgreSQL), the download waits for a slot of the session's room first, and that
+   * slot is held until the page download settles, since it cannot be aborted.
    */
   private async capInboundMediaFor(
     msg: Message,
     maxBytesOverride?: number,
+    ticket?: InboundTicket,
   ): Promise<IncomingMessage['media'] | undefined> {
     if (!isMediaDownloadEnabled()) {
       return declaredOnlyMedia(msg);
@@ -294,9 +277,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // that renamed it to `$1` (#747), which is the same build whose page-side rename makes these
     // downloads fail. The warnings below are the diagnostic for it, so they must carry a real id.
     const msgId = readWid(msg.id);
-    const maxBytes = maxBytesOverride ?? inboundMediaMaxBytes();
-    const data = (msg as unknown as { _data?: { size?: number; mimetype?: string; filename?: string } })._data;
-    const declared = coerceDeclaredSize(data?.size);
+    // An override (the status seed's STATUS_MEDIA_MAX_BYTES) only tightens the global cap: a larger one
+    // would let a download the cap below always drops run anyway, past the memory guard it exists for.
+    const maxBytes = Math.min(maxBytesOverride ?? Number.POSITIVE_INFINITY, inboundMediaMaxBytes());
+    const declared = declaredMediaSize(msg);
     if (declared > maxBytes) {
       this.logger.warn('Inbound media declared size exceeds the cap; skipped download', {
         msgId,
@@ -305,29 +289,58 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       });
       return declaredOnlyMedia(msg);
     }
-    // msg.downloadMedia() can't be aborted, so freeing the slot the moment the wall-clock deadline fires
+    if (ticket) {
+      const granted = ticket.reserve();
+      if (!(granted === true || (granted !== false && (await granted)))) {
+        this.logger.warn('No room for inbound media within the wait; emitting the omitted marker', { msgId });
+        return declaredOnlyMedia(msg);
+      }
+    }
+    // The page download can't be aborted, so freeing the slot the moment the wall-clock deadline fires
     // would admit a fresh download while the abandoned one is still materialising in heap — letting the
     // number of in-flight downloads exceed inboundMediaConcurrency(). Instead, HOLD the slot until the real
     // download settles; the caller still unblocks on the timeout race and emits the message without media.
     // boundedReady adopts the timeout-bounded race (a Promise resolving a Promise flattens), so awaiting it
     // unblocks the caller once the task is admitted AND the deadline-or-download settles — yielding the
     // media or null on timeout.
-    let resolveBounded: (value: MessageMedia | null | PromiseLike<MessageMedia | null>) => void = () => undefined;
-    const boundedReady = new Promise<MessageMedia | null>(resolve => {
+    type Download = PageMediaDownload | null | undefined;
+    let resolveBounded: (value: Download | PromiseLike<Download>) => void = () => undefined;
+    const boundedReady = new Promise<Download>(resolve => {
       resolveBounded = resolve;
     });
-    const slotHeld = this.inboundLimiter.run(() => {
-      // downloadMedia() is async, so a page-side throw (a detached target, a WA Web field rename) arrives
+    // Set when the caller's wait below expires. A task still queued at that point has nobody left to
+    // read its result, so once admitted it gives the slot straight back instead of pulling a full
+    // base64 blob over CDP and holding the slot for it: after a burst, that backlog is what made
+    // later messages miss their own deadline. A download that already started is unaffected.
+    let abandoned = false;
+    const downloadInSlot = (): Promise<void> => {
+      if (abandoned) {
+        resolveBounded(null);
+        return Promise.resolve();
+      }
+      // The page download is async, so a page-side throw (a detached target, a WA Web field rename) arrives
       // as a rejection, which boundedReady adopts and rethrows past the only exit that builds the marker,
       // leaving every call site to emit with no media field at all. It is the same "no usable media"
       // outcome as the timeout below, so it takes the same null sentinel.
-      const download = msg.downloadMedia().catch((error: unknown) => {
-        this.logger.warn('Inbound media download failed; emitting the omitted marker', {
-          msgId,
-          error: String(error),
+      const download = downloadCappedMedia(msg, maxBytes)
+        .then(result => {
+          // The page answers null or undefined for media it cannot serve (re-uploading, a failed resolve, a
+          // 404), and the omitted marker alone gives nobody a line to post.
+          if (!result) {
+            this.logger.warn('Inbound media download returned nothing; emitting the omitted marker', {
+              msgId,
+              answer: String(result),
+            });
+          }
+          return result;
+        })
+        .catch((error: unknown) => {
+          this.logger.warn('Inbound media download failed; emitting the omitted marker', {
+            msgId,
+            error: String(error),
+          });
+          return null;
         });
-        return null;
-      });
       resolveBounded(
         withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () =>
           this.logger.warn(
@@ -343,7 +356,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         () => undefined,
         () => undefined,
       );
-    });
+    };
+    // Per-session slot first, then the process-wide one, so a session parks at most its own
+    // INBOUND_MEDIA_CONCURRENCY waiters on the shared gate. Both are held until the download settles.
+    const slotHeld = this.inboundLimiter.run(() => runUnderGlobalMediaGate(downloadInSlot));
+    // The payload can reach Node after the wait below gave up on it: keep the room until it settles.
+    ticket?.holdUntil(slotHeld);
     // Defensive only, and deliberately kept. `run()` rejects on a full queue (gone — the queue is
     // unbounded) or on close(), which nothing calls on this limiter; the task itself swallows both
     // download outcomes. So nothing is expected here — but an unhandled rejection from a
@@ -362,22 +380,26 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // those messages are never emitted AT ALL — strictly worse than the media loss this change set
     // out to fix. The old queue cap provided that degradation by rejecting; this restores it without
     // shedding at a fixed batch size.
-    const media = await withInboundDownloadTimeout(boundedReady, inboundMediaTimeoutMs(), () =>
+    const media = await withInboundDownloadTimeout(boundedReady, inboundMediaTimeoutMs(), () => {
+      abandoned = true;
       this.logger.warn(
         'Inbound media did not arrive within MEDIA_DOWNLOAD_TIMEOUT_MS; emitting message without media',
         {
           msgId,
         },
-      ),
-    );
+      );
+    });
     if (!media) {
       return declaredOnlyMedia(msg);
     }
+    // An over-cap payload arrives without data, carrying the size the page measured. Anything that did
+    // arrive is counted here as received, so a page that sends more than the cap is still caught.
     const capped = capInboundMedia({
       mimetype: media.mimetype,
       filename: media.filename || undefined,
-      sizeBytes: Buffer.byteLength(media.data, 'base64'),
+      sizeBytes: media.data ? Buffer.byteLength(media.data, 'base64') : media.sizeBytes,
       toBase64: () => media.data,
+      maxBytes,
     });
     if (capped.omitted) {
       this.logger.warn('Inbound media exceeds MEDIA_DOWNLOAD_MAX_BYTES; dropped payload, kept envelope', {
@@ -393,14 +415,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   async initialize(callbacks: EngineEventCallbacks): Promise<void> {
     this.callbacks = callbacks;
     return this.lifecycle.initialize();
-  }
-
-  private setupEventHandlers(): void {
-    this.lifecycle.setupEventHandlers();
-  }
-
-  private attachPuppeteerLifecycleListeners(): void {
-    this.lifecycle.attachPuppeteerLifecycleListeners();
   }
 
   private isPageTransportError(error: unknown): boolean {
@@ -459,10 +473,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.stuckAuth.clearLocalAuth();
   }
 
-  private reportActionRequired(reason: string): void {
-    this.onboardingWatcher.reportActionRequired(reason);
-  }
-
   /**
    * Register the message/group/call domain events on a freshly built client — the one seam the
    * lifecycle's setupEventHandlers() uses for everything that is pure payload mapping. The
@@ -475,15 +485,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     client.on('call', call => this.calls.handleIncomingCall(call));
   }
 
-  /**
-   * whatsapp-web.js exposes no way to observe another party's presence: WAWebPresenceChatAction
-   * offers only sendPresenceAvailable/sendPresenceUnavailable, which publish the ACCOUNT's own
-   * presence, and the library surfaces no presence event at all.
-   *
-   * Declared here inline rather than in a delegate on purpose. The parity gate reads method bodies
-   * off the prototype, so a throw hidden behind a delegate call is invisible to it and the
-   * `not-available` matrix row would go unverified; inline, the gate checks it.
-   */
   createChannel(name: string, description?: string): Promise<Channel> {
     return this.channels.createChannel(name, description);
   }
@@ -512,9 +513,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * whatsapp-web.js 1.34.7 can read labels and assign them, but cannot create, rename, recolour or
    * delete one — `index.d.ts` exposes getLabels / getLabelById / getChatLabels / getChatsByLabelId /
    * addOrRemoveLabels and nothing that edits the label itself.
-   *
-   * Inline rather than delegated so the parity gate, which reads bodies off the prototype, can
-   * verify the matrix row (see docs/29).
    */
   // eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars
   async upsertLabel(_label: LabelInput): Promise<void> {
@@ -526,6 +524,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     throw new EngineNotSupportedError('deleteLabel');
   }
 
+  /**
+   * whatsapp-web.js exposes no way to observe another party's presence: WAWebPresenceChatAction
+   * offers only sendPresenceAvailable/sendPresenceUnavailable, which publish the ACCOUNT's own
+   * presence, and the library surfaces no presence event at all.
+   */
   // eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars
   async subscribeToPresence(_chatId: string): Promise<void> {
     throw new EngineNotSupportedError('subscribeToPresence');
@@ -584,6 +587,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   resolveContactPhone(contactId: string): Promise<string | null> {
     return this.contacts.resolveContactPhone(contactId);
+  }
+
+  getContactLid(number: string): Promise<string | null> {
+    return this.contacts.getContactLid(number);
   }
 
   getGroups(): Promise<Group[]> {
@@ -663,6 +670,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.messaging.getMessageReactions(chatId, messageId);
   }
 
+  getMessageReceipts(chatId: string, messageId: string): Promise<MessageReceipts> {
+    return this.messaging.getMessageReceipts(chatId, messageId);
+  }
+
   // Labels (Phase 3) - WhatsApp Business only
   getLabels(): Promise<Label[]> {
     return this.labels.getLabels();
@@ -717,7 +728,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.messaging.getChatHistory(chatId, limit, includeMedia, mediaMaxBytes, signal);
   }
 
-  // Delete Message
   starMessage(chatId: string, messageId: string, star: boolean): Promise<void> {
     return this.messaging.starMessage(chatId, messageId, star);
   }
@@ -741,7 +751,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.messaging.unpinMessage(chatId, messageId);
   }
 
-  deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {
+  deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<string | void> {
     return this.messaging.deleteMessage(chatId, messageId, forEveryone);
   }
 
@@ -840,6 +850,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.groups.setGroupEphemeral(groupId, durationSec);
   }
 
+  setGroupMemberLabel(groupId: string, label: string): Promise<void> {
+    return this.groups.setGroupMemberLabel(groupId, label);
+  }
+
   getGroupMembershipRequests(groupId: string): Promise<GroupMembershipRequest[]> {
     return this.groups.getGroupMembershipRequests(groupId);
   }
@@ -853,7 +867,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   // ========== Status/Stories (Phase 3) ==========
-  // Note: These are stub implementations - whatsapp-web.js has limited Status API support
 
   getContactStatuses(): Promise<Status[]> {
     return this.statuses.getContactStatuses();
@@ -961,11 +974,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // Post-READY navigation window: window.WWebJS is gone until the re-inject completes, so every
     // delegate evaluate would die as a raw TypeError 500 (and five raw send failures latch the send
     // breaker for its 15-minute cooldown). Answer the same retryable 409 the pre-READY states get,
-    // naming the reload so the operator can tell this state from a plain disconnect (#1081).
-    if (this.lifecycle.isInNavigationReinjectWindow()) {
-      throw new EngineNotReadyError(
-        'WhatsApp Web is reloading its page and the session is re-injecting. Retry in a few seconds.',
-      );
+    // naming the reload so the operator can tell this state from a plain disconnect (#1081). Past the
+    // window the same holds for a reloaded page a liveness probe has read without its helpers.
+    if (this.lifecycle.isInNavigationReinjectWindow() || this.lifecycle.isPageWithoutHelpers()) {
+      throw new EngineNotReadyError(PAGE_RELOADING_MESSAGE);
     }
   }
 
@@ -974,7 +986,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // upstream wwebjs#201823 — WA Web removed Msg.avParams). Text→channel works; media does not.
     // Fail fast with a typed 501 instead of surfacing the raw TypeError as a 500 (#673).
     if (isChannelJid(chatId)) {
-      throw new ChannelMediaNotSupportedError();
+      throw markNothingSent(new ChannelMediaNotSupportedError());
     }
   }
 }

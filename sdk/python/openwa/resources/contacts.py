@@ -11,6 +11,7 @@ from .._http import quote_segment
 from ..types import (
     UpsertContactRequest,
     CheckNumberResponse,
+    ContactLidResponse,
     ContactPhoneResponse,
     ContactRecord,
     ProfilePictureResponse,
@@ -38,6 +39,7 @@ class ContactsResource:
         return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}")
 
     def check(self, session_id: str, number: str) -> CheckNumberResponse:
+        """Check whether a number is on WhatsApp (OPERATOR)."""
         return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/contacts/check/{quote_segment(number)}")
 
     def profile_picture(self, session_id: str, contact_id: str) -> ProfilePictureResponse:
@@ -55,7 +57,17 @@ class ContactsResource:
     def phone(self, session_id: str, contact_id: str) -> ContactPhoneResponse:
         return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}/phone")
 
+    def lid(self, session_id: str, number: str) -> ContactLidResponse:
+        """Look up the ``@lid`` WhatsApp holds for a phone number, without sending a message (OPERATOR).
+
+        ``lid`` is ``None`` when WhatsApp holds none, which an unregistered number also answers. The lookup can
+        query WhatsApp (Baileys on every call, whatsapp-web.js when the page holds no LID), so bulk lookups put
+        the linked account at risk.
+        """
+        return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(number)}/lid")
+
     def block(self, session_id: str, contact_id: str) -> SuccessResult:
+        """Block a contact (OPERATOR)."""
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}/block")
 
     def upsert(self, session_id: str, contact_id: str, body: UpsertContactRequest) -> SuccessResult:
@@ -71,6 +83,7 @@ class ContactsResource:
         )
 
     def unblock(self, session_id: str, contact_id: str) -> SuccessResult:
+        """Unblock a contact (OPERATOR)."""
         return self._http.request("DELETE", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}/block")
 
     def list_blocked(self, session_id: str) -> List[str]:

@@ -85,7 +85,11 @@ public final class ChatsResource {
             HttpMethod.POST, "/api/sessions/" + encodeSegment(sessionId) + "/chats/unread", null, body, SuccessResult.class);
     }
 
-    /** Delete every message in a chat, keeping the chat itself. */
+    /**
+     * Delete every message in a chat, keeping the chat itself. On success the gateway also deletes
+     * its stored copy of the chat's messages (rows, inline and archived media, search entries);
+     * export the history first if you need it.
+     */
     public SuccessResult clearMessages(String sessionId, String chatId) {
         return client.request(
             HttpMethod.DELETE,
@@ -96,8 +100,9 @@ public final class ChatsResource {
     }
 
     /**
-     * Archive or unarchive a chat. A false success means the engine declined — on Baileys a chat
-     * with no known history cannot be archived.
+     * Archive or unarchive a chat. A false success means the engine declined — on Baileys an id the
+     * session knows no chat for. A known chat with no message in memory or stored is archived without
+     * one.
      */
     public SuccessResult archive(String sessionId, ArchiveChatRequest body) {
         return client.request(
@@ -105,8 +110,9 @@ public final class ChatsResource {
     }
 
     /**
-     * Pin a chat to the top of the list, or unpin it. A false success means WhatsApp declined —
-     * an account may pin only three chats at a time.
+     * Pin a chat to the top of the list, or unpin it. A false success means WhatsApp declined: an
+     * account may pin only three chats at a time. Only whatsapp-web.js reports that refusal; Baileys
+     * cannot observe the cap and always answers true.
      */
     public SuccessResult pin(String sessionId, PinChatRequest body) {
         return client.request(
@@ -125,7 +131,11 @@ public final class ChatsResource {
             HttpMethod.POST, "/api/sessions/" + encodeSegment(sessionId) + "/chats/mute", null, body, SuccessResult.class);
     }
 
-    /** Delete a chat from the chat list. */
+    /**
+     * Delete a chat from the chat list. On success the gateway also deletes its stored copy of the
+     * chat's messages (rows, inline and archived media, search entries); export the history first if
+     * you need it.
+     */
     public SuccessResult delete(String sessionId, DeleteChatRequest body) {
         return client.request(
             HttpMethod.POST, "/api/sessions/" + encodeSegment(sessionId) + "/chats/delete", null, body, SuccessResult.class);

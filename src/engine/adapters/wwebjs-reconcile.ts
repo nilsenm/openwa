@@ -20,7 +20,9 @@ export interface WwebjsReadyReconcileHost {
   getCallbacks(): EngineEventCallbacks;
   /** Promote to READY off the live client's info — the lifecycle's own ready path. */
   markReadyFromClientInfo(): void;
-  /** The deadline's non-bridge branch: clear the broken auth and let the lifecycle re-pair. */
+  /** Whether this engine showed a QR before authenticating: a fresh pairing, not a restored session. */
+  wasFreshPairing(): boolean;
+  /** The deadline's fresh-pairing branch: clear the broken auth and let the lifecycle re-pair. */
   recoverFromStuckAuth(): Promise<void>;
 }
 
@@ -28,9 +30,10 @@ const READY_RECONCILE_INTERVAL_MS = 2000;
 export const READY_RECONCILE_TIMEOUT_MS = 90_000;
 
 // How long after `authenticated` the event bridge is allowed to still be attaching before a reload is
-// considered. whatsapp-web.js clears `eventsAttached` in its constructor (Client.js:109) and sets it
-// only once attachEventListeners() resolves (Client.js:373); in between it evaluates LoadUtils, polls
-// up to 30s for window.WWebJS (Client.js:334), then builds ClientInfo and InterfaceController. So a
+// considered. whatsapp-web.js clears `eventsAttached` in its constructor (and, with the ready-sync patch, again
+// whenever its post-auth callback starts attaching for a page without the helpers) and sets it only once
+// attachEventListeners() resolves; in between it evaluates LoadUtils, polls up to 30s for window.WWebJS, then
+// builds ClientInfo and InterfaceController. So a
 // false flag is the NORMAL reading for most of a minute on a loaded host, and reloading on it aborts
 // a healthy attach — the page navigates out from under the in-flight inject(), which then dies before
 // re-exposing the bridge and cannot be retried (#1081). Must exceed upstream's own 30s poll with room
@@ -66,8 +69,10 @@ export class WwebjsReadyReconcile {
         // different animal from a stuck-after-QR session: the link and the credentials are fine,
         // only this browser instance is broken. Wiping the only copy of the credentials would trade
         // a restart-fixable fault for a forced re-pair — fail loudly and keep the auth instead.
+        // A reload attempt counts as proof of CONNECTED: it only follows a CONNECTED probe, and the
+        // page it reboots can report OPENING on every probe until the deadline.
         const bridgeDead =
-          this.lastProbeStateConnected &&
+          (this.lastProbeStateConnected || this.readyReconcileReloadAttempted) &&
           (this.host.getClient() as Client & { eventsAttached?: boolean })?.eventsAttached === false;
         if (bridgeDead) {
           this.host.logger.error(
@@ -84,6 +89,27 @@ export class WwebjsReadyReconcile {
             .onError?.(
               'WhatsApp Web is connected but its event bridge never attached, so inbound messages would be ' +
                 'lost. The saved session was kept — restart the session to relaunch the browser.',
+            );
+          return;
+        }
+        // A session restored from saved credentials never showed a QR, so nothing says those
+        // credentials are bad: a stuck restore is far more often an incompatible WhatsApp Web build,
+        // which a re-pair does not fix. Clearing them is not reversible, so keep them and fail loudly.
+        if (!this.host.wasFreshPairing()) {
+          this.host.logger.error(
+            'WhatsApp Web restored the saved session but it never became ready within the readiness ' +
+              'deadline; the session is marked failed and the saved credentials were kept.',
+            undefined,
+            { sessionId: this.host.config.sessionId, action: 'ready_reconcile_timeout_restored' },
+          );
+          this.clearReadyReconcile();
+          this.host.setStatus(EngineStatus.FAILED);
+          this.host
+            .getCallbacks()
+            .onError?.(
+              'WhatsApp Web restored the saved session but never became ready; the saved credentials were kept. ' +
+                'Restart the session; to pair again, delete it (which clears the saved credentials) and create ' +
+                'it anew. Pin WWEBJS_WEB_VERSION if it keeps recurring.',
             );
           return;
         }

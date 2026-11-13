@@ -17,15 +17,25 @@ import {
 } from 'recharts';
 import { BarChart3 } from 'lucide-react';
 import { useStatsMessagesQuery } from '../hooks/queries';
-import type { StatsPeriod } from '../services/api';
+import type { MessageType, StatsPeriod } from '../services/api';
 import { formatTick } from '../utils/chartTicks';
+import { messageTypeLabelKey } from '../utils/enumLabels';
+import { isolate, shortenLabel } from '../utils/shortenLabel';
 import './DashboardCharts.css';
 
 const PERIODS: StatsPeriod[] = ['24h', '7d', '30d'];
 
-// Stable, distinct color per message type (recharts needs literal colors). Keyed by type name —
-// not array index — so two types can never share a color, and a slice keeps its color even when the
-// set of present types changes between requests. Covers every type mapMessageType() can emit.
+const tooltipStyles = {
+  contentStyle: { backgroundColor: 'var(--bg-card)', border: '1px solid var(--border)' },
+  labelStyle: { color: 'var(--text-primary)' },
+  itemStyle: { color: 'var(--text-primary)' },
+};
+
+// Stable, distinct color per message type (recharts needs literal colors). Keyed by type name, not
+// array index, so a slice keeps its color even when the set of present types changes between requests.
+// Covers every MESSAGE_TYPES value (the `satisfies` fails the build when one is missing). No color
+// repeats here or in the fallback palette, so no known type shares its color, not even with a type
+// that falls back.
 const TYPE_COLORS: Record<string, string> = {
   text: '#25d366',
   image: '#3b82f6',
@@ -37,13 +47,16 @@ const TYPE_COLORS: Record<string, string> = {
   sticker: '#ef4444',
   location: '#84cc16',
   poll: '#6366f1',
+  call: '#0ea5e9',
   revoked: '#f43f5e',
+  order: '#f97316',
+  product: '#d946ef',
   masked: '#8b5cf6',
   unknown: '#64748b',
-};
+} satisfies Record<MessageType, string>;
 
-// Deterministic fallback for any unmapped type, so its color is stable across renders.
-const FALLBACK_COLORS = ['#0ea5e9', '#d946ef', '#f97316', '#10b981', '#6366f1', '#eab308'];
+// Deterministic fallback for a type this build does not know yet, so its color is stable across renders.
+const FALLBACK_COLORS = ['#10b981', '#eab308'];
 function colorForType(name: string): string {
   if (TYPE_COLORS[name]) return TYPE_COLORS[name];
   let hash = 0;
@@ -68,8 +81,9 @@ export function DashboardCharts() {
   if (isError && forbidden) return null;
 
   const timeSeries = (data?.timeSeries ?? []).map(p => ({ ...p, label: formatTick(p.timestamp, period) }));
+  // `name` keys the slice color; `label` is what the legend and tooltip show.
   const byType = Object.entries(data?.byType ?? {})
-    .map(([name, value]) => ({ name, value }))
+    .map(([name, value]) => ({ name, label: t(messageTypeLabelKey(name), { defaultValue: name }), value }))
     .sort((a, b) => b.value - a.value);
   const topChats = (data?.topChats ?? [])
     .slice(0, 8)
@@ -123,8 +137,8 @@ export function DashboardCharts() {
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                 <XAxis dataKey="label" tick={{ fontSize: 12, fill: 'var(--text-secondary)' }} />
                 <YAxis allowDecimals={false} tick={{ fontSize: 12, fill: 'var(--text-secondary)' }} />
-                <Tooltip />
-                <Legend />
+                <Tooltip {...tooltipStyles} />
+                <Legend labelStyle={{ color: 'var(--text-secondary)' }} />
                 <Area
                   type="monotone"
                   dataKey="sent"
@@ -152,13 +166,13 @@ export function DashboardCharts() {
             ) : (
               <ResponsiveContainer width="100%" height={260}>
                 <PieChart>
-                  <Pie data={byType} dataKey="value" nameKey="name" innerRadius={55} outerRadius={90} paddingAngle={2}>
+                  <Pie data={byType} dataKey="value" nameKey="label" innerRadius={55} outerRadius={90} paddingAngle={2}>
                     {byType.map(entry => (
                       <Cell key={entry.name} fill={colorForType(entry.name)} />
                     ))}
                   </Pie>
-                  <Tooltip />
-                  <Legend />
+                  <Tooltip {...tooltipStyles} />
+                  <Legend labelStyle={{ color: 'var(--text-secondary)' }} />
                 </PieChart>
               </ResponsiveContainer>
             )}
@@ -178,8 +192,11 @@ export function DashboardCharts() {
                     dataKey="name"
                     width={120}
                     tick={{ fontSize: 12, fill: 'var(--text-secondary)' }}
+                    // A group has no name here, so its label is its numeric id, wider than the axis; the tooltip
+                    // keeps the full label.
+                    tickFormatter={(label: string) => isolate(shortenLabel(String(label)))}
                   />
-                  <Tooltip />
+                  <Tooltip {...tooltipStyles} />
                   <Bar dataKey="count" name={t('dashboard.charts.messages')} fill="#25d366" radius={[0, 4, 4, 0]} />
                 </BarChart>
               </ResponsiveContainer>

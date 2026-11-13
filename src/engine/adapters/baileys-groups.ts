@@ -11,12 +11,13 @@ import {
 } from '../interfaces/whatsapp-engine.interface';
 import { mapBaileysGroup, mapBaileysGroupInfo } from './baileys-group-mapper';
 import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
-import { resolveMediaBuffer } from './baileys-messaging';
+import { assertReadableImage, resolveMediaBuffer } from './baileys-messaging';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
 import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
 import { type createLogger } from '../../common/services/logger.service';
-import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
+import { BAILEYS_QUERY_BUDGET_MS, confirmedWrite, withQueryDeadline } from './baileys-query-deadline';
 import { toParticipantWid } from '../identity/wa-id';
 
 /**
@@ -36,6 +37,8 @@ export interface BaileysGroupsHost {
   normalizedSelfJid(): string;
   /** Learn lid->pn pairs (write-through to the persistent table); no-ops pairs missing either side. */
   addLidMappings(mappings: { lid?: string; pn?: string }[]): void;
+  /** Drop the group's cached metadata, which a group send reuses: its members or settings are changing. */
+  forgetGroupMetadata?(groupId: string): void;
 }
 
 /**
@@ -73,6 +76,10 @@ export function refusedStatusCode(error: unknown): number | undefined {
  * failures (dropped socket, timeout) propagate untouched: folding them in would report a dead
  * connection as a permissions problem.
  *
+ * WA codes 408 and 429 (timed out, rate limited) become EngineTransportError (503) instead: a
+ * throttled caller has not been refused, and a retry may succeed. A 429 is the EngineThrottledError
+ * subclass, since a throttled request was not applied and a paced write can give its budget back.
+ *
  * `notFound`, when given, takes WA code 404 (item-not-found) instead: a caller whose request names a
  * single resource maps it to that resource's not-found error rather than a permissions refusal.
  */
@@ -88,6 +95,12 @@ export async function mapServerRefusal<T>(
     const code = classify(error);
     if (code === 404 && notFound) {
       throw notFound();
+    }
+    if (code === 429) {
+      throw new EngineThrottledError(`${operation} was rate-limited by WhatsApp (code ${code})`);
+    }
+    if (code === 408) {
+      throw new EngineTransportError(`${operation} was timed out by WhatsApp (code ${code})`);
     }
     if (code !== undefined && code >= 400 && code < 500) {
       throw new EngineRefusedError(
@@ -151,7 +164,7 @@ export class BaileysGroups {
 
   /** Bound a write whose confirmation the library discards; see baileys-query-deadline.ts. */
   private confirmed<T>(work: Promise<T>, operation: string): Promise<T> {
-    return withQueryDeadline(work, this.queryBudgetMs, `WhatsApp did not confirm ${operation} in time`);
+    return confirmedWrite(work, this.queryBudgetMs, operation);
   }
 
   /** Post-ensureReady socket handle. */
@@ -165,8 +178,14 @@ export class BaileysGroups {
    * reads as not-found, so it answers 404 as whatsapp-web.js does rather than a 403 permissions
    * refusal. The w:g2 group IQs are addressed to the group jid, and a leave names only that group.
    */
-  private groupWrite<T>(groupId: string, operation: string, op: () => Promise<T>): Promise<T> {
-    return mapServerRefusal(operation, op, refusedStatusCode, () => new GroupNotFoundError(groupId));
+  private async groupWrite<T>(groupId: string, operation: string, op: () => Promise<T>): Promise<T> {
+    try {
+      return await mapServerRefusal(operation, op, refusedStatusCode, () => new GroupNotFoundError(groupId));
+    } finally {
+      // A group write may change who is in the group and how it sends, confirmed or not, so the next send
+      // to it reads the group again instead of reusing the participant list cached before.
+      this.host.forgetGroupMetadata?.(groupId);
+    }
   }
 
   /** Neutral → engine id fold for participant/mention lists. */
@@ -179,11 +198,22 @@ export class BaileysGroups {
     // groupFetchAllParticipating yields {} for BOTH an unanswered query and an account with no
     // groups, so the empty list carries no signal — only our own clock separates them, and an
     // empty list is the shape a caller is least able to question.
-    const all = await withQueryDeadline(
-      this.sock().groupFetchAllParticipating(),
-      this.queryBudgetMs,
-      'WhatsApp did not answer the group list query in time',
-    );
+    let all: Awaited<ReturnType<WASocket['groupFetchAllParticipating']>>;
+    try {
+      all = await withQueryDeadline(
+        this.sock().groupFetchAllParticipating(),
+        this.queryBudgetMs,
+        'WhatsApp did not answer the group list query in time',
+      );
+    } catch (err) {
+      // A throttle is retryable, as on getGroupInfo. Any other refusal keeps its old shape: folding
+      // it into mapServerRefusal's 403 would claim a permissions problem for a plain list read.
+      const code = refusedStatusCode(err);
+      if (code === 408 || code === 429) {
+        throw new EngineTransportError(`WhatsApp rate-limited or timed out the group list query (code ${code})`);
+      }
+      throw err;
+    }
     const self = this.host.normalizedSelfJid();
     return Object.values(all).map(metadata => mapBaileysGroup(metadata, self, jid => this.host.toNeutralJid(jid)));
   }
@@ -204,8 +234,12 @@ export class BaileysGroups {
       // Only a SERVER refusal may become null (→ service 404): the group does not exist or the
       // account cannot see it. Anything else — a dropped socket, a timeout, a protocol error —
       // folded into null makes a dead transport look like a missing group, so it propagates.
+      // Every other 4xx answer (a malformed or non-group id) is not-found too, as getGroupJoinInfo reads it.
       const code = refusedStatusCode(err);
-      if (code === 401 || code === 403 || code === 404) {
+      if (code === 408 || code === 429) {
+        throw new EngineTransportError(`WhatsApp rate-limited or timed out the group metadata query (code ${code})`);
+      }
+      if (code !== undefined && code >= 400 && code < 500) {
         this.host.logger.debug('groupMetadata refused; treating as not-found', {
           groupId,
           error: err instanceof Error ? err.message : String(err),
@@ -218,15 +252,21 @@ export class BaileysGroups {
 
   /**
    * Deliberately NOT bounded by a deadline, unlike the reads either side of it. Creating a group is
-   * the one non-idempotent operation here, and 503 is a backpressure status the Go SDK retries three
-   * times for POST (sdk/go/retry.go) — an OpenWA deadline abandons the call without cancelling it,
-   * so a slow-but-succeeding create could be issued four times and leave duplicate groups. An
-   * unanswered query therefore still surfaces opaquely rather than as something retryable.
+   * the one non-idempotent operation here, and 503 is a status a client that retries a POST replays (the Go SDK
+   * does with an Idempotency-Key or a Retry-After, sdk/go/retry.go) — an OpenWA deadline abandons the call without
+   * cancelling it, so a slow-but-succeeding create could be issued again and leave duplicate groups. An
+   * unanswered query therefore still surfaces opaquely rather than as something retryable, and so
+   * does WA code 408: a server timeout does not say whether the group was created.
    */
   async createGroup(name: string, participants: string[]): Promise<Group> {
     this.host.ensureReady();
-    const metadata = await mapServerRefusal('Creating the group', () =>
-      this.sock().groupCreate(name, this.toEngineParticipants(participants)),
+    const metadata = await mapServerRefusal(
+      'Creating the group',
+      () => this.sock().groupCreate(name, this.toEngineParticipants(participants)),
+      error => {
+        const code = refusedStatusCode(error);
+        return code === 408 ? undefined : code;
+      },
     );
     return mapBaileysGroup(metadata, this.host.normalizedSelfJid(), jid => this.host.toNeutralJid(jid));
   }
@@ -330,7 +370,11 @@ export class BaileysGroups {
   async getGroupInviteCode(groupId: string): Promise<string> {
     this.host.ensureReady();
     const code = await this.groupWrite(groupId, 'Fetching the group invite code', () =>
-      this.sock().groupInviteCode(groupId),
+      withQueryDeadline(
+        this.sock().groupInviteCode(groupId),
+        this.queryBudgetMs,
+        'WhatsApp did not answer the group invite-code query in time',
+      ),
     );
     if (!code) {
       throw new EngineTransportError('WhatsApp did not answer the group invite-code query');
@@ -340,8 +384,14 @@ export class BaileysGroups {
 
   async revokeGroupInviteCode(groupId: string): Promise<string> {
     this.host.ensureReady();
+    // Bounded like the read: a revoke WhatsApp applies after the deadline only mints a code nobody holds,
+    // and a retry mints another.
     const code = await this.groupWrite(groupId, 'Revoking the group invite code', () =>
-      this.sock().groupRevokeInvite(groupId),
+      withQueryDeadline(
+        this.sock().groupRevokeInvite(groupId),
+        this.queryBudgetMs,
+        'WhatsApp did not answer the group invite-code revocation in time',
+      ),
     );
     if (!code) {
       throw new EngineTransportError('WhatsApp did not answer the group invite-code revocation');
@@ -370,6 +420,9 @@ export class BaileysGroups {
       // Baileys throws a Boom carrying the WA code for an invalid/expired/revoked invite — the
       // route's documented 404 (matching whatsapp-web.js), not a 500. Transport failures propagate.
       const code = refusedStatusCode(error);
+      if (code === 408 || code === 429) {
+        throw new EngineTransportError(`WhatsApp rate-limited or timed out the invite-info query (code ${code})`);
+      }
       if (code !== undefined && code >= 400 && code < 500) {
         throw new GroupNotFoundError(inviteCode);
       }
@@ -413,6 +466,9 @@ export class BaileysGroups {
       if (code === undefined || code < 400 || code >= 500) {
         throw error;
       }
+      if (code === 408 || code === 429) {
+        throw new EngineTransportError(`WhatsApp rate-limited or timed out the group join (code ${code})`);
+      }
       this.host.logger.warn('Group invite refused', { error: String(error) });
       jid = undefined;
     }
@@ -447,6 +503,7 @@ export class BaileysGroups {
     this.host.ensureReady();
     // Same socket call as the own-account picture, addressed at the group JID.
     const { data } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
+    await assertReadableImage(data);
     await this.pictureWrite(groupId, 'Setting the group picture', () =>
       this.confirmed(this.sock().updateProfilePicture(groupId, data), 'the group picture change'),
     );
@@ -505,6 +562,17 @@ export class BaileysGroups {
     this.host.ensureReady();
     await this.groupWrite(groupId, 'Setting the disappearing-message timer', () =>
       this.confirmed(this.sock().groupToggleEphemeral(groupId, durationSec), 'the disappearing-message timer change'),
+    );
+  }
+
+  /**
+   * Not an IQ: `updateMemberLabel` relays a GROUP_MEMBER_LABEL_CHANGE protocol message to the group and
+   * resolves with its message id once sent, so a 4xx here is the group lookup the relay depends on.
+   */
+  async setGroupMemberLabel(groupId: string, label: string): Promise<void> {
+    this.host.ensureReady();
+    await this.groupWrite(groupId, 'Setting the member label', () =>
+      this.confirmed(this.sock().updateMemberLabel(groupId, label), 'the member label change'),
     );
   }
 

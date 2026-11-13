@@ -10,9 +10,12 @@
 # The per-arch runtime deps are installed natively in the target-platform production stage below.
 # NOTE: $BUILDPLATFORM requires BuildKit (CI uses buildx; modern `docker build`/compose default to it).
 # The digest pins the multi-arch node:22-slim index, so every build starts from the same immutable
-# base; dependabot's docker ecosystem proposes the new digest when the tag moves. Update tag and
-# digest together.
-FROM --platform=$BUILDPLATFORM docker.io/node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS builder
+# base. Dependabot proposes a refreshed digest when the tag moves; if none has arrived, refresh by
+# hand (`docker buildx imagetools inspect docker.io/node:22-slim`). The base-image-drift job in
+# security-scan.yml fails once the pin differs from what the tag serves and either the tag has
+# served that image for 7 or more days, or for 3 or more days with the pin last changed 28 or more
+# days ago. Update both stages together.
+FROM --platform=$BUILDPLATFORM docker.io/node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS builder
 
 WORKDIR /app
 
@@ -38,7 +41,8 @@ COPY scripts/postinstall.js ./scripts/
 # Coolify (and similar PaaS) promote every ${VAR} referenced in the compose file to a build-time
 # variable, so docker-compose.yml's `NODE_ENV=${NODE_ENV:-production}` leaks NODE_ENV=production
 # into this stage and a bare `npm ci` would skip @nestjs/cli → `sh: 1: nest: not found` (exit 127).
-# (docker-compose.dev.yml hardcodes NODE_ENV=development, which is why the dev build never hit this.)
+# (docker-compose.dev.yml forwards `NODE_ENV=${NODE_ENV:-development}`, so the dev build only sees
+# production when the host sets it.)
 # This stage only builds dist/ and the dashboard SPA and never launches a browser; the production
 # stage downloads Chrome explicitly. Skip the Puppeteer postinstall download so @puppeteer/browsers 3
 # does not try to extract a zip here, where no archiver is installed.
@@ -59,7 +63,7 @@ RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:
 
 # ===== Stage 2: Production =====
 # Same digest-pinned node:22-slim base as the builder stage.
-FROM docker.io/node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS production
+FROM docker.io/node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS production
 
 # Run the app with production defaults from the first boot: an unset NODE_ENV selects the
 # development branch of the CORS/Swagger/DTO-error-detail/default-secret hardening (main.ts
@@ -137,12 +141,14 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # Postgres the compose file does not control, where 17 is the current default. Pinning to 16 would
 # have left every such deployment unable to back up. Verified against live 16 and 17 servers.
 #
-# The signing key is committed rather than fetched at build time. Fetched, it was the one build input
-# nothing pinned: `signed-by` attests only that the .debs match whatever that request returned, so a
-# compromised host, or a build behind a TLS-intercepting proxy whose root is in the trust store,
-# would swap the trust anchor with nothing to notice. Committed, it is reviewed once and diffable
-# forever, and it removes one of the two network calls the release build makes uncached
-# (release.yml's `no-cache-filters: production` rebuilds this stage every tag, on both platforms).
+# The signing key is committed rather than fetched at build time. Fetched, nothing pinned it:
+# `signed-by` attests only that the .debs match whatever that request returned, so a compromised
+# host, or a build behind a TLS-intercepting proxy whose root is in the trust store, would swap the
+# trust anchor with nothing to notice. Committed, it is reviewed once and diffable forever. It is not
+# the only such input: this stage re-fetches on every release build (release.yml's
+# `no-cache-filters: production` rebuilds it every tag, on both platforms), and npm and its Undici
+# below are pinned by version over TLS only, as is the amd64 Chrome for Testing archive, which has no
+# checksum.
 # Verify with `gpg --show-keys --with-fingerprint scripts/pgdg-ACCC4CF8.asc`:
 #   B97B0AFC AA1A47F0 44F244A0 7FCC7D46 ACCC4CF8, uid "PostgreSQL Debian Repository".
 #
@@ -167,11 +173,14 @@ http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.l
     && apt-get update && apt-get install -y --no-install-recommends postgresql-client-17 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Puppeteer to skip automatic download during npm install (we download it explicitly below)
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# Keep puppeteer's postinstall from downloading a browser (the --ignore-scripts install below
+# already skips it; amd64 downloads its pinned build explicitly further down)
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 
-# Create app user for security
-RUN groupadd -r openwa && useradd -r -g openwa openwa
+# Create app user for security. The ids are pinned (997 is what `-r` assigned on both arches) so a
+# Kubernetes runAsUser/fsGroup or a `docker run --user` can name the runtime user; the root start
+# re-owns /app/data by name either way.
+RUN groupadd -r -g 997 openwa && useradd -r -u 997 -g openwa openwa
 
 WORKDIR /app
 
@@ -180,16 +189,16 @@ COPY package*.json ./
 
 # Backport upstream whatsapp-web.js#201832 (id._serialized -> id.$1 normalization,
 # broken by WA Web 2.3000.x ~2026-07-14) into the installed dep at build time.
-# The patcher self-disables once whatsapp-web.js ships the fix upstream.
+# The patcher stands down once every site it writes carries the fix; a release that fixes the ids
+# another way fails the build until the backport is retired.
 # scripts/postinstall.js rides along so a bare local `npm ci` keeps working, but the
 # --ignore-scripts install below skips the hook here: the explicit fatal run right
 # after is the sole (and stricter) applier for the image.
-COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-wwebjs-media-id.js scripts/patch-wwebjs-send-error.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js ./scripts/
+COPY scripts/postinstall.js scripts/atomic-write.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-wwebjs-media-id.js scripts/patch-wwebjs-send-error.js scripts/patch-wwebjs-puppeteer.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js scripts/patch-baileys-pairing.js scripts/patch-baileys-media-stream.js ./scripts/
 
-# Install production dependencies only, then apply the backports. The status patcher runs after
-# the two patchers it depends on: its transforms were written against the tree they leave behind.
-# The send-error patcher runs after the other two that edit Client.js, so theirs still meet the
-# tree they were written against.
+# Install production dependencies only, then apply the backports. Each patcher matches the pristine
+# library on its own and none depends on another's edits, so the order below is not load-bearing:
+# applied in reverse, they leave the same tree.
 # scripts/dockerfile-patchers.spec.js derives this list from scripts/patch-*.js and fails if a
 # patcher is added without being copied AND run here — a hand-written list loses one silently, and
 # the Baileys one shipped in postinstall for a whole release without ever reaching the image.
@@ -202,8 +211,20 @@ COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832
 # msgpackr-extract) are optional=true with runtime fallbacks. The patchers that DO
 # need to run are the explicit fatal invocations below; baileys' preinstall is only
 # a node-version check that the engines field enforces anyway.
-# sharp trae su binario en un paquete opcional por plataforma que npm resuelve en su install
-# script; con --ignore-scripts no llega, y el contenedor arranca sin poder procesar imagenes.
+#
+# [LESOTUR] sharp trae su binario en un paquete opcional por plataforma que npm resuelve en su
+# install script; con --ignore-scripts no llega, y el contenedor arranca sin poder procesar
+# imagenes. El upstream NO instala ese binario (comprobado en 0.30.0), asi que la linea del
+# `npm install @img/sharp-linux-x64` de abajo es nuestra y hay que conservarla en cada sync.
+#
+# typescript and ts-node come out again at the end of the same RUN. They are root devDependencies
+# and also optional peers of valibot and typeorm, so the lockfile marks them devOptional and
+# `--omit=dev` keeps them: about 24 MiB that nothing loads. `node dist/main` registers no loader,
+# and migration:*:prod run the plain typeorm CLI on the compiled data sources under dist/. Their
+# bin links go with them, or they would dangle. ts-node's small helper packages (acorn, diff and
+# others) stay: they are generic names that a later dependency may come to share. The removal has
+# a line of its own, ahead of the cache clean that docs/10 quotes, and
+# scripts/smoke-test-engine-libs.sh checks the built image on each architecture.
 RUN npm ci --omit=dev --ignore-scripts \
     && npm install @img/sharp-linux-x64@$(node -p "require('sharp/package.json').version") --omit=dev --ignore-scripts \
     && node scripts/patch-wwebjs-201832.js \
@@ -217,17 +238,32 @@ RUN npm ci --omit=dev --ignore-scripts \
     && node scripts/patch-wwebjs-send-error.js \
     && node scripts/patch-baileys-appstate.js \
     && node scripts/patch-baileys-newsletter-create.js \
+    && node scripts/patch-baileys-pairing.js \
+    && node scripts/patch-baileys-media-stream.js \
+    && node scripts/patch-wwebjs-puppeteer.js \
+    && rm -rf node_modules/typescript node_modules/ts-node node_modules/.bin/tsc node_modules/.bin/tsserver \
+        node_modules/.bin/ts-script node_modules/.bin/ts-node* \
     && npm cache clean --force
 
 # Replace the npm the base image bundles. npm is not on the request path — the entrypoint runs
 # `node dist/main` — but it stays in the image because the operator runbooks drive it
-# (`docker exec openwa npm run cli …`, `npm run export`), and its own bundled dependency tree is
-# what the release image scan reports. node:22-slim currently ships npm 10.9.8, whose bundle
-# carries a critical node-tar advisory plus sigstore/picomatch ones; npm 12 fixes all three.
+# (`docker compose run --rm openwa-api npm run migration:run:prod`), and its own bundled dependency
+# tree is what the release image scan reports. node:22-slim ships npm 10.9 (10.9.9 at the pinned digest),
+# whose bundle has carried a critical node-tar advisory plus sigstore/picomatch ones; npm 12 fixes
+# all three.
 # Deliberately AFTER `npm ci`, so the application tree is still resolved by the npm the lockfile
 # was generated with and only the global CLI is swapped. Pinned to the exact patch release —
 # a floating npm@12 would make the image's bundled npm tree depend on when the build happened.
-RUN npm install -g npm@12.0.2 && npm cache clean --force
+# npm 12.2.1 still bundles Undici 6.29.0. Replace only that package with its compatible patch;
+# npm's bundled private packages prevent reinstalling its dependency tree from the registry.
+RUN npm install -g npm@12.2.1 && \
+    node -e "if (require('/usr/local/lib/node_modules/npm/node_modules/undici/package.json').version !== '6.29.0') throw new Error('Recheck npm Undici replacement');" && \
+    npm_http_patch_dir=$(mktemp -d) && \
+    npm install --prefix "$npm_http_patch_dir" --no-save --package-lock=false --ignore-scripts --no-audit --fund=false undici@6.29.1 && \
+    rm -rf /usr/local/lib/node_modules/npm/node_modules/undici && \
+    mv "$npm_http_patch_dir/node_modules/undici" /usr/local/lib/node_modules/npm/node_modules/undici && \
+    rm -rf "$npm_http_patch_dir" && \
+    npm cache clean --force
 
 # amd64: download Chrome for Testing via Puppeteer and symlink it.
 # arm64: use Debian's chromium installed above (a choice; see the note at that install).
@@ -248,7 +284,7 @@ RUN if [ "$TARGETARCH" = arm64 ]; then \
         ln -s /usr/bin/chromium /usr/local/bin/puppeteer-chrome; \
     else \
         mkdir -p /opt/puppeteer && \
-        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@153.0.8010.36' && \
+        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@157.0.8103.50' && \
         chown -R openwa:openwa /opt/puppeteer && \
         chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
         test -n "$chrome_path" && \
@@ -265,9 +301,9 @@ COPY --from=builder /app/dashboard/dist ./dashboard/dist
 
 # Create data directories with correct ownership. Only ./data is chowned, NOT all of /app: the app
 # tree (node_modules, dist) only needs read access, which root-owned files already grant, and the
-# entrypoint re-chowns /app/data at every container start for the mounted-volume case. A full
-# /app chown walks every production dependency file (issue #1045: ~35 minutes on a small VPS) and
-# duplicates their metadata into a new image layer.
+# entrypoint re-owns any wrong-owned path under /app/data at every start for the mounted-volume
+# case. A full /app chown walks every production dependency file (issue #1045: ~35 minutes on a
+# small VPS) and duplicates their metadata into a new image layer.
 RUN mkdir -p ./data/sessions ./data/media ./data/plugins && \
     chown -R openwa:openwa ./data
 
@@ -296,18 +332,24 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # Expose port
 EXPOSE 2785
 
-# Health check
+# Probe the port the app binds: PORT from the container environment, else the app's own default.
+# The probe shell sees only that environment, never a PORT set in a file the app loads (a mounted
+# .env or data/.env.generated), so a non-default PORT must be passed with -e/--env. Shell form on
+# purpose: exec form would not expand it.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:2785/api/health/ready || exit 1
+    CMD curl -f "http://localhost:${PORT:-2785}/api/health/ready" || exit 1
 
 # dumb-init is PID 1 and handles signal forwarding.
 # It execs docker-entrypoint.sh (as root), which fixes volume ownership and
 # then drops to the openwa user via gosu before starting the node process.
 #
 # NOTE — no `USER openwa` directive on purpose (Trivy DS-0002 will flag it, ignore).
-# The Node process does NOT run as root: docker-entrypoint.sh:30 is
-# `exec gosu openwa "$@"` after the chowns on lines 7 and 25. Adding `USER openwa`
-# here would run the entrypoint as openwa and break the chown-before-drop pattern
-# that makes named-volume mounts work on first boot (#254, #259).
+# The Node process does NOT run as root: docker-entrypoint.sh ends with
+# `exec gosu openwa "$@"`, after it chowns /app/data and the Chromium XDG
+# dirs. Adding `USER openwa` here would run the entrypoint as openwa and break
+# the chown-before-drop pattern that makes named-volume mounts work on first
+# boot (#254, #259). Starting it as a non-root uid on purpose (`--user 997:997`,
+# a Kubernetes runAsUser) is supported: the entrypoint skips the chown and the
+# drop, and needs /app/data to be writable by that uid.
 ENTRYPOINT ["dumb-init", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "dist/main"]

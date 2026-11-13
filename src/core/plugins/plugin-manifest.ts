@@ -1,5 +1,10 @@
 import * as path from 'path';
 import { PluginManifest, PluginType } from './plugin.interfaces';
+import { compareSemver } from '../../modules/plugins/catalog';
+
+// The version of the running code (same source as /api/health), the default floor check target.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { version: HOST_VERSION } = require('../../../package.json') as { version: string };
 
 /**
  * Plugin ids a plugin package / directory must never use. `whatsapp-web.js` / `baileys` are built-in
@@ -14,6 +19,8 @@ export const INSTALLABLE_TYPES = new Set<string>([PluginType.EXTENSION]);
 
 const SAFE_ID = /^[a-z0-9][a-z0-9._-]*$/i;
 const REQUIRED_FIELDS = ['id', 'name', 'version', 'type', 'main'] as const;
+// compareSemver reads garbage as 0.0.0, so a floor must be well-formed before it is compared.
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
 /**
  * The manifest validation BOTH install-time (parsePluginPackage) and boot-time
@@ -23,12 +30,18 @@ const REQUIRED_FIELDS = ['id', 'name', 'version', 'type', 'main'] as const;
  * logged + the directory skipped).
  *
  * Checks: plain-object shape; required fields present as non-empty strings; id format + reserved
- * ids; installable (extension) type; and that `main` is a relative path that cannot escape the
- * plugin directory. The `main` check here is lexical (forward-slash semantics); the loader
- * additionally anchors it against the real on-disk directory, which also catches platform-separator
- * tricks, and requires the entry file to exist (parity with install's in-archive check).
+ * ids; installable (extension) type; that `permissions`, `sessions`, `hooks` and `net.allow` /
+ * `net.allowConfigHosts` are string arrays when present; that `main` is a relative path that
+ * cannot escape the plugin directory; and that an optional `minOpenWAVersion` is a MAJOR.MINOR.PATCH version no newer
+ * than `hostVersion` (pre-release suffixes are ignored, so 0.24.0-rc.1 satisfies 0.24.0). The
+ * `main` check here is lexical (forward-slash semantics); the loader additionally anchors it
+ * against the real on-disk directory, which also catches platform-separator tricks, and requires
+ * the entry file to exist (parity with install's in-archive check).
  */
-export function validatePluginManifest(manifest: unknown): asserts manifest is PluginManifest {
+export function validatePluginManifest(
+  manifest: unknown,
+  hostVersion: string = HOST_VERSION,
+): asserts manifest is PluginManifest {
   // JSON.parse("null") / "[]" / "5" don't throw — but indexing a field on a non-object then throws a
   // TypeError downstream. Require a plain object up front.
   if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
@@ -56,6 +69,92 @@ export function validatePluginManifest(manifest: unknown): asserts manifest is P
     );
   }
   assertMainContained(m.main);
+  // The consumers match these with `.includes`, which also works on a string: `sessions: 'sales-team'`
+  // would admit session 'sales'. Require real string arrays (null reads as absent, like the consumers).
+  assertStringArray(m.permissions, 'permissions');
+  assertStringArray(m.sessions, 'sessions');
+  assertStringArray(m.hooks, 'hooks');
+  const net: unknown = m.net;
+  if (net !== undefined && net !== null) {
+    if (typeof net !== 'object' || Array.isArray(net)) {
+      throw new Error('manifest.json net must be an object');
+    }
+    assertStringArray(m.net?.allow, 'net.allow');
+    assertStringArray(m.net?.allowConfigHosts, 'net.allowConfigHosts');
+  }
+  const min: unknown = m.minOpenWAVersion;
+  if (min !== undefined && min !== null) {
+    if (typeof min !== 'string' || !SEMVER.test(min)) {
+      throw new Error('manifest.json minOpenWAVersion must be a MAJOR.MINOR.PATCH version');
+    }
+    if (compareSemver(hostVersion, min) < 0) {
+      throw new Error(`Plugin ${m.id} requires OpenWA >= ${min} (running ${hostVersion})`);
+    }
+  }
+}
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/**
+ * Remove, in place and at any depth, a configSchema `properties` or `items` that is not a plain object and a
+ * `properties` entry that is not a field object. Every reader of the schema (secret masking and restore, the
+ * dashboard form) takes such an entry as a field and fails on a null one, which took down the plugin list for
+ * every plugin. The key is then read as an undescribed one, as seedConfigDefaults already does. Not a refusal:
+ * such a package loads today.
+ */
+export function dropMalformedConfigFields(schema: unknown): void {
+  if (!isPlainObject(schema)) return;
+  if ('properties' in schema) {
+    const properties = schema.properties;
+    if (!isPlainObject(properties)) {
+      delete schema.properties;
+    } else {
+      for (const [key, field] of Object.entries(properties)) {
+        if (isPlainObject(field)) dropMalformedConfigFields(field);
+        else delete properties[key];
+      }
+    }
+  }
+  if ('items' in schema) {
+    if (isPlainObject(schema.items)) dropMalformedConfigFields(schema.items);
+    else delete schema.items;
+  }
+}
+
+const dropNonText = (obj: Record<string, unknown>, ...keys: string[]): void => {
+  for (const key of keys) if (key in obj && typeof obj[key] !== 'string') delete obj[key];
+};
+
+/**
+ * Remove, in place, the manifest text the dashboard renders when it is not text: `description` and `author`, the
+ * entries of `provides` (all of it when it is not a list), and a locale's `name`, `description` and config field
+ * `title`/`description` under `i18n`. Each is a React child on the plugin list, and an object there took down the
+ * Plugins page for every operator, the page that would disable or remove the plugin. Not a refusal: such a package
+ * loads today.
+ */
+export function dropMalformedDisplayFields(manifest: PluginManifest): void {
+  const m = manifest as unknown as Record<string, unknown>;
+  dropNonText(m, 'description', 'author');
+  if ('provides' in m) {
+    if (Array.isArray(m.provides)) m.provides = m.provides.filter(item => typeof item === 'string');
+    else delete m.provides;
+  }
+  if (!isPlainObject(m.i18n)) return;
+  for (const locale of Object.values(m.i18n)) {
+    if (!isPlainObject(locale)) continue;
+    dropNonText(locale, 'name', 'description');
+    if (!isPlainObject(locale.config)) continue;
+    for (const field of Object.values(locale.config)) {
+      if (isPlainObject(field)) dropNonText(field, 'title', 'description');
+    }
+  }
+}
+
+function assertStringArray(value: unknown, field: string): void {
+  if (value !== undefined && value !== null && !(Array.isArray(value) && value.every(v => typeof v === 'string'))) {
+    throw new Error(`manifest.json ${field} must be an array of strings`);
+  }
 }
 
 /**

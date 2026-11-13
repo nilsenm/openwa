@@ -24,7 +24,10 @@ function contacts(sock: Record<string, jest.Mock>, budgetMs: number): BaileysCon
     resolvePhone: () => null,
     listChats: () => [],
     lastMessage: () => LAST,
+    chatDeletedAt: () => null,
     toEngineJid: (j: string) => j,
+    chatJid: (j: string) => j,
+    lidOf: () => null,
   } as unknown as BaileysContactsHost;
   return new BaileysContacts(host, budgetMs);
 }
@@ -41,6 +44,9 @@ function messaging(sock: Record<string, jest.Mock>, budgetMs: number): BaileysMe
     toUnixSeconds: () => 1,
     loadLib: () => Promise.resolve({} as never),
     getStoredMessage: () => Promise.resolve({ key: { ...LAST.key, fromMe: true }, message: {}, messageTimestamp: 1 }),
+    wasDeletedForEveryone: () => false,
+    pendingEditOf: () => undefined,
+    markDeletedForEveryone: () => undefined,
     putStoredMessage: () => undefined,
     recordLidMapping: () => undefined,
     getOnMessageCreate: () => undefined,

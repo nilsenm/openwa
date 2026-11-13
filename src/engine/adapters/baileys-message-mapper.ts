@@ -1,5 +1,48 @@
-import { DeliveryStatus, IncomingMessage, MessageType } from '../interfaces/whatsapp-engine.interface';
-import { chatKind } from '../identity/wa-id';
+import type { proto } from '@whiskeysockets/baileys';
+import {
+  DeliveryStatus,
+  EventResponseKind,
+  IncomingMessage,
+  MessageType,
+} from '../interfaces/whatsapp-engine.interface';
+import { chatKind, parseWaId, toNeutralJid } from '../identity/wa-id';
+import { boundPollOptions, boundPollText } from './message-mapper';
+
+/**
+ * Content types that change or annotate another message and carry nothing of their own: a poll vote,
+ * an in-chat pin, a keep-in-chat toggle, an album header (its photos arrive as their own messages), an
+ * encrypted reaction, an event RSVP, an encrypted edit and an encrypted comment. Mapped, they would
+ * surface as a bodyless `unknown` message, so the live and history paths drop them instead. The live
+ * path first reads an encrypted edit or reaction it holds the secret for (baileys-secret-payload.ts),
+ * and drops only what it cannot read.
+ */
+export const BAILEYS_NON_CONTENT_TYPES: ReadonlySet<string> = new Set([
+  'pollUpdateMessage',
+  'pinInChatMessage',
+  'keepInChatMessage',
+  'albumMessage',
+  'encReactionMessage',
+  'encEventResponseMessage',
+  'secretEncryptedMessage',
+  'encCommentMessage',
+]);
+
+/**
+ * Map Baileys' `EventResponseMessage.EventResponseType` (UNKNOWN=0, GOING=1, NOT_GOING=2, MAYBE=3)
+ * to the neutral RSVP kind. Matched by number so the mapper needs no runtime proto import.
+ */
+export function mapBaileysEventResponseType(type: number | null | undefined): EventResponseKind {
+  switch (type) {
+    case 1:
+      return 'going';
+    case 2:
+      return 'not_going';
+    case 3:
+      return 'maybe';
+    default:
+      return 'unknown';
+  }
+}
 
 /**
  * Map a Baileys message content-type token (from `getContentType`) to the engine-neutral
@@ -23,6 +66,8 @@ export function mapBaileysMessageType(
     case 'imageMessage':
       return 'image';
     case 'videoMessage':
+    case 'ptvMessage':
+      // A round video note is a VideoMessage under its own content key.
       return 'video';
     case 'audioMessage':
       return isPtt ? 'voice' : 'audio';
@@ -40,7 +85,10 @@ export function mapBaileysMessageType(
     case 'pollCreationMessage':
     case 'pollCreationMessageV2':
     case 'pollCreationMessageV3':
+    case 'pollCreationMessageV4':
+    case 'pollCreationMessageV5':
       // Native polls; WhatsApp bumps the content key across versions, all map to the same neutral type.
+      // V4 and V5 are read from the pinned library's proto schema (see pollCreationOf).
       return 'poll';
     case 'interactiveMessage':
     case 'buttonsMessage':
@@ -100,6 +148,9 @@ export interface BaileysBodyContent {
   pollCreationMessage?: { name?: string | null } | null;
   pollCreationMessageV2?: { name?: string | null } | null;
   pollCreationMessageV3?: { name?: string | null } | null;
+  pollCreationMessageV5?: { name?: string | null } | null;
+  /** A wrapper whose inner message carries the poll under one of the keys above. */
+  pollCreationMessageV4?: { message?: PollCreationKeys<{ name?: string | null }> | null } | null;
   /** A shared WhatsApp event; only its display name is surfaced as text. */
   eventMessage?: { name?: string | null } | null;
   /** The user tapping a business message button: which visible label they pressed. */
@@ -120,6 +171,32 @@ export interface BaileysBodyContent {
     catalog?: { title?: string | null } | null;
   } | null;
 }
+
+/** A poll's question as it reaches the body, bounded like the poll's own copy of it. */
+const pollQuestion = (name: string | null | undefined): string | undefined =>
+  name == null ? undefined : boundPollText(name);
+
+/** The content keys that carry a PollCreationMessage directly. */
+interface PollCreationKeys<P> {
+  pollCreationMessage?: P | null;
+  pollCreationMessageV2?: P | null;
+  pollCreationMessageV3?: P | null;
+  pollCreationMessageV5?: P | null;
+}
+
+/**
+ * The poll a message carries under one of {@link PollCreationKeys}. `pollCreationMessageV4` is a
+ * FutureProofMessage that the library's normalizeMessageContent does not open, so callers read its
+ * inner message with this once, one level down. V4 and V5 (a PollCreationMessage with quiz fields)
+ * are handled from the proto schema of the pinned library; no inbound message under either key has
+ * been captured from a live account.
+ */
+const pollCreationOf = <P>(content: PollCreationKeys<P> | null | undefined): P | undefined =>
+  content?.pollCreationMessage ??
+  content?.pollCreationMessageV2 ??
+  content?.pollCreationMessageV3 ??
+  content?.pollCreationMessageV5 ??
+  undefined;
 
 /**
  * Extract the display text of an inbound Baileys message: plain text first, then a media caption,
@@ -147,9 +224,11 @@ export function extractBaileysBody(content: BaileysBodyContent): string {
     content.interactiveResponseMessage?.body?.text ??
     content.listMessage?.description ??
     content.listMessage?.title ??
-    content.pollCreationMessage?.name ??
-    content.pollCreationMessageV2?.name ??
-    content.pollCreationMessageV3?.name ??
+    pollQuestion(content.pollCreationMessage?.name) ??
+    pollQuestion(content.pollCreationMessageV2?.name) ??
+    pollQuestion(content.pollCreationMessageV3?.name) ??
+    pollQuestion(content.pollCreationMessageV5?.name) ??
+    pollQuestion(pollCreationOf(content.pollCreationMessageV4?.message)?.name) ??
     content.eventMessage?.name ??
     content.buttonsResponseMessage?.selectedDisplayText ??
     content.templateButtonReplyMessage?.selectedDisplayText ??
@@ -163,6 +242,71 @@ export function extractBaileysBody(content: BaileysBodyContent): string {
     content.productMessage?.catalog?.title ??
     ''
   );
+}
+
+/**
+ * The envelopes Baileys' `normalizeMessageContent` opens (Utils/messages.js), in its order: a disappearing
+ * chat's, a view-once item's, a captioned document's, an edit's and a few more. Read here for code that has
+ * no handle on the library, the chat preview recorded synchronously by the session store.
+ */
+const CONTENT_WRAPPERS = [
+  'ephemeralMessage',
+  'viewOnceMessage',
+  'documentWithCaptionMessage',
+  'viewOnceMessageV2',
+  'viewOnceMessageV2Extension',
+  'editedMessage',
+  'associatedChildMessage',
+  'groupStatusMessage',
+  'groupStatusMessageV2',
+] as const;
+
+/**
+ * The text a message is announced with ({@link extractBaileysBody}, else the label of a native-flow reply
+ * that carries it only in its params), read inside its envelopes as `normalizeMessageContent` would open
+ * them, at most five deep like the library. `''` when it carries none.
+ */
+export function baileysMessageText(message: unknown): string {
+  let content = message as Record<string, { message?: unknown } | null | undefined> | null | undefined;
+  for (let depth = 0; depth < 5 && content; depth++) {
+    const wrapper = CONTENT_WRAPPERS.find(name => content?.[name]);
+    if (!wrapper) break;
+    content = content[wrapper]?.message as typeof content;
+  }
+  if (!content) return '';
+  return extractBaileysBody(content) || extractBaileysButtonReply(content, 'interactiveResponseMessage')?.text || '';
+}
+
+/**
+ * Write edited text into the slot a message carries its text in, which is where
+ * {@link extractBaileysBody} reads it back: the text itself, or the caption of a photo, video or
+ * document. Everything else the content holds (media keys, thumbnail, link preview) is kept, as
+ * WhatsApp Web keeps it (an edit changes the message's body or caption in place), so the edited
+ * message is still a valid message of its original type when it is quoted or forwarded. Returns
+ * false, changing nothing, when the content has no such slot.
+ * Pass the NORMALIZED content: it is a reference into the message, so the write lands there.
+ */
+export function setBaileysText(
+  content: Pick<
+    BaileysBodyContent,
+    'conversation' | 'extendedTextMessage' | 'imageMessage' | 'videoMessage' | 'documentMessage'
+  >,
+  text: string,
+): boolean {
+  if (typeof content.conversation === 'string') {
+    content.conversation = text;
+    return true;
+  }
+  if (content.extendedTextMessage) {
+    content.extendedTextMessage.text = text;
+    return true;
+  }
+  const media = content.imageMessage ?? content.videoMessage ?? content.documentMessage;
+  if (media) {
+    media.caption = text;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -748,6 +892,8 @@ interface BaileysContextCarrier {
     quotedMessage?: unknown;
     expiration?: number | null;
     mentionedJid?: string[] | null;
+    isForwarded?: boolean | null;
+    forwardingScore?: number | null;
   } | null;
 }
 
@@ -759,6 +905,7 @@ export interface BaileysContextContent {
   extendedTextMessage?: (BaileysContextCarrier & { backgroundArgb?: number | null; font?: number | null }) | null;
   imageMessage?: BaileysContextCarrier | null;
   videoMessage?: BaileysContextCarrier | null;
+  ptvMessage?: BaileysContextCarrier | null;
   audioMessage?: BaileysContextCarrier | null;
   documentMessage?: BaileysContextCarrier | null;
   stickerMessage?: BaileysContextCarrier | null;
@@ -769,6 +916,16 @@ export interface BaileysContextContent {
   templateButtonReplyMessage?: BaileysContextCarrier | null;
   listResponseMessage?: BaileysContextCarrier | null;
   interactiveResponseMessage?: BaileysContextCarrier | null;
+  /** Content types that carry a `contextInfo` of their own and have no extractor beyond it. */
+  contactMessage?: BaileysContextCarrier | null;
+  contactsArrayMessage?: BaileysContextCarrier | null;
+  liveLocationMessage?: BaileysContextCarrier | null;
+  pollCreationMessage?: BaileysContextCarrier | null;
+  pollCreationMessageV2?: BaileysContextCarrier | null;
+  pollCreationMessageV3?: BaileysContextCarrier | null;
+  pollCreationMessageV5?: BaileysContextCarrier | null;
+  /** A poll wrapper; the poll inside it carries the `contextInfo`. */
+  pollCreationMessageV4?: { message?: object | null } | null;
 }
 
 /** Everything the context region of an inbound message yields — not just the quote. */
@@ -779,6 +936,9 @@ export interface BaileysMessageContext {
   ephemeralDuration?: number;
   /** @mentioned JIDs from `contextInfo.mentionedJid`. */
   mentionedJids?: string[];
+  /** `contextInfo.isForwarded` / `forwardingScore`: set when the sender forwarded the message. */
+  isForwarded?: boolean;
+  forwardingScore?: number;
   /** Styling of an extended-text (status) message: proto `backgroundArgb` (fixed32 ARGB). */
   backgroundArgb?: number;
   /** Styling of an extended-text (status) message: proto `font` (WhatsApp font index). */
@@ -797,6 +957,7 @@ export function extractBaileysContext(content: BaileysContextContent): BaileysMe
     content.extendedTextMessage ??
     content.imageMessage ??
     content.videoMessage ??
+    content.ptvMessage ??
     content.audioMessage ??
     content.documentMessage ??
     content.stickerMessage ??
@@ -808,21 +969,31 @@ export function extractBaileysContext(content: BaileysContextContent): BaileysMe
   // A text status's styling rides on the extended-text content (proto backgroundArgb/font) —
   // surface it so the store/viewer can render the story the way it was posted.
   const extText = content.extendedTextMessage;
-  const contextInfo = subForContext?.contextInfo;
+  // A reply can be a poll, contact card, live location, order or event as well, and WhatsApp stamps the
+  // timer on every message in a disappearing chat, so any content node answers when the carriers above
+  // have none. A V4 poll's node is one level down, inside its wrapper.
+  const contexts = Object.values(content)
+    .concat(Object.values(content.pollCreationMessageV4?.message ?? {}))
+    .map(node => (node as BaileysContextCarrier | null | undefined)?.contextInfo);
+  const contextInfo = subForContext?.contextInfo ?? contexts.find(info => info != null);
+  const expiration =
+    contextInfo?.expiration ??
+    contexts.map(info => info?.expiration).find((e): e is number => typeof e === 'number' && e > 0);
 
   const context: BaileysMessageContext = {
-    ephemeralDuration: contextInfo?.expiration ?? undefined,
+    ephemeralDuration: expiration ?? undefined,
     mentionedJids: contextInfo?.mentionedJid ?? undefined,
+    isForwarded: contextInfo?.isForwarded === true ? true : undefined,
+    forwardingScore: typeof contextInfo?.forwardingScore === 'number' ? contextInfo.forwardingScore : undefined,
     backgroundArgb: typeof extText?.backgroundArgb === 'number' ? extText.backgroundArgb : undefined,
     font: typeof extText?.font === 'number' ? extText.font : undefined,
   };
 
   if (contextInfo?.quotedMessage && contextInfo.stanzaId) {
-    // The quote's body comes from the SAME extractor as the live message, so a quoted contact card,
-    // poll or interactive shape carries its text instead of an empty string — matching wwjs, whose
-    // quote is a full Message and therefore shows the same body it would show unquoted.
-    const qm = contextInfo.quotedMessage as BaileysBodyContent;
-    context.quotedMessage = { id: contextInfo.stanzaId, body: extractBaileysBody(qm) };
+    // The quote's body is the text the quoted message is announced with ({@link baileysMessageText}), so a
+    // quoted contact card, poll, interactive shape or native-flow reply carries its text instead of an empty
+    // string. That matches wwjs, whose quote is a full Message and shows the same body it would show unquoted.
+    context.quotedMessage = { id: contextInfo.stanzaId, body: baileysMessageText(contextInfo.quotedMessage) };
   }
 
   return context;
@@ -852,6 +1023,21 @@ export function mapBaileysStatus(status: number | null | undefined): DeliverySta
   }
 }
 
+/** Extract native poll versions from content already normalized by Baileys. */
+export function extractBaileysPoll(content: proto.IMessage): IncomingMessage['poll'] {
+  const poll = pollCreationOf(content) ?? pollCreationOf(content.pollCreationMessageV4?.message);
+  if (!poll) return undefined;
+  const options = (poll.options ?? [])
+    .map(option => option.optionName)
+    .filter((option): option is string => typeof option === 'string');
+  if (!options.length) return undefined;
+  return {
+    name: boundPollText(poll.name ?? ''),
+    options: boundPollOptions(options),
+    allowMultipleAnswers: poll.selectableOptionsCount !== 1,
+  };
+}
+
 /**
  * The subset of a Baileys `WAMessage` the adapter reads (after proto extraction) to build the
  * base of an {@link IncomingMessage}. Declared explicitly so the neutral-shape logic is
@@ -859,10 +1045,10 @@ export function mapBaileysStatus(status: number | null | undefined): DeliverySta
  */
 export interface BaileysIncomingFields {
   id: string;
-  /** The chat JID (`key.remoteJid`): a contact, a `@g.us` group, or `status@broadcast`. */
+  /** The chat JID (`key.remoteJid`): a contact, a `@g.us` group, `status@broadcast`, or a broadcast list. */
   remoteJid: string;
   fromMe: boolean;
-  /** Group sender (`key.participant`); `remoteJid` is the group JID for group messages. */
+  /** Sender in a group, status or broadcast list (`key.participant`); `remoteJid` names the chat. */
   participant?: string;
   body: string;
   /** Result of `getContentType(msg.message)`. */
@@ -882,6 +1068,7 @@ export interface BaileysIncomingFields {
   /** Pre-extracted commerce ids. Populated by the adapter for `orderMessage` / `productMessage`. */
   order?: IncomingMessage['order'];
   product?: IncomingMessage['product'];
+  poll?: IncomingMessage['poll'];
   /** Pre-extracted button/list reply. Populated by the adapter when the user tapped a control. */
   button?: IncomingMessage['button'];
   /** Pre-extracted prompt choices. Populated by the adapter for business button/list prompts. */
@@ -892,6 +1079,9 @@ export interface BaileysIncomingFields {
   ephemeralDuration?: number;
   /** @mentioned engine JIDs from `contextInfo.mentionedJid`; normalized and surfaced as `mentionedIds`. */
   mentionedJids?: string[];
+  /** Forwarded flag and count from `contextInfo`; surfaced as `isForwarded` / `forwardingScore`. */
+  isForwarded?: boolean;
+  forwardingScore?: number;
   /** Styling of an extended-text (status) message: proto `backgroundArgb` (fixed32 ARGB). */
   backgroundArgb?: number;
   /** Styling of an extended-text (status) message: proto `font` (WhatsApp font index). */
@@ -899,10 +1089,65 @@ export interface BaileysIncomingFields {
 }
 
 /**
- * Build a neutral {@link IncomingMessage} from extracted Baileys fields. The chat is always
- * `remoteJid` (Baileys reports the conversation directly); `fromMe` only flips from/to. The group
- * sender — and likewise the poster of a status broadcast — lives in `participant` (exposed as
- * `author`), matching the wwjs convention where `from` is the group JID / broadcast channel.
+ * The chat a message belongs to, from its raw key: `remoteJid`, except for a broadcast-list message
+ * the account received, which belongs to the 1:1 chat with its sender (`participant`). Mirrors
+ * Baileys' own `getChatId` (Utils/process-message.js), which files the chat list the same way, but
+ * falls back to the list instead of throwing when the key names no participant.
+ */
+export function baileysChatJid(remoteJid: string, participant: string | null | undefined, fromMe: boolean): string {
+  const isList = remoteJid.endsWith('@broadcast') && remoteJid !== 'status@broadcast';
+  return isList && !fromMe && participant ? participant : remoteJid;
+}
+
+/**
+ * Whether a stored key belongs to the chat `chatId` names: the chat the message is reported under
+ * ({@link baileysChatJid}), or the raw `remoteJid`, which a client may still hold for a list message.
+ * Both sides go through `neutral`, so the dialects of one chat compare equal.
+ */
+export function storedKeyInChat(
+  key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null },
+  chatId: string,
+  neutral: (jid: string) => string,
+): boolean {
+  const raw = key.remoteJid ?? '';
+  const want = neutral(chatId);
+  return neutral(raw) === want || neutral(baileysChatJid(raw, key.participant, key.fromMe === true)) === want;
+}
+
+/** Match a stored LID/phone alias only through a reported persisted pairing. */
+export async function storedKeyInChatPersisted(
+  key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null },
+  chatId: string,
+  resolveLid?: (jid: string) => Promise<string | null>,
+): Promise<boolean> {
+  if (storedKeyInChat(key, chatId, toNeutralJid)) return true;
+  if (!resolveLid) return false;
+  const want = parseWaId(chatId);
+  for (const raw of [key.remoteJid ?? '', baileysChatJid(key.remoteJid ?? '', key.participant, key.fromMe === true)]) {
+    const stored = parseWaId(raw);
+    if (!((stored.kind === 'lid' && want.kind === 'user') || (stored.kind === 'user' && want.kind === 'lid'))) continue;
+    const lid = stored.kind === 'lid' ? raw : chatId;
+    const phone = stored.kind === 'user' ? stored.userPart : want.userPart;
+    if ((await resolveLid(lid).catch(() => null)) === phone) return true;
+  }
+  return false;
+}
+
+/**
+ * The participant a live key names, or undefined when it names none. Baileys passes every live key
+ * through cleanMessage, which writes jidNormalizedUser(participant) back, and that is '' for the absent
+ * participant of a 1:1 chat. `??` keeps the empty string, which then reads as a sender that is nobody.
+ */
+export function keyParticipant(key: { participant?: string | null }): string | undefined {
+  return key.participant ? key.participant : undefined;
+}
+
+/**
+ * Build a neutral {@link IncomingMessage} from extracted Baileys fields. The chat is `remoteJid`
+ * (Baileys reports the conversation directly), except that a received broadcast-list message is filed
+ * under its sender's chat (see {@link baileysChatJid}); `fromMe` only flips from/to. The group sender,
+ * the poster of a status broadcast and the sender of a broadcast-list message all live in
+ * `participant` (exposed as `author`).
  */
 export function buildIncomingMessageFromBaileys(
   fields: BaileysIncomingFields,
@@ -914,7 +1159,7 @@ export function buildIncomingMessageFromBaileys(
   const rawChatId = fields.remoteJid;
   const isGroup = rawChatId.endsWith('@g.us');
   const isStatusBroadcast = rawChatId === 'status@broadcast';
-  const chatId = normalizeJid(rawChatId);
+  const chatId = normalizeJid(baileysChatJid(rawChatId, fields.participant, fields.fromMe));
   const self = normalizeJid(fields.selfJid ?? '');
 
   const incoming: IncomingMessage = {
@@ -933,16 +1178,17 @@ export function buildIncomingMessageFromBaileys(
     isStatusBroadcast,
   };
 
-  // The sender behind a group message — or the poster behind a status broadcast — lives in
-  // `participant` (exposed as `author`), matching the wwjs convention where `from` is the group JID
-  // (or the shared status@broadcast channel). Without the status arm, buildIncomingStatus can only
-  // resolve the poster to the pseudo-JID itself and drops every Baileys status.
-  if ((isGroup || isStatusBroadcast) && fields.participant) {
+  // The sender behind a group message, the poster behind a status broadcast and the sender behind a
+  // broadcast-list message all live in `participant` (exposed as `author`). Without the status arm,
+  // buildIncomingStatus can only resolve the poster to the pseudo-JID itself and drops every Baileys
+  // status; the list arm keeps `author` on a list message too, where it repeats the chat's sender
+  // (or names the account, for a list message it sent).
+  if ((isGroup || rawChatId.endsWith('@broadcast')) && fields.participant) {
     incoming.author = normalizeJid(fields.participant);
   }
 
   // The lid check uses the RAW sender (participant in a group, else the chat JID) before normalization.
-  const senderJid = fields.participant ?? rawChatId;
+  const senderJid = fields.participant ? fields.participant : rawChatId;
   if (senderJid.endsWith('@lid')) {
     incoming.isLidSender = true;
   }
@@ -962,6 +1208,8 @@ export function buildIncomingMessageFromBaileys(
   if (fields.media) {
     incoming.media = fields.media;
   }
+
+  if (fields.poll) incoming.poll = fields.poll;
 
   if (fields.location) {
     incoming.location = fields.location;
@@ -1001,6 +1249,15 @@ export function buildIncomingMessageFromBaileys(
   // (message-mapper.ts:90), consumed by command targeting and the `mentions` webhook filter.
   if (fields.mentionedJids && fields.mentionedJids.length > 0) {
     incoming.mentionedIds = fields.mentionedJids.map(normalizeJid);
+  }
+
+  // Parity with the wwjs mapper: mark forwarded content so it is not attributed to the sender, gated
+  // on a positive score the same way ephemeralDuration is, above.
+  if (fields.isForwarded === true) {
+    incoming.isForwarded = true;
+    if (typeof fields.forwardingScore === 'number' && fields.forwardingScore > 0) {
+      incoming.forwardingScore = fields.forwardingScore;
+    }
   }
 
   return incoming;

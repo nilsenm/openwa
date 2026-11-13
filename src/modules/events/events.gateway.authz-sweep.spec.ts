@@ -18,7 +18,8 @@ import type { WSErrorResponse, WSSubscribedResponse } from './dto/ws-messages.dt
  * authentication hot path rewrites on its own (lastUsedAt, usageCount, updatedAt), which would
  * disconnect every live client once a minute. Only a real table, written by the real tracker,
  * proves it does not. The changes that never reach this process, a key deleted, revoked, expired or
- * narrowed by another node or a direct write, are expressed the same way: straight to the table.
+ * narrowed by a direct write to this node's main database, are expressed the same way: straight to
+ * the table.
  */
 describe('EventsGateway API-key authorization sweep', () => {
   const CLIENT_IP = '203.0.113.5';
@@ -187,6 +188,22 @@ describe('EventsGateway API-key authorization sweep', () => {
 
     expect(open.disconnect).not.toHaveBeenCalled();
     expect(later.disconnect).not.toHaveBeenCalled();
+  });
+
+  it('evicts a socket when its stored expiry becomes invalid', async () => {
+    const { apiKey, rawKey } = await service.createApiKey({ name: 'invalid expiry' });
+    const sock = await connect(rawKey);
+
+    await repo.query('UPDATE api_keys SET expiresAt = ? WHERE id = ?', ['not-a-date', apiKey.id]);
+    const current = await repo.findOneByOrFail({ id: apiKey.id });
+    expect(current.expiresAt).toBeInstanceOf(Date);
+    expect(Number.isFinite(current.expiresAt!.getTime())).toBe(false);
+    await expect(service.validateApiKey(rawKey, CLIENT_IP)).rejects.toThrow('API key has expired');
+
+    await sweep();
+
+    expect(sock.disconnect).toHaveBeenCalledWith(true);
+    expect(evictionMessage(sock)).toBe('API key has expired');
   });
 
   it('evicts on the snapshot expiry when the api_keys table cannot be read', async () => {

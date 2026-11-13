@@ -1,6 +1,11 @@
+import { POLL_MAX_OPTIONS, POLL_TEXT_MAX_LENGTH } from './message-mapper';
 import {
+  BaileysBodyContent,
+  BaileysContextContent,
   BaileysIncomingFields,
+  baileysChatJid,
   buildIncomingMessageFromBaileys,
+  extractBaileysPoll,
   extractBaileysBody,
   extractBaileysButtonReply,
   extractBaileysButtons,
@@ -14,6 +19,8 @@ import {
   isBaileysCatalogShare,
   mapBaileysMessageType,
   mapBaileysStatus,
+  setBaileysText,
+  storedKeyInChatPersisted,
 } from './baileys-message-mapper';
 
 describe('mapBaileysMessageType (baileys content-type -> neutral MessageType)', () => {
@@ -22,6 +29,8 @@ describe('mapBaileysMessageType (baileys content-type -> neutral MessageType)', 
     ['extendedTextMessage', false, 'text'],
     ['imageMessage', false, 'image'],
     ['videoMessage', false, 'video'],
+    // A round video note is a VideoMessage under its own key.
+    ['ptvMessage', false, 'video'],
     ['audioMessage', false, 'audio'],
     ['audioMessage', true, 'voice'],
     ['documentMessage', false, 'document'],
@@ -47,6 +56,10 @@ describe('mapBaileysMessageType (baileys content-type -> neutral MessageType)', 
     ['pollCreationMessage', false, 'poll'],
     ['pollCreationMessageV2', false, 'poll'],
     ['pollCreationMessageV3', false, 'poll'],
+    ['pollCreationMessageV4', false, 'poll'],
+    ['pollCreationMessageV5', false, 'poll'],
+    // A vote changes a poll and carries nothing of its own; it is never a poll itself.
+    ['pollUpdateMessage', false, 'unknown'],
     // Regression trap: calls arrive via the `call` socket event, never as a message content type,
     // so any call-ish token must stay 'unknown' (no accidental mapping).
     ['callLogMessage', false, 'unknown'],
@@ -163,6 +176,23 @@ describe('extractBaileysBody (inbound text/caption + interactive shapes)', () =>
     expect(extractBaileysBody({ pollCreationMessage: { name: 'Lunch order?' } })).toBe('Lunch order?');
     expect(extractBaileysBody({ pollCreationMessageV2: { name: 'Team offsite?' } })).toBe('Team offsite?');
     expect(extractBaileysBody({ pollCreationMessageV3: { name: 'Standup time?' } })).toBe('Standup time?');
+    expect(extractBaileysBody({ pollCreationMessageV5: { name: 'Quiz?' } })).toBe('Quiz?');
+    expect(
+      extractBaileysBody({ pollCreationMessageV4: { message: { pollCreationMessage: { name: 'Wrapped?' } } } }),
+    ).toBe('Wrapped?');
+  });
+
+  it('reads a V4 poll one level down only, and nothing but a poll from inside it', () => {
+    expect(
+      extractBaileysBody({
+        pollCreationMessageV4: {
+          message: { pollCreationMessageV4: { message: { pollCreationMessage: { name: 'Deep' } } } },
+        },
+      } as BaileysBodyContent),
+    ).toBe('');
+    expect(
+      extractBaileysBody({ pollCreationMessageV4: { message: { conversation: 'not a poll' } } } as BaileysBodyContent),
+    ).toBe('');
   });
 
   it('returns empty for a poll with no name rather than falling through to other sources', () => {
@@ -188,6 +218,29 @@ describe('extractBaileysBody (inbound text/caption + interactive shapes)', () =>
   });
 });
 
+describe('setBaileysText (an edit written back where extractBaileysBody reads it)', () => {
+  it.each([
+    ['a plain text', { conversation: 'before' }],
+    ['an extended text', { extendedTextMessage: { text: 'before', matchedText: 'https://example.com' } }],
+    ['a photo caption', { imageMessage: { caption: 'before', url: 'https://mmg.example/x' } }],
+    ['a video caption', { videoMessage: { caption: 'before' } }],
+    ['a document caption', { documentMessage: { caption: 'before', fileName: 'a.pdf' } }],
+  ])('rewrites %s and keeps the rest of the content', (_kind, content) => {
+    const copy = structuredClone(content);
+    expect(setBaileysText(copy, 'after')).toBe(true);
+    expect(extractBaileysBody(copy)).toBe('after');
+    // Only the text slot moved: the same object with the new text is what remains.
+    expect(setBaileysText(copy, 'before')).toBe(true);
+    expect(copy).toEqual(content);
+  });
+
+  it('changes nothing on content with no text slot', () => {
+    const content = { locationMessage: { degreesLatitude: 1 } } as Record<string, unknown>;
+    expect(setBaileysText(content, 'after')).toBe(false);
+    expect(content).toEqual({ locationMessage: { degreesLatitude: 1 } });
+  });
+});
+
 describe('extractBaileysContext (quoted body shares the live body extractor)', () => {
   const quoted = (quotedMessage: object) =>
     extractBaileysContext({
@@ -207,6 +260,49 @@ describe('extractBaileysContext (quoted body shares the live body extractor)', (
     expect(quoted({ imageMessage: { caption: 'pic' } })?.body).toBe('pic');
     expect(quoted({ conversation: 'the original' })?.body).toBe('the original');
     expect(quoted({ stickerMessage: {} })?.body).toBe('');
+  });
+
+  it('reads the quote, timer and mentions off a video note', () => {
+    expect(
+      extractBaileysContext({
+        ptvMessage: {
+          contextInfo: {
+            stanzaId: 'wamid.original',
+            quotedMessage: { conversation: 'the original' },
+            expiration: 86400,
+            mentionedJid: ['628222@s.whatsapp.net'],
+          },
+        },
+      }),
+    ).toMatchObject({
+      quotedMessage: { id: 'wamid.original', body: 'the original' },
+      ephemeralDuration: 86400,
+      mentionedJids: ['628222@s.whatsapp.net'],
+    });
+  });
+
+  it.each([
+    'productMessage',
+    'contactMessage',
+    'contactsArrayMessage',
+    'pollCreationMessageV3',
+    'liveLocationMessage',
+    'orderMessage',
+    'eventMessage',
+  ])('reads the disappearing-messages timer off a %s', type => {
+    const content = { [type]: { contextInfo: { expiration: 86400 } } } as BaileysContextContent;
+    expect(extractBaileysContext(content).ephemeralDuration).toBe(86400);
+  });
+
+  it('reads the disappearing-messages timer off the poll inside a pollCreationMessageV4', () => {
+    const content = {
+      pollCreationMessageV4: { message: { pollCreationMessage: { contextInfo: { expiration: 604800 } } } },
+    } as BaileysContextContent;
+    expect(extractBaileysContext(content).ephemeralDuration).toBe(604800);
+  });
+
+  it('reads no timer when no content node carries one', () => {
+    expect(extractBaileysContext({ conversation: 'hi' } as BaileysContextContent).ephemeralDuration).toBeUndefined();
   });
 
   it('carries a quote from a button-reply contextInfo', () => {
@@ -298,6 +394,16 @@ describe('buildIncomingMessageFromBaileys', () => {
     expect(r.isLidSender).toBe(true);
   });
 
+  it('reads an empty participant as none: a lid chat is still a lid sender and a group names no author', () => {
+    // A live key goes through cleanMessage, which writes '' for the participant of a 1:1 chat.
+    const direct = buildIncomingMessageFromBaileys({ ...base, remoteJid: '111@lid', participant: '' });
+    expect(direct.isLidSender).toBe(true);
+    expect(direct.author).toBeUndefined();
+    const group = buildIncomingMessageFromBaileys({ ...base, remoteJid: '123-456@g.us', participant: '' });
+    expect(group.author).toBeUndefined();
+    expect(group.isLidSender).toBeFalsy();
+  });
+
   it('flags a status broadcast', () => {
     const r = buildIncomingMessageFromBaileys({ ...base, remoteJid: 'status@broadcast' });
     expect(r.isStatusBroadcast).toBe(true);
@@ -314,6 +420,55 @@ describe('buildIncomingMessageFromBaileys', () => {
     // Without this, buildIncomingStatus can only resolve the poster to the status@broadcast
     // pseudo-JID itself and drops the status entirely.
     expect(r.author).toBe('628111@s.whatsapp.net');
+  });
+
+  it("files a received broadcast-list message under the sender's chat, as Baileys does", () => {
+    const normalize = (jid: string) => jid.replace('@s.whatsapp.net', '@c.us');
+    const r = buildIncomingMessageFromBaileys(
+      { ...base, remoteJid: '1700000000@broadcast', participant: '628222@s.whatsapp.net' },
+      normalize,
+    );
+    expect(r.chatId).toBe('628222@c.us');
+    expect(r.from).toBe('628222@c.us');
+    expect(r.to).toBe('628999@c.us');
+    expect(r.kind).toBe('individual');
+    expect(r.isStatusBroadcast).toBe(false);
+    expect(r.isGroup).toBe(false);
+    expect(r.author).toBe('628222@c.us');
+  });
+
+  it('keeps the list as the chat for a received list message with no participant', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base, remoteJid: '1700000000@broadcast' });
+    expect(r.chatId).toBe('1700000000@broadcast');
+    expect(r.kind).toBe('broadcast');
+  });
+
+  it('flags a lid sender of a received list message and files it under the lid', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base, remoteJid: '1700000000@broadcast', participant: '222@lid' });
+    expect(r.chatId).toBe('222@lid');
+    expect(r.isLidSender).toBe(true);
+  });
+
+  it('baileysChatJid mirrors Baileys getChatId without throwing', () => {
+    const list = '1700000000@broadcast';
+    const sender = '628222@s.whatsapp.net';
+    expect(baileysChatJid(list, sender, false)).toBe(sender);
+    expect(baileysChatJid(list, sender, true)).toBe(list);
+    expect(baileysChatJid(list, undefined, false)).toBe(list);
+    expect(baileysChatJid('status@broadcast', sender, false)).toBe('status@broadcast');
+    expect(baileysChatJid('120363@g.us', sender, false)).toBe('120363@g.us');
+  });
+
+  it('keeps the list as the chat for a broadcast-list message the account sent', () => {
+    const normalize = (jid: string) => jid.replace('@s.whatsapp.net', '@c.us');
+    const r = buildIncomingMessageFromBaileys(
+      { ...base, remoteJid: '1700000000@broadcast', fromMe: true, participant: '628999@s.whatsapp.net' },
+      normalize,
+    );
+    expect(r.chatId).toBe('1700000000@broadcast');
+    expect(r.from).toBe('628999@c.us');
+    expect(r.to).toBe('1700000000@broadcast');
+    expect(r.author).toBe('628999@c.us');
   });
 
   it('converts extended-text status styling: backgroundArgb -> #RRGGBB, font passed through', () => {
@@ -360,6 +515,19 @@ describe('buildIncomingMessageFromBaileys', () => {
       normalize,
     );
     expect(r.mentionedIds).toEqual(['111@c.us', '222@c.us']);
+  });
+
+  it('maps isForwarded and forwardingScore for a forwarded message', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base, isForwarded: true, forwardingScore: 2 });
+    expect(r.isForwarded).toBe(true);
+    expect(r.forwardingScore).toBe(2);
+    expect(buildIncomingMessageFromBaileys(base)).not.toHaveProperty('isForwarded');
+  });
+
+  it('omits forwardingScore when a forwarded message reports none', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base, isForwarded: true, forwardingScore: 0 });
+    expect(r.isForwarded).toBe(true);
+    expect(r).not.toHaveProperty('forwardingScore');
   });
 
   it('omits mentionedIds when absent or empty', () => {
@@ -1038,6 +1206,146 @@ describe('isBaileysCatalogShare (the productMessage arm with no product)', () =>
   it('is false for a real product card, and for a productMessage carrying both arms', () => {
     expect(isBaileysCatalogShare({ productMessage: { product: { productId: '2' } } })).toBe(false);
     expect(isBaileysCatalogShare({ productMessage: { product: { productId: '2' }, catalog: { title: 'S' } } })).toBe(
+      false,
+    );
+  });
+});
+
+describe('native poll choice metadata', () => {
+  type PollNode = { name?: string; options?: Array<{ optionName?: string }>; selectableOptionsCount?: number };
+  // Every content key a poll travels under. pollCreationMessageV4 wraps a whole message, with the poll inside it.
+  const shapes: Array<[string, (poll: PollNode) => Record<string, unknown>]> = [
+    ['pollCreationMessage', poll => ({ pollCreationMessage: poll })],
+    ['pollCreationMessageV2', poll => ({ pollCreationMessageV2: poll })],
+    ['pollCreationMessageV3', poll => ({ pollCreationMessageV3: poll })],
+    ['pollCreationMessageV5', poll => ({ pollCreationMessageV5: poll })],
+    ...(
+      ['pollCreationMessage', 'pollCreationMessageV2', 'pollCreationMessageV3', 'pollCreationMessageV5'] as const
+    ).map((inner): [string, (poll: PollNode) => Record<string, unknown>] => [
+      `pollCreationMessageV4 around ${inner}`,
+      poll => ({ pollCreationMessageV4: { message: { [inner]: poll } } }),
+    ]),
+  ];
+
+  it.each(shapes)('reads %s without changing option texts', (_label, wrap) => {
+    expect(
+      extractBaileysPoll(
+        wrap({
+          name: 'Where?',
+          options: [{ optionName: ' Park ' }, { optionName: 'Beach' }],
+          selectableOptionsCount: 1,
+        }),
+      ),
+    ).toEqual({ name: 'Where?', options: [' Park ', 'Beach'], allowMultipleAnswers: false });
+  });
+
+  it('reads a V5 quiz as its question and options, with the correct answer kept out of the options', () => {
+    expect(
+      extractBaileysPoll({
+        pollCreationMessageV5: {
+          name: 'Capital of France?',
+          options: [{ optionName: 'Paris' }, { optionName: 'Lyon' }],
+          selectableOptionsCount: 1,
+          pollType: 1,
+          correctAnswer: { optionName: 'Paris' },
+        },
+      }),
+    ).toEqual({ name: 'Capital of France?', options: ['Paris', 'Lyon'], allowMultipleAnswers: false });
+  });
+
+  it('opens a V4 wrapper one level only', () => {
+    const poll = { name: 'Deep', options: [{ optionName: 'a' }, { optionName: 'b' }] };
+    expect(
+      extractBaileysPoll({
+        pollCreationMessageV4: { message: { pollCreationMessageV4: { message: { pollCreationMessage: poll } } } },
+      }),
+    ).toBeUndefined();
+    expect(extractBaileysPoll({ pollCreationMessageV4: {} })).toBeUndefined();
+  });
+  it('reports multiple choices and omits unavailable poll data', () => {
+    expect(
+      extractBaileysPoll({
+        pollCreationMessageV3: {
+          name: 'Q',
+          options: [{ optionName: 'a' }, { optionName: 'b' }],
+          selectableOptionsCount: 0,
+        },
+      })?.allowMultipleAnswers,
+    ).toBe(true);
+    expect(extractBaileysPoll({})).toBeUndefined();
+    expect(extractBaileysPoll({ pollCreationMessage: {} })).toBeUndefined();
+  });
+
+  describe.each(shapes)('bounds on %s', (_label, wrap) => {
+    const content = (name: string, optionNames: string[]) =>
+      wrap({ name, options: optionNames.map(optionName => ({ optionName })), selectableOptionsCount: 1 });
+
+    it('keeps a poll WhatsApp itself could send exactly as it is', () => {
+      const question = 'q'.repeat(255);
+      const options = Array.from({ length: 12 }, (_, i) => `${i}`.padEnd(100, 'o'));
+      expect(extractBaileysPoll(content(question, options))).toEqual({
+        name: question,
+        options,
+        allowMultipleAnswers: false,
+      });
+      expect(extractBaileysBody(content(question, options) as BaileysBodyContent)).toBe(question);
+    });
+
+    // The numbers are written out here, not read from the constants, so moving either by one shows up.
+    it('keeps a poll of 32 options with 1024 characters in each text whole', () => {
+      const text = (i: number) => `${i}`.padEnd(1024, 'x');
+      const options = Array.from({ length: 32 }, (_, i) => text(i));
+      expect(extractBaileysPoll(content(text(99), options))).toEqual({
+        name: text(99),
+        options,
+        allowMultipleAnswers: false,
+      });
+      expect(extractBaileysBody(content(text(99), options) as BaileysBodyContent)).toBe(text(99));
+    });
+
+    it('cuts a poll at its 33rd option and at the 1025th character of a text', () => {
+      const text = (i: number) => `${i}`.padEnd(1025, 'x');
+      const options = Array.from({ length: 33 }, (_, i) => text(i));
+      const poll = extractBaileysPoll(content(text(99), options))!;
+      expect(poll.options).toEqual(options.slice(0, 32).map(option => option.slice(0, 1024)));
+      expect(poll.name).toBe(text(99).slice(0, 1024));
+      expect(extractBaileysBody(content(text(99), options) as BaileysBodyContent)).toBe(text(99).slice(0, 1024));
+    });
+
+    it('truncates an oversized poll, in the poll and in the body, and keeps it a poll', () => {
+      const long = 'x'.repeat(POLL_TEXT_MAX_LENGTH * 3);
+      const optionNames = Array.from({ length: POLL_MAX_OPTIONS * 50 }, (_, i) => `${i}${long}`);
+      const poll = extractBaileysPoll(content(long, optionNames))!;
+      expect(poll.options).toHaveLength(POLL_MAX_OPTIONS);
+      expect(poll.options.every(option => option.length === POLL_TEXT_MAX_LENGTH)).toBe(true);
+      expect(poll.options[1].startsWith('1xxx')).toBe(true);
+      expect(poll.name).toHaveLength(POLL_TEXT_MAX_LENGTH);
+      expect(extractBaileysBody(content(long, optionNames) as BaileysBodyContent)).toHaveLength(POLL_TEXT_MAX_LENGTH);
+    });
+  });
+});
+
+describe('storedKeyInChatPersisted', () => {
+  it('accepts an exact identity without requiring a directory', async () => {
+    expect(await storedKeyInChatPersisted({ remoteJid: '111@lid' }, '111@lid')).toBe(true);
+    expect(await storedKeyInChatPersisted({ remoteJid: '628111@s.whatsapp.net' }, '628111@c.us')).toBe(true);
+  });
+
+  it('refuses cross-form identity when no directory is available', async () => {
+    expect(await storedKeyInChatPersisted({ remoteJid: '111@lid' }, '628111@c.us')).toBe(false);
+    expect(await storedKeyInChatPersisted({ remoteJid: '628111@s.whatsapp.net' }, '111@lid')).toBe(false);
+  });
+
+  it.each([null, '628222', '628111'])('uses only the reported pairing %s in either direction', async phone => {
+    const resolve = () => Promise.resolve(phone);
+    expect(await storedKeyInChatPersisted({ remoteJid: '111@lid' }, '628111@c.us', resolve)).toBe(phone === '628111');
+    expect(await storedKeyInChatPersisted({ remoteJid: '628111@s.whatsapp.net' }, '111@lid', resolve)).toBe(
+      phone === '628111',
+    );
+  });
+
+  it('keeps distinct raw LIDs separate even if a directory maps both to one phone', async () => {
+    expect(await storedKeyInChatPersisted({ remoteJid: '111@lid' }, '222@lid', () => Promise.resolve('628111'))).toBe(
       false,
     );
   });

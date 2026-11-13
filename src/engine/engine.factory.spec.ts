@@ -1,3 +1,5 @@
+// A plain-object copy of fs, so a test can spy on existsSync (the real module's exports are not configurable).
+jest.mock('fs', () => ({ __esModule: true, ...jest.requireActual<typeof import('fs')>('fs') }));
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -7,6 +9,8 @@ import { PluginLoaderService, PluginType } from '../core/plugins';
 import { BaileysMessageStoreService } from './adapters/baileys-message-store.service';
 import { LidMappingStoreService } from './identity/lid-mapping-store.service';
 import { ChatStateStoreService } from './adapters/baileys-chat-state-store.service';
+import type { StoredChatPreviewService } from './adapters/baileys-stored-chat-previews.service';
+import type { BaileysPlugin } from './builtin/baileys';
 import { baileysAuthDir, wwjsAuthDir } from './auth-dir-paths';
 
 describe('EngineFactory', () => {
@@ -39,6 +43,7 @@ describe('EngineFactory', () => {
       getCached: jest.fn(),
       lidsForPhone: jest.fn().mockReturnValue([]),
       remember: jest.fn().mockResolvedValue(undefined),
+      releaseSession: jest.fn().mockResolvedValue(undefined),
     }) as unknown as LidMappingStoreService;
 
   const buildChatStateStore = (): ChatStateStoreService =>
@@ -72,24 +77,72 @@ describe('EngineFactory', () => {
     const pluginLoader = {
       getPlugin: jest.fn().mockReturnValue({ instance: pluginInstance }),
     } as unknown as PluginLoaderService;
+    // create() makes both auth dirs, so the bases live under a temp root rather than the default
+    // ./data/baileys of the checkout and a /var/data the suite may be able to write as root.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'openwa-factory-neutral-'));
+    try {
+      const factory = new EngineFactory(
+        buildConfigService({
+          'engine.sessionDataPath': path.join(tmp, 'sessions'),
+          'engine.baileys.authDir': path.join(tmp, 'baileys'),
+        }),
+        pluginLoader,
+        buildMessageStore(),
+        buildLidStore(),
+        buildChatStateStore(),
+      );
+      factory.create({ sessionId: 'sess-1', dbSessionId: 'db-1', proxyUrl: 'http://p', proxyType: 'http' });
 
-    const factory = new EngineFactory(
-      buildConfigService(),
-      pluginLoader,
-      buildMessageStore(),
-      buildLidStore(),
-      buildChatStateStore(),
-    );
-    factory.create({ sessionId: 'sess-1', dbSessionId: 'db-1', proxyUrl: 'http://p', proxyType: 'http' });
+      // Plain-object (not objectContaining) assertion: any browser key (headless/puppeteerArgs/
+      // executablePath) leaking into the per-call config would fail this exact match. The auth-dir
+      // bases are the deliberate exception, pinned below.
+      expect(createEngine).toHaveBeenCalledWith({
+        sessionId: 'sess-1',
+        dbSessionId: 'db-1',
+        proxyUrl: 'http://p',
+        proxyType: 'http',
+        sessionDataPath: path.join(tmp, 'sessions'),
+        authDir: path.join(tmp, 'baileys'),
+      });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
-    // Plain-object (not objectContaining) assertion: any browser key (headless/puppeteerArgs/
-    // executablePath/sessionDataPath) leaking into the per-call config would fail this exact match.
-    expect(createEngine).toHaveBeenCalledWith({
-      sessionId: 'sess-1',
-      dbSessionId: 'db-1',
-      proxyUrl: 'http://p',
-      proxyType: 'http',
-    });
+  // The adapters used to read these bases from the plugin config, which a PUT /api/plugins/:id/config
+  // override can move, while this factory hardens and purges the dirs under the env-derived bases.
+  // Credentials then landed in a directory never made owner-only and never removed on delete.
+  it('hands the engine the same auth-dir bases it hardens and purges', () => {
+    const createEngine = jest.fn().mockReturnValue({});
+    const pluginLoader = {
+      getPlugin: jest.fn().mockReturnValue({
+        instance: { type: PluginType.ENGINE, createEngine },
+        config: { sessionDataPath: '/data/other', baileys: { authDir: '/data/other' } },
+      }),
+    } as unknown as PluginLoaderService;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'openwa-factory-bases-'));
+    try {
+      const factory = new EngineFactory(
+        buildConfigService({
+          'engine.sessionDataPath': path.join(tmp, 'sessions'),
+          'engine.baileys.authDir': path.join(tmp, 'baileys'),
+        }),
+        pluginLoader,
+        buildMessageStore(),
+        buildLidStore(),
+        buildChatStateStore(),
+      );
+
+      factory.create({ sessionId: SESSION_ID, dbSessionId: SESSION_ID });
+
+      const passed = (createEngine.mock.calls[0] as [{ sessionDataPath: string; authDir: string }])[0];
+      expect(wwjsAuthDir(passed.sessionDataPath, SESSION_ID)).toBe(wwjsAuthDir(path.join(tmp, 'sessions'), SESSION_ID));
+      expect(baileysAuthDir(passed.authDir, SESSION_ID)).toBe(baileysAuthDir(path.join(tmp, 'baileys'), SESSION_ID));
+      expect(fs.existsSync(wwjsAuthDir(passed.sessionDataPath, SESSION_ID))).toBe(true);
+      expect(fs.existsSync(baileysAuthDir(passed.authDir, SESSION_ID))).toBe(true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it('registers the built-in engine with the opaque engine config blob (#219 guarantee moves to context.config)', async () => {
@@ -138,36 +191,68 @@ describe('EngineFactory', () => {
     expect(registeredIds).toContain('baileys');
   });
 
-  it('falls back to the direct adapter when no engine plugin is available', () => {
+  it('gives the baileys engine the stored chat previews it lists after a restart', async () => {
+    const registerBuiltInPlugin = jest.fn();
     const pluginLoader = {
-      getPlugin: jest.fn().mockReturnValue(undefined),
+      registerBuiltInPlugin,
+      enablePlugin: jest.fn().mockResolvedValue(undefined),
+      getPlugin: jest.fn(),
     } as unknown as PluginLoaderService;
+    const storedChatPreviews = { latestPerChat: jest.fn() } as unknown as StoredChatPreviewService;
 
-    const factory = new EngineFactory(
+    await new EngineFactory(
       buildConfigService(),
       pluginLoader,
       buildMessageStore(),
       buildLidStore(),
       buildChatStateStore(),
+      storedChatPreviews,
+    ).onModuleInit();
+
+    const [, plugin] = registerBuiltInPlugin.mock.calls.find(
+      call => (call as [{ id: string }])[0].id === 'baileys',
+    ) as [unknown, BaileysPlugin];
+    const engine = plugin.createEngine({ sessionId: SESSION_ID, dbSessionId: SESSION_ID, authDir: '/nonexistent' });
+    expect((engine as unknown as { config: { storedChatPreviews: unknown } }).config.storedChatPreviews).toBe(
+      storedChatPreviews,
     );
-    expect(() => factory.create({ sessionId: 'sess-2', dbSessionId: 'db-2' })).not.toThrow();
   });
 
-  it('throws instead of silently building whatsapp-web.js when a non-wwebjs engine has no plugin', () => {
-    // The legacy fallback only builds wwebjs; reaching it with ENGINE_TYPE=baileys must fail loudly
-    // rather than run the wrong engine.
-    const pluginLoader = {
-      getPlugin: jest.fn().mockReturnValue(undefined),
-    } as unknown as PluginLoaderService;
+  describe('create() with no usable engine plugin', () => {
+    let tmpRoot: string;
+    beforeEach(() => {
+      tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-missing-'));
+    });
+    afterEach(() => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
 
-    const factory = new EngineFactory(
-      buildConfigService({ 'engine.type': 'baileys' }),
-      pluginLoader,
-      buildMessageStore(),
-      buildLidStore(),
-      buildChatStateStore(),
-    );
-    expect(() => factory.create({ sessionId: 'sess-b', dbSessionId: 'db-b' })).toThrow(/baileys/i);
+    const missing: Array<[string, unknown]> = [
+      ['no plugin', undefined],
+      ['a plugin without an instance', { instance: undefined }],
+      ['a non-engine plugin', { instance: { type: PluginType.EXTENSION } }],
+    ];
+
+    describe.each(['whatsapp-web.js', 'baileys'])('ENGINE_TYPE=%s', engineType => {
+      it.each(missing)('throws for %s instead of building another engine', (_label, entry) => {
+        const pluginLoader = {
+          getPlugin: jest.fn().mockReturnValue(entry),
+        } as unknown as PluginLoaderService;
+        const factory = new EngineFactory(
+          buildConfigService({
+            'engine.type': engineType,
+            'engine.sessionDataPath': path.join(tmpRoot, 'sessions'),
+            'engine.baileys.authDir': path.join(tmpRoot, 'baileys'),
+          }),
+          pluginLoader,
+          buildMessageStore(),
+          buildLidStore(),
+          buildChatStateStore(),
+        );
+        const create = () => factory.create({ sessionId: SESSION_ID, dbSessionId: SESSION_ID });
+        expect(create).toThrow(`Engine '${engineType}' is not registered; cannot start the session.`);
+      });
+    });
   });
 
   describe('create() makes the session credential directories owner-only', () => {
@@ -235,6 +320,7 @@ describe('EngineFactory', () => {
     const buildBothDirFactory = (engineType: string) => {
       const sessionDataPath = path.join(tmpRoot, 'sessions');
       const authDir = path.join(tmpRoot, 'baileys');
+      const lidStore = buildLidStore();
       const factory = new EngineFactory(
         buildConfigService({
           'engine.type': engineType,
@@ -243,11 +329,12 @@ describe('EngineFactory', () => {
         }),
         noPluginLoader(),
         buildMessageStore(),
-        buildLidStore(),
+        lidStore,
         buildChatStateStore(),
       );
       return {
         factory,
+        lidStore,
         wwjsDir: wwjsAuthDir(sessionDataPath, SESSION_ID),
         baileysDir: baileysAuthDir(authDir, SESSION_ID),
       };
@@ -292,9 +379,110 @@ describe('EngineFactory', () => {
       expect(fs.existsSync(baileysDir)).toBe(true);
     });
 
+    it("hands the deleted session's lid mappings to no session, and not for an unsafe key", async () => {
+      const { factory, lidStore } = buildBothDirFactory('baileys');
+      const { releaseSession } = lidStore as unknown as { releaseSession: jest.Mock };
+
+      await factory.purgeSessionData(SESSION_ID);
+      await factory.purgeSessionData('../baileys-evil');
+
+      expect(releaseSession).toHaveBeenCalledTimes(1);
+      expect(releaseSession).toHaveBeenCalledWith(SESSION_ID);
+    });
+
     it('is a no-op (no throw) when neither auth dir exists', async () => {
       const { factory } = buildBothDirFactory('baileys');
       await expect(factory.purgeSessionData('never-linked')).resolves.toBeUndefined();
+    });
+
+    // A profile relocated onto another volume is a symlink. The purge removes the link and never follows it,
+    // so the WhatsApp login stays at the target, and the operator has to be told that instead of "purged".
+    describe('with an auth directory that is a symlink', () => {
+      type Logged = Record<'log' | 'warn', (message: string, meta?: Record<string, unknown>) => void>;
+      const spiesOn = (factory: EngineFactory) => {
+        const logger = (factory as unknown as { logger: Logged }).logger;
+        return { log: jest.spyOn(logger, 'log'), warn: jest.spyOn(logger, 'warn') };
+      };
+      const purged = (log: ReturnType<typeof spiesOn>['log']): unknown[] =>
+        log.mock.calls.filter(([message]) => message === 'Purged session auth directory').map(([, meta]) => meta?.dir);
+      const volume = () => path.join(tmpRoot, 'other-volume', SESSION_ID);
+      const withLogin = (target: string): void => {
+        fs.mkdirSync(target, { recursive: true });
+        fs.writeFileSync(path.join(target, 'creds.json'), '{}');
+      };
+      const linkWarning = (dir: string, target: string): unknown =>
+        expect.objectContaining({ action: 'engine_purge_link', sessionId: SESSION_ID, dir, target });
+
+      it('removes the link, keeps the login at its target and says so, while a real directory is purged as before', async () => {
+        const { factory, wwjsDir, baileysDir } = buildBothDirFactory('baileys');
+        withLogin(volume());
+        fs.mkdirSync(path.dirname(baileysDir), { recursive: true });
+        fs.symlinkSync(volume(), baileysDir);
+        fs.mkdirSync(wwjsDir, { recursive: true });
+        const { log, warn } = spiesOn(factory);
+
+        await factory.purgeSessionData(SESSION_ID);
+
+        expect(() => fs.lstatSync(baileysDir)).toThrow(/ENOENT/);
+        expect(fs.existsSync(path.join(volume(), 'creds.json'))).toBe(true);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.any(String), linkWarning(baileysDir, volume()));
+        expect(purged(log)).toEqual([wwjsDir]);
+        expect(fs.existsSync(wwjsDir)).toBe(false);
+      });
+
+      it('names the absolute target of a link written relative to its own directory', async () => {
+        const { factory, baileysDir } = buildBothDirFactory('baileys');
+        withLogin(volume());
+        fs.mkdirSync(path.dirname(baileysDir), { recursive: true });
+        fs.symlinkSync(path.join('..', 'other-volume', SESSION_ID), baileysDir);
+        const { warn } = spiesOn(factory);
+
+        await factory.purgeSessionData(SESSION_ID);
+
+        expect(warn).toHaveBeenCalledWith(expect.any(String), linkWarning(baileysDir, volume()));
+        expect(fs.existsSync(path.join(volume(), 'creds.json'))).toBe(true);
+      });
+
+      it('removes a link whose target is gone, without failing', async () => {
+        const { factory, wwjsDir } = buildBothDirFactory('baileys');
+        fs.mkdirSync(path.dirname(wwjsDir), { recursive: true });
+        fs.symlinkSync(volume(), wwjsDir);
+        const { warn } = spiesOn(factory);
+
+        await expect(factory.purgeSessionData(SESSION_ID)).resolves.toBeUndefined();
+
+        expect(() => fs.lstatSync(wwjsDir)).toThrow(/ENOENT/);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.any(String), linkWarning(wwjsDir, volume()));
+      });
+
+      it('says so for a legacy name-keyed directory that is a link', async () => {
+        const { factory } = buildBothDirFactory('baileys');
+        const legacy = baileysAuthDir(path.join(tmpRoot, 'baileys'), 'alice');
+        withLogin(volume());
+        fs.mkdirSync(path.dirname(legacy), { recursive: true });
+        fs.symlinkSync(volume(), legacy);
+        const { warn } = spiesOn(factory);
+
+        await factory.purgeSessionData(SESSION_ID, 'alice');
+
+        expect(() => fs.lstatSync(legacy)).toThrow(/ENOENT/);
+        expect(warn).toHaveBeenCalledWith(expect.any(String), linkWarning(legacy, volume()));
+        expect(fs.existsSync(path.join(volume(), 'creds.json'))).toBe(true);
+      });
+
+      it('logs no warning when only one engine has a directory, and none when neither does', async () => {
+        const { factory, baileysDir } = buildBothDirFactory('baileys');
+        const { warn } = spiesOn(factory);
+        await factory.purgeSessionData('never-linked');
+        fs.mkdirSync(baileysDir, { recursive: true });
+
+        await factory.purgeSessionData(SESSION_ID);
+
+        expect(warn).not.toHaveBeenCalled();
+        expect(fs.existsSync(baileysDir)).toBe(false);
+      });
     });
 
     // The boot migration keeps a legacy name-keyed directory it could not rename (an open profile, or
@@ -317,15 +505,43 @@ describe('EngineFactory', () => {
 
     // Why the legacy purge matches a directory listing instead of asking existsSync: there, deleting
     // `Alice` would remove the directory holding `alice`'s login, which is #1597 through the delete
-    // path. The two only diverge on a case-insensitive filesystem, which is where the bug lives.
+    // path. The two only diverge on a case-insensitive filesystem, which is where the bug lives, so
+    // existsSync is made to answer as one does: CI runs on a case-sensitive one, where it never would.
     it('leaves a legacy directory whose stored name differs only in case alone', async () => {
       const { factory } = buildBothDirFactory('baileys');
       const otherSession = wwjsAuthDir(path.join(tmpRoot, 'sessions'), 'alice');
       fs.mkdirSync(otherSession, { recursive: true });
 
-      await factory.purgeSessionData(SESSION_ID, 'Alice');
+      const exists = jest.spyOn(fs, 'existsSync').mockReturnValue(true);
+      const rm = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+      try {
+        await factory.purgeSessionData(SESSION_ID, 'Alice');
+        expect(rm).not.toHaveBeenCalledWith(wwjsAuthDir(path.join(tmpRoot, 'sessions'), 'Alice'), expect.anything());
+        expect(rm).not.toHaveBeenCalledWith(baileysAuthDir(path.join(tmpRoot, 'baileys'), 'Alice'), expect.anything());
+      } finally {
+        exists.mockRestore();
+        rm.mockRestore();
+      }
 
+      await factory.purgeSessionData(SESSION_ID, 'Alice');
       expect(fs.existsSync(otherSession)).toBe(true);
+    });
+
+    // The shape of a name says nothing about whose login its directory holds: a session named after a
+    // tenant UUID owns it. Whether the name is another session's live id is the caller's to decide
+    // (SessionEngineControls.delete asks the table and withholds such a name).
+    it('removes the legacy directories of a UUID-shaped name as well', async () => {
+      const { factory } = buildBothDirFactory('baileys');
+      const uuidName = '0b5c3a52-6d1e-4c1a-9f0e-2a7b8c9d0e1f';
+      const legacyWwjs = wwjsAuthDir(path.join(tmpRoot, 'sessions'), uuidName);
+      const legacyBaileys = baileysAuthDir(path.join(tmpRoot, 'baileys'), uuidName);
+      fs.mkdirSync(legacyWwjs, { recursive: true });
+      fs.mkdirSync(legacyBaileys, { recursive: true });
+
+      await factory.purgeSessionData(SESSION_ID, uuidName);
+
+      expect(fs.existsSync(legacyWwjs)).toBe(false);
+      expect(fs.existsSync(legacyBaileys)).toBe(false);
     });
 
     it('refuses to purge an unsafe session key (no rm on a traversal path)', async () => {

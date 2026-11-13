@@ -1,7 +1,9 @@
 import type { Product as BaileysProduct, WASocket } from '@whiskeysockets/baileys';
 import { Catalog, PaginatedProducts, Product, ProductQueryOptions } from '../interfaces/whatsapp-engine.interface';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { withQueryDeadline } from './baileys-query-deadline';
+import { mapServerRefusal, refusedStatusCode } from './baileys-groups';
 import { type createLogger } from '../../common/services/logger.service';
 
 /**
@@ -36,34 +38,58 @@ export class BaileysCatalog {
     private readonly budgetMs: number = CATALOG_QUERY_BUDGET_MS,
   ) {}
 
-  /** Spend part of one request-wide budget on a single query, and say so when it runs out. */
-  private async bounded<T>(work: Promise<T>, deadline: number): Promise<T> {
+  /**
+   * Spend part of one request-wide budget on a single query, and say so when it runs out. A WhatsApp
+   * error answer (a Boom with a numeric code) becomes an HTTP refusal rather than a raw 500. A 404
+   * (item-not-found) on the first query means the account has no catalog, which the routes answer as
+   * an empty body, so it resolves `empty` instead. Without `empty` (a later page of the walk) the 404
+   * stays a refusal, so a walk that breaks halfway fails rather than returning a short list.
+   */
+  private async bounded<T>(work: () => Promise<T>, deadline: number, empty?: T): Promise<T> {
     try {
-      return await withQueryDeadline(work, deadline - Date.now(), 'WhatsApp did not answer the catalog query in time');
+      return await withQueryDeadline(
+        mapServerRefusal('Reading the catalog', () =>
+          work().catch((error: unknown) => {
+            if (empty !== undefined && refusedStatusCode(error) === 404) return empty;
+            throw error;
+          }),
+        ),
+        deadline - Date.now(),
+        'WhatsApp did not answer the catalog query in time',
+      );
     } catch (error) {
       if (error instanceof EngineTransportError) {
         // Baileys' own "timed out waiting for message" warn is silent at the default
-        // BAILEYS_LOG_LEVEL, so without this line the 503 has no explanation anywhere.
-        this.host.logger.warn('Catalog query exceeded its budget', { budgetMs: this.budgetMs });
+        // BAILEYS_LOG_LEVEL, so without this line the 503 has no explanation anywhere. The message
+        // tells a spent budget apart from a rate limit WhatsApp answered.
+        this.host.logger.warn('Catalog query got no usable answer', { budgetMs: this.budgetMs, error: error.message });
       }
       throw error;
     }
   }
 
   /** Post-ensureReady socket handle. */
-  private sock(): WASocket {
-    return this.host.getSocket();
+  private sock(expected?: WASocket): WASocket {
+    this.host.ensureReady();
+    const socket = this.host.getSocket();
+    if (expected && socket !== expected) throw new EngineNotReadyError();
+    return socket;
   }
 
   /**
    * Baileys' getCatalog returns products + cursor only; the catalog metadata our Catalog type
    * expects is synthesized from the first collection (the only named grouping the library
    * exposes). A business without collections has no catalog to describe — null.
+   *
+   * getCollections sends one limit (default 51) as both collection_limit and item_limit, so
+   * productCount counts at most 51 products. Raising it would also raise the collection count fetched.
    */
   async getCatalog(): Promise<Catalog | null> {
     this.host.ensureReady();
     const jid = this.host.normalizedSelfJid();
-    const { collections } = await this.bounded(this.sock().getCollections(jid), Date.now() + this.budgetMs);
+    const { collections } = await this.bounded(() => this.sock().getCollections(jid), Date.now() + this.budgetMs, {
+      collections: [],
+    });
     const first = collections[0];
     if (!first) {
       return null;
@@ -92,8 +118,8 @@ export class BaileysCatalog {
     };
   }
 
-  async getProduct(productId: string): Promise<Product | null> {
-    const found = (await this.fetchAllProducts()).find(p => p.id === productId);
+  async getProduct(productId: string, expected?: WASocket): Promise<Product | null> {
+    const found = (await this.fetchAllProducts(expected)).find(p => p.id === productId);
     return found ? mapProduct(found) : null;
   }
 
@@ -105,14 +131,19 @@ export class BaileysCatalog {
    * The budget is computed once and shared by every page: a per-query deadline would multiply by
    * the page count, making a ten-page walk slower than the 60s stall it replaces.
    */
-  private async fetchAllProducts(): Promise<BaileysProduct[]> {
-    this.host.ensureReady();
+  private async fetchAllProducts(expected?: WASocket): Promise<BaileysProduct[]> {
+    const sock = this.sock(expected);
     const jid = this.host.normalizedSelfJid();
     const deadline = Date.now() + this.budgetMs;
     const products: BaileysProduct[] = [];
     let cursor: string | undefined;
     do {
-      const page = await this.bounded(this.sock().getCatalog({ jid, limit: CATALOG_PAGE_SIZE, cursor }), deadline);
+      const page = await this.bounded(
+        () => this.sock(sock).getCatalog({ jid, limit: CATALOG_PAGE_SIZE, cursor }),
+        deadline,
+        cursor === undefined ? { products: [], nextPageCursor: undefined } : undefined,
+      );
+      this.sock(sock);
       products.push(...page.products);
       // A server echoing back the cursor it was handed would otherwise spin this loop until the
       // process runs out of heap — the accumulator grows on every pass.
@@ -135,9 +166,10 @@ function mapProduct(p: BaileysProduct): Product {
     id: p.id,
     name: p.name,
     description: p.description || undefined,
-    price: p.price,
-    currency: p.currency,
-    priceFormatted: formatPrice(p.price, p.currency),
+    // A catalog item without a price parses as NaN, which would reach clients as "price":null.
+    ...(Number.isFinite(p.price) && { price: p.price, priceFormatted: formatPrice(p.price, p.currency) }),
+    // Read from the <currency> child the same way, so an item without one has none to report.
+    ...(p.currency && { currency: p.currency }),
     imageUrl: Object.values(p.imageUrls ?? {})[0],
     url: p.url ?? '',
     isAvailable: p.availability === 'in stock',
@@ -145,7 +177,8 @@ function mapProduct(p: BaileysProduct): Product {
   };
 }
 
-function formatPrice(price: number, currency: string): string {
+function formatPrice(price: number, currency: string | undefined): string {
+  if (!currency) return new Intl.NumberFormat('en').format(price);
   try {
     return new Intl.NumberFormat('en', { style: 'currency', currency }).format(price);
   } catch {

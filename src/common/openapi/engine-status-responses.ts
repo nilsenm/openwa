@@ -23,6 +23,15 @@ export const ENGINE_NOT_READY_409 =
   'into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.';
 
 /**
+ * `EngineRegistry.require()`'s default `BadRequestException` (400): the session has no engine at all,
+ * the case ENGINE_NOT_READY_409 leaves out. The catalog and status routes answer this with a 404
+ * instead; see SESSION_NOT_STARTED_404.
+ */
+export const SESSION_NOT_STARTED_400 =
+  'The session is not started: no engine is running for it (never started, stopped, or logged out). ' +
+  'Start the session and retry.';
+
+/**
  * `EngineNotReadyError` (409) on `POST /sessions/:sessionId/pairing-code`, where the generic wording
  * above points the caller at the wrong state: both engines accept a pairing request only while the
  * session is `qr_ready`, and a session that reads `ready` is already linked and answers `400`.
@@ -76,6 +85,7 @@ export const SESSION_NOT_STARTED_404 =
  * a 404 meaning that four of the six routes carrying this constant do not even declare.
  */
 export const RECIPIENT_UNREACHABLE_400 =
+  'Baileys rejects a phone number reported as unregistered. ' +
   'The request was rejected before anything was sent. Among the causes: the recipient could not be ' +
   'addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number ' +
   'is not on WhatsApp — as well as body validation and a session that is not active.';
@@ -85,10 +95,54 @@ export const ENGINE_REFUSED_403 =
   'WhatsApp refused the operation. The request was well formed — the refusal happened WhatsApp-side, ' +
   'most often because the account lacks the admin rights the operation requires.';
 
+export const RECIPIENT_LOOKUP_503 =
+  'Baileys could not complete the recipient lookup within the request budget. On send routes, ' +
+  'no message was handed to WhatsApp for this lookup failure.';
+
+/**
+ * `EngineThrottledError` (429) and `EngineTransportError` (408), both 503, from `mapSendRefusal`: on Baileys a
+ * send, reaction, delete, pin, edit or status post awaits several queries before it relays the message, and
+ * WhatsApp turns a throttled or timed out one away with that code. They differ in what they prove: a throttle
+ * sent nothing, so the idempotency key is freed; a timeout proves nothing, so the key stays taken. A connection
+ * that closed before the message was written (`EngineNotSentError`) sent nothing either.
+ */
+const SEND_REFUSAL_503 =
+  'On Baileys, also when WhatsApp rate-limits the request (code 429: nothing was sent, and a keyed send frees ' +
+  'its `Idempotency-Key`), times out a query it awaits (code 408: the outcome is not proven, and a keyed ' +
+  'send keeps its `Idempotency-Key` taken), or the connection closes before the message is written (nothing ' +
+  'was sent, and a keyed send frees its `Idempotency-Key`).';
+
+/**
+ * Both texts, for every route that reaches the Baileys send path. `presence/subscribe` shares the recipient
+ * lookup but sends nothing, so it keeps RECIPIENT_LOOKUP_503 alone.
+ */
+export const SEND_503 = `${RECIPIENT_LOOKUP_503} ${SEND_REFUSAL_503}`;
+
+/**
+ * The same refusals on a Baileys status post. It has no recipient to look up and takes no idempotency key,
+ * so the text names the post only.
+ */
+export const STATUS_POST_503 =
+  'On Baileys, WhatsApp can answer the post with a 503: it rate-limited the request (code 429: nothing was ' +
+  'posted) or timed out a query the post awaits (code 408: the outcome is not proven, so the post may have ' +
+  'been published). The post also answers 503 when the connection closes before it is written (nothing was ' +
+  'posted).';
+
 /** `MessageNotFoundError` (404): outside the adapter's lookup window, or revoked. */
 export const MESSAGE_NOT_FOUND_404 =
   "No such message: the id is outside the engine's lookup window (roughly the last hundred messages " +
   'of the chat, or absent from the Baileys store) or the message was revoked.';
+
+/**
+ * `MessageNotFoundError` (404) on the send routes that take a `quotedMessageId`. Not the react/delete
+ * wording: whatsapp-web.js looks the quote up by id in the page's message collection and then by
+ * `Msg.getMessagesById`, with no window of recent messages, and does not refuse a quote that resolves
+ * but cannot be replied to.
+ */
+export const QUOTED_MESSAGE_NOT_FOUND_404 =
+  'The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the ' +
+  'Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). ' +
+  'On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.';
 
 /** `ChannelNotFoundError` (404), on routes addressed by channel id. */
 export const CHANNEL_NOT_FOUND_404 =
@@ -110,6 +164,21 @@ export const CHANNEL_INVITE_NOT_FOUND_404 =
 export const CUSTOM_LINK_PREVIEW_501 =
   'A caller-supplied `customLinkPreview` is not supported by the whatsapp-web.js engine — only ' +
   'Baileys can attach one. The send itself is supported on both; omit the field, or use `linkPreview`.';
+
+/**
+ * send-text's 413: a custom preview's image has its own cap, `LINK_PREVIEW_THUMBNAIL_MAX_BYTES`, far
+ * below the 50 MiB media cap that MEDIA_TOO_LARGE_413 names.
+ */
+export const PREVIEW_IMAGE_TOO_LARGE_413 =
+  'The `customLinkPreview` image, as decoded `thumbnailBase64` or as downloaded from `thumbnailUrl`, ' +
+  'exceeds 5 MiB (or `MEDIA_DOWNLOAD_MAX_BYTES`, if that is lower).';
+
+/** MEDIA_URL_PROXY_503 for send-text, whose only fetched URL is a custom preview's `thumbnailUrl`. */
+export const PREVIEW_IMAGE_PROXY_503 =
+  'The session routes its URL fetches through an egress proxy, and the `customLinkPreview.thumbnailUrl` ' +
+  'fetch failed or timed out before any response arrived, so nothing was sent. The proxy or the target ' +
+  'behind it may be at fault; the gateway cannot tell which. Without a session proxy the same failure ' +
+  'answers `400`.';
 
 /**
  * `GroupNotFoundError` (404) — the id names a group, but no such group is known.

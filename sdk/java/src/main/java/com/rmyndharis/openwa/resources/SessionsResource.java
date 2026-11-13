@@ -44,8 +44,10 @@ public final class SessionsResource {
     }
 
     /**
-     * Update a RUNNING session's configuration. Takes effect without re-linking the account — all
-     * three fields were fixed at creation before this route existed.
+     * Update a session's configuration, in any state, without a restart or re-linking the account
+     * (all three fields were fixed at creation before this route existed). {@code autoRejectCalls}
+     * applies immediately; {@code maxReconnectAttempts} and {@code reconnectBaseDelay} apply on the
+     * next start.
      */
     public SessionConfig updateConfig(String id, UpdateSessionConfigRequest body) {
         return client.request(
@@ -60,7 +62,7 @@ public final class SessionsResource {
 
     /**
      * Update per-session proxy settings. No restart is performed — changes apply on the next start.
-     * Send {@code proxyUrl: null} to clear the proxy. Requires an OPERATOR-level key.
+     * Send {@code proxyUrl: null} to clear the proxy. Requires an unscoped ADMIN key.
      */
     public SessionProxy updateProxy(String id, UpdateSessionProxyRequest body) {
         return client.request(
@@ -72,7 +74,7 @@ public final class SessionsResource {
         return client.request(HttpMethod.GET, "/api/sessions/" + encodeSegment(id), null, null, SessionResponse.class);
     }
 
-    /** Create a new session. Requires an OPERATOR-level key. */
+    /** Create a new session. Requires an OPERATOR-level key; setting proxyUrl requires an ADMIN key. */
     public SessionResponse create(CreateSessionRequest body) {
         return client.request(HttpMethod.POST, "/api/sessions", null, body, SessionResponse.class);
     }
@@ -109,13 +111,21 @@ public final class SessionsResource {
      * operation did not complete (no send, no acknowledgement, timeout/transport error, or local
      * cleanup failure); {@code phone} is cleared and no success audit is written. Start the session
      * again and retry the logout; do not assume the retry reconnects automatically or lands in a
-     * guaranteed QR state.
+     * guaranteed QR state. On Baileys, a session with no linked device throws on HTTP {@code 409}
+     * instead: it was stopped locally, {@code phone} is cleared and no success audit is written.
+     * Start it to link a device, or delete it; retrying the logout cannot help.
      */
     public SessionResponse logout(String id) {
         return client.request(HttpMethod.POST, "/api/sessions/" + encodeSegment(id) + "/logout", null, null, SessionResponse.class);
     }
 
-    /** Force-kill a stuck session (SIGKILL + teardown). */
+    /**
+     * Force-kill a stuck session (SIGKILL + teardown). Throws with HTTP 502 and {@code code()}
+     * {@code SESSION_FORCE_KILL_INCOMPLETE} when the session was stopped locally but the
+     * force-destroy threw or timed out, so the engine process may still be running; the status is
+     * settled to {@code disconnected} and a retry answers 400 because no engine is left to kill.
+     * Restart the node to reap a leaked process.
+     */
     public SessionResponse forceKill(String id) {
         return client.request(HttpMethod.POST, "/api/sessions/" + encodeSegment(id) + "/force-kill", null, null, SessionResponse.class);
     }
@@ -125,7 +135,10 @@ public final class SessionsResource {
         return client.request(HttpMethod.GET, "/api/sessions/" + encodeSegment(id) + "/qr", null, null, QrCodeResponse.class);
     }
 
-    /** Request an 8-character pairing code for phone-based login. */
+    /**
+     * Request an 8-character pairing code for phone-based login. On whatsapp-web.js, never request one for a
+     * number that already has a linked session: WhatsApp can revoke that device. Link it by QR instead.
+     */
     public PairingCodeResponse requestPairingCode(String id, RequestPairingCodeRequest body) {
         return client.request(HttpMethod.POST, "/api/sessions/" + encodeSegment(id) + "/pairing-code", null, body, PairingCodeResponse.class);
     }

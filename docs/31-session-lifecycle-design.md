@@ -8,11 +8,11 @@
 
 The lifecycle is split across three files with one rule each:
 
-| File                                                                                | Owns                                                                   |
-| ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `session-engine-lifecycle.service.ts` (~1,100 lines)                                | Engine creation/initialization, status transitions, teardown           |
-| `session-engine-controls.ts` (~660 lines)                                           | The seven control verbs (start/stop/logout/forceKill/delete/reconnect) |
-| `session-ownership.service.ts` + `src/modules/takeover/session-takeover.service.ts` | Cross-node leases, adoption, orphan reaping                            |
+| File                                                                                | Owns                                                                                                  |
+| ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `session-engine-lifecycle.service.ts`                                               | Engine creation/initialization, status transitions, the reconnect loop (`executeReconnect`), teardown |
+| `session-engine-controls.ts`                                                        | The seven control verbs (start/stop/logout/forceKill/delete/shutdown/stopOrphanEngines)               |
+| `session-ownership.service.ts` + `src/modules/takeover/session-takeover.service.ts` | Cross-node leases, adoption, orphan reaping                                                           |
 
 ---
 
@@ -28,8 +28,8 @@ starting" read; two engines come up; one is leaked forever (registry holds the s
 **Defense:** `initializingSessions` is reserved SYNCHRONOUSLY (before any `await`) in
 `session-engine-controls.ts` — the second request observes the reservation and fails fast.
 **Pinned by:** `session.service.spec.ts` (the maxConcurrent/double-start cases, incl. the concurrent-start
-claim-holding verbs at `')() keeps the claim when a concurrent start still holds the session
-here'`).
+claim-holding verbs at
+`'%s() keeps the claim when a concurrent start still holds the session here'`).
 **The naive fix that is wrong:** checking session.status instead — status is written to the DB
 and read back with an await in between; the reservation map is the only synchronous view.
 
@@ -40,16 +40,24 @@ and read back with an await in between; the reservation map is the only synchron
 **Defense:** the INITIALIZING row is written and its promise tracked
 (`session-engine-lifecycle.service.ts`, `initializeEngine`); a retiring control awaits the
 pending write before deciding what it is retiring.
-**Pinned by:** `session.service.spec.ts` (the stop/delete-during-start teardown cases).
+**Pinned by:** `session-initial-status-commit-order.spec.ts`, where the INITIALIZING update commits only
+after stop, logout, forceKill and delete have begun, and each verb's own write must still land last
+(it fails if the verbs stop awaiting the pending write). `session-initial-status-retirement.spec.ts`
+pins the other half: a late INITIALIZING reply announces nothing once its engine has retired.
 
 ### INV-3 — Ownership is re-validated by object identity, not by session id
 
 **Interleaving:** control A starts engine #1; engine #1 fails and is destroyed; control B (a
 retry) starts engine #2; a stale callback from #1 arrives and mutates registry state owned by #2.
 **Defense:** `EngineRegistry` keys by session id but validates liveness by object identity
-(`isLive` / `deleteIfLive`) — a superseded engine's late callback cannot act.
+(`isLive` / `deleteIfLive`) — a superseded engine's late callback cannot act. One report is the
+exception: a superseded engine's terminal unlink (LOGOUT, UNPAIRED, UNPAIRED_IDLE, Baileys `logged out`)
+needs neither the engine nor the row, so it is still recorded (the audit row, the phone clear, the
+`session.disconnected` announcement). It changes no registry state, and it is skipped while a local
+replacement engine is READY.
 **Pinned by:** `engine-registry.service.spec.ts` (isLive / deleteIfLive cases); the registry
-is the single most repeated invariant in the module.
+is the single most repeated invariant in the module. The unlink exception is pinned by
+`session-unlink-retired-engine.spec.ts`.
 
 ### INV-4 — Init timeout evicts and 504s; init rejection propagates as FAILED
 
@@ -58,35 +66,88 @@ rejects, and neither does a navigation that never completes because WhatsApp Web
 a plain `await` hangs the start forever. The engine's own `authTimeoutMs` poll does not cover that
 case: whatsapp-web.js only starts it in `inject()`, after the page has loaded.
 **Defense:** `Promise.race` deadline in `initializeEngine`; on timeout the engine is evicted +
-force-destroyed + status DISCONNECTED + 504 to the caller. A REAL rejection is NOT treated as a
-timeout: it propagates so `start()` records FAILED with the reason.
+force-destroyed + status DISCONNECTED + 504 to the caller; a reconnect's own attempt instead leaves the row
+INITIALIZING with the timeout as `lastError` until its next attempt. The eviction, the recorded error and the
+DISCONNECTED write apply only while that engine is still the live one: a stale deadline (a stop +
+start replaced it mid-init) force-destroys its own engine and 504s, and leaves the replacement alone.
+The DISCONNECTED write also lands only on a row whose `nodeId` is this node's or empty: a deadline that
+fires while the teardown of a lease lost during the init is still running leaves the row to the peer
+that adopted it (INV-6).
+A REAL rejection is NOT treated as a timeout: it propagates so `start()` records FAILED with the
+reason.
 **Pinned by:** `session.service.spec.ts` (start failure-path cases; the timeout/rejection
-split lives in `session.service.spec.ts`'s init-timeout describes).
+split lives in `session.service.spec.ts`'s init-timeout describes);
+`session-init-timeout-after-lease-loss.spec.ts` for the lost lease.
 **Do not "simplify" the two paths into one** — the distinction is why a bad proxy config returns
 FAILED + reason while an init that never completes returns 504 + eviction.
 
 ### INV-5 — Delete racing a start re-purges auth directories after init resolves
 
-**Interleaving:** delete runs (purges dirs, tombstones the row); the in-flight start's
-`initialize()` resolves and re-creates the auth dir; a phantom session lingers on disk.
-**Defense:** post-init resurrection guards re-check the tombstone and re-purge
-(`session-engine-controls.ts` start path, after the awaited init).
-**Pinned by:** `session.service.spec.ts` ('tears down the just-initialized engine if a
-stop/delete lands during start() — no resurrection to READY').
+**Interleaving:** delete runs (purges dirs, removes the session's messages, outbox rows and
+delivery failures in batches, then the session row and its other child rows in one
+transaction); the in-flight start's `initialize()` resolves and re-creates the auth dir; a phantom
+session lingers on disk.
+**Defense:** the post-init guards in `start()` (`session-engine-controls.ts`) and `executeReconnect`
+(`session-engine-lifecycle.service.ts`) call `isSessionRetired`, which treats a stop mark or a missing
+row as retired (delete clears its mark before a slow init resolves), then tear down the
+just-registered engine and re-purge with `purgeAuthDirsIfDeleted`.
+**Pinned by:** `session.service.spec.ts` ('re-purges the auth dirs when a start completes after its
+row was deleted (init re-created them)' for `start()`, and 'tears down an engine created when a
+delete lands during init (session row gone, mark cleared)' for `executeReconnect`). The opposite half,
+that a stop retirement does not purge, is pinned by 'tears down the just-initialized engine if a
+stop/delete lands during start() (no resurrection to READY)'.
 
 ### INV-6 — Lease loss tears down local engines only; it never writes session rows
 
 **Interleaving:** node A holds session X's lease; node B adopts it after A's lease lapses; a
 stale in-flight write from A would clobber B's status.
 **Defense:** on lease loss, `stopOrphanEngines` destroys local engines; the session row is the
-owning node's alone (`session.service.ts` boot path). The one exception is the takeover sweep's
-`markLapsedDisconnected`, which marks a row disconnected only under the predicate it read (same
-`nodeId`, same status, lease expired more than two TTLs ago, and for a `qr_ready` row still no
-phone), so a row B has claimed, or a pairing that completed meanwhile, matches nothing. A `qr_ready`
-row with a phone is never marked: the adoption sweep would take the resulting disconnected row over.
+owning node's alone (`session.service.ts` boot path). Five writes are exceptions, each under a
+predicate. The takeover sweep's `markLapsedDisconnected` marks a row disconnected only under the
+predicate it read (same `nodeId`, same status, lease expired more than two TTLs ago, and for a
+`qr_ready` row still no phone), so a row B has claimed, or a pairing that completed meanwhile, matches
+nothing. A `qr_ready` row with a phone is never marked: the adoption sweep would take the resulting
+disconnected row over. And a start or reconnect whose post-init read finds its claim gone retires the
+engine it launched through `retireLaunchedEngine` (`session-engine-controls.ts`): the engine's own
+DISCONNECTED report is held back, because the in-memory ownership it is fenced on still lists the
+session until the next heartbeat, and the verb writes DISCONNECTED only on a row whose `nodeId` is this
+node's or empty, so a row B has claimed keeps B's status. The init deadline's DISCONNECTED (INV-4) is
+written under that same predicate: it can fire while `stopOrphanEngines` is still tearing the engine
+down, after B adopted the row. So is the phone clear of a WhatsApp unlink reported after its engine was
+retired (`reportUnlinkWithoutRow`): a launch retired for its lost claim can still report the unlink its
+cleanup was finishing, while the in-memory ownership that write is also fenced on has not caught up. Last,
+a start that fails or is refused with no engine left here (a
+takeover adoption whose launch fails, say) releases its claim and then writes DISCONNECTED only on a
+row that no node holds and that still has an active status: a row no node holds is revisited by
+neither `markLapsedDisconnected` nor the adoption sweep, so the READY a vanished node left on it would
+otherwise stand until a boot, and any claim since sets `nodeId`, so a row B claimed matches nothing.
+Four writes change the binding of a session: the unlink's clear, the number and push name a READY links, the
+push name an engine syncs after it, and the clear of a logout. The first three are not awaited by their issuer;
+the logout awaits its own. They are issued one after another per session, so the database receives them in the
+order they were issued, and a row read that acts on the session's phone (the disconnect handler's reload, the
+second read of a start) must not return the binding they replace: it starts once the writes this process issued
+have been answered and is repeated when another is issued while it runs (`session-phone-writes.ts`). A write
+that is not answered holds up the ones behind it for five seconds at most, and a read that finds them
+unanswered for that long fails: the disconnect handler reads again shortly, and a start fails with it. A READY writes its status and times at once and only its
+number and push name join this order, so a stop or a failure that follows it is not overwritten by a write
+that was waiting; the synced push name joins it too, so the empty name of the READY row cannot land after it.
+The logout issues its clear in the step that removes its engine from the registry, before a start can find
+the registry empty. Both readers also compare the binding epoch they took before reading with the one at the
+moment they use the row, since an unlink recorded in between clears a binding the row still shows. The snapshot
+a reconnect episode starts its next attempt from follows the binding in both directions: an unlink clears its
+phone, and an accepted READY sets it, so an attempt that linked an account and then failed is retried with it.
 **Pinned by:** `src/modules/takeover/session-takeover.service.spec.ts` +
-`session-ownership.service.spec.ts` + `session-ownership-status-fence.spec.ts` + the real-database
-predicate spec for `markLapsedDisconnected` in `src/modules/session/session.service.spec.ts`.
+`session-ownership.service.spec.ts` + `session-ownership-status-fence.spec.ts` +
+`session-failed-write-ownership-fence.spec.ts` for the FAILED writers outside the wiring + the real-database
+predicate spec for `markLapsedDisconnected` in `src/modules/session/session.service.spec.ts` +
+`session-retired-start-leaves-peer-row.spec.ts` for the retired launch +
+`session-init-timeout-after-lease-loss.spec.ts` for the init deadline +
+`session-unlink-retired-engine.spec.ts` for the unlink's phone clear +
+`session-reconnect-stale-binding.spec.ts` for the reads that wait for it +
+`src/modules/takeover/session-takeover-failed-adoption.spec.ts` for the failed start. That
+`stopOrphanEngines` itself writes no row is pinned by `session-delete-claim.spec.ts` ('retires an old
+local engine after a peer takes over and a fresh claim fails with SQL error %s'), where the peer's
+claimed row must still read as the peer's own start left it.
 
 ### INV-7 — FAILED sessions are deliberately NOT adopted by takeover
 
@@ -100,23 +161,34 @@ worth resuming: unauthenticated, mid-pairing, or operator-flagged failed').
 
 **Interleaving:** `client.logout()` chains `authStrategy.logout()` → `fs.rm(userDataDir)` while
 the Chromium process still holds file handles → rm fails or races a browser re-write.
-**Defense:** the logout path force-destroys the browser first, waits, then removes the dir; the
-475-line spec enumerates the interleavings.
-**Pinned by:** `logout-teardown-race.spec.ts` — the module's most complete race corpus. Read it
-before touching anything in the logout/forceKill path.
+**Defense:** whatsapp-web.js's own `Client.logout()` closes the browser and polls up to ~1 s for it
+to disconnect before LocalAuth removes the profile dir. OpenWA's part is the name-keyed
+credential-teardown fence: `teardownEngineSafely` registers the whole `engine.logout()` promise under
+the session name, and `start()`, `delete()` and `executeReconnect` wait for it through
+`awaitPendingTeardown` (bounded at 10 s and fail-closed: a timeout is a 409 for `start()`/`delete()`
+and a failed attempt for a reconnect), so no new engine or purge races the rm.
+**Pinned by:** `logout-teardown-race.spec.ts`, which enumerates that fence's interleavings. Read it
+before touching anything in the logout/forceKill path. The `executeReconnect` wait is pinned by
+`session-delete-claim.spec.ts` ('keeps a reconnect awaiting teardown when the old start returns from
+its %s').
 
 ### INV-9 — The reconnect loop bounds itself: backoff with jitter, clamp ≤ 5 min and ≤ setTimeout's 32-bit range, alert every 5 consecutive attempts
 
 **Defense:** `reconnect-policy.ts` — a pure decision function (attempt budget, loop alerts)
-consumed by the lifecycle, which resets the budget only when the session reaches READY; the clamps
-exist because a naive `delay * 2^attempt` reaches values `setTimeout` silently truncates.
-**Pinned by:** `reconnect-policy.spec.ts`.
+consumed by the lifecycle, which resets the budget only when the session held READY for
+`STABLE_READY_MS` (5 min) before its next drop or its next READY, so a session that flaps keeps
+backing off and still alerts. The stretch ends where the engine first reports a non-READY state
+(`readyEndedAt`), so a Baileys in-engine reconnect between two READYs is not counted as READY time;
+the clamps exist because a naive `delay * 2^attempt` reaches values
+`setTimeout` silently truncates, and overflows to `Infinity` on a long enough streak.
+**Pinned by:** `reconnect-policy.spec.ts`, `session.service.spec.ts` (scheduleReconnect cases).
 
 ### INV-10 — Boot auto-start is sequential, staggered (2s per Chromium), and detached from bootstrap
 
 **Why:** ten Chromium instances launching simultaneously on boot would hold the HTTP port closed
 for minutes; detaching from bootstrap means the API answers while engines warm.
-**Pinned by:** `session.service.spec.ts` (boot auto-start ordering/staggering cases).
+**Pinned by:** `session.service.spec.ts` (boot auto-start ordering/staggering cases; the stagger by
+'waits the full throttle between two auto-started launches').
 
 ---
 
@@ -125,13 +197,14 @@ for minutes; detaching from bootstrap means the API answers while engines warm.
 Every transition has a known, enumerated set of writers. When debugging a status surprise, find the
 writer before anything else:
 
-| Transition                      | Writers                                                                                   |
-| ------------------------------- | ----------------------------------------------------------------------------------------- |
-| → `INITIALIZING`                | `initializeEngine` (persisted before `initialize()`)                                      |
-| → `QR_READY` / `AUTHENTICATING` | engine callbacks (wired in the lifecycle delegate), via the registry's liveness check     |
-| → `READY`                       | `handleEngineReady` (also drops a recorded failure reason, see INV-7's rationale comment) |
-| → `DISCONNECTED`                | init-timeout eviction, graceful stop, puppeteer-death detection                           |
-| → `FAILED`                      | four terminal paths only, all ownership-fenced: see below                                 |
+| Transition                      | Writers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| → `INITIALIZING`                | `initializeEngine` (persisted before `initialize()`), engine-reported `INITIALIZING` via `onStateChanged` (ownership-fenced; Baileys while connecting and through its own reconnect after a drop)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| → `QR_READY` / `AUTHENTICATING` | engine callbacks (wired in the lifecycle delegate), via the registry's liveness check                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| → `READY`                       | `handleEngineReady` (also drops a recorded failure reason, see INV-7's rationale comment), engine-reported `READY` via `onStateChanged` (ownership-fenced; both engines report it next to `onReady`; skipped for a link the account binding refuses, which `rejectRebind` lands in `FAILED`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| → `DISCONNECTED`                | init-timeout eviction of a start (own or unowned row only, INV-4), graceful stop, logout, forceKill, a delete whose teardown fence times out, the engine `onDisconnected` callback and the liveness watchdog (`handleEngineDisconnected`), the boot reset, a backup import (active rows restored as disconnected), engine-reported `DISCONNECTED` via `onStateChanged`, the takeover sweep's `markLapsedDisconnected` (INV-6), a start or reconnect retiring the engine it launched (`retireLaunchedEngine`, own or unowned row only, INV-6), a failed or refused start that left no engine here, on the row it released (still-active status only, INV-6), a start whose transient-failure retry shutdown refused (`session.service.ts` hands a `FAILED` row it may claim back as `DISCONNECTED` for the next boot) |
+| → `ACTION_REQUIRED`             | engine-reported `ACTION_REQUIRED` via `onStateChanged` (ownership-fenced status write; the whatsapp-web.js onboarding-modal fallback), and `onActionRequired` records the reason                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| → `FAILED`                      | five terminal paths only, all ownership-fenced: see below                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 `FAILED` is the one worth spelling out, because it is terminal (neither the boot reset nor the
 takeover sweep resumes a FAILED row, INV-7) and because more than one path reaches it:
@@ -143,12 +216,16 @@ takeover sweep resumes a FAILED row, INV-7) and because more than one path reach
    forwards verbatim (`session-engine-event-wiring.ts`).
 4. A reconnect chain that EXHAUSTS its attempts, so the session is not left silently stuck
    `DISCONNECTED` with no engine (`session-engine-lifecycle.service.ts`).
+5. `rejectRebind`, when a different WhatsApp account scans a bound session's QR: it logs that account
+   out and lands `FAILED` with the reason (`session-engine-lifecycle.service.ts`).
 
 What still holds, and is load-bearing, is the narrower claim: no reconnect ATTEMPT writes FAILED.
 Only the exhaustion of the whole chain does. A loop that marked each failed attempt would turn every
-transient network blip into an operator-visible terminal state and defeat INV-7's signal. All four
+transient network blip into an operator-visible terminal state and defeat INV-7's signal. All five
 paths are fenced on `ownsSession`, so a dying generation cannot park a peer's session in a status
-nothing resets automatically.
+nothing resets automatically. The two wiring paths (2 and 3) share one fence, pinned by
+`session-ownership-status-fence.spec.ts`; the other three are pinned by
+`session-failed-write-ownership-fence.spec.ts`, which drives the real lifecycle.
 
 ## 31.3 Comments that exist because the obvious fix is wrong
 
@@ -157,10 +234,15 @@ Collected here so they survive refactors of the code around them:
 - `session-engine-lifecycle.service.ts` (init deadline region): the do-not-reorder note — the
   ownership re-validation window between the status write and `initialize()` is _narrowed, not
   closed_; moving the re-validation after init reopens INV-2.
-- `session-engine-controls.ts` (start): `session.config` is clamped to trusted keys because the
-  row is client-writable; an unclamped spread would let a caller smuggle engine options.
+- `session-engine-controls.ts` (start): the reconnect knobs read from the client-writable
+  `session.config` are coerced and clamped by `resolveReconnectConfig`, so a poisoned value cannot
+  become a NaN delay (a zero-delay relaunch storm) or a NaN attempt cap that never trips.
 - `EngineRegistry`: identity-based `deleteIfLive` rather than `delete(id)` — see INV-3; every
-  site that bypassed this in review's history created the same phantom-callback bug.
+  site that bypassed this in the past created the same phantom-callback bug. The eviction
+  helpers go through it too: `evictAndForceDestroy`, the init-timeout branch, and `start()`'s catch.
+  `start()` identifies its own engine by capturing the registry entry right after calling
+  `initializeEngine` (which registers it before its first await), not by a lookup in the catch: a
+  mid-init disconnect can schedule a reconnect that registers a replacement first.
 
 ## 31.4 What this document is NOT
 

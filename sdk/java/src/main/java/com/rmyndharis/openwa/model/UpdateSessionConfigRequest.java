@@ -1,7 +1,9 @@
 package com.rmyndharis.openwa.model;
 
 /**
- * Partial update of a RUNNING session's configuration — no re-link and no QR scan.
+ * Partial update of a session's configuration — no re-link and no QR scan. {@code autoRejectCalls}
+ * applies immediately; {@code maxReconnectAttempts} and {@code reconnectBaseDelay} apply on the
+ * next start.
  *
  * <p>The route needs THREE states per field, not two: an absent key leaves the value unchanged, a key
  * sent as explicit null clears it back to the default, and a value sets it. A record of nullable
@@ -32,7 +34,10 @@ public record UpdateSessionConfigRequest(
         private boolean clearMaxReconnectAttempts;
         private boolean clearReconnectBaseDelay;
 
-        /** Auto-reject incoming calls. */
+        /**
+         * Auto-reject incoming calls. Baileys only: whatsapp-web.js stores the flag but cannot reject a
+         * call, so calls keep ringing there.
+         */
         public Builder autoRejectCalls(Boolean v) {
             this.autoRejectCalls = v;
             return this;

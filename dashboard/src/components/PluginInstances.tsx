@@ -9,7 +9,8 @@ import {
   useUpdateInstanceMutation,
   useDeleteInstanceMutation,
 } from '../hooks/queries';
-import { isValidInstanceId, isValidInstanceSecret, parseInstanceConfig } from '../utils/instanceForm';
+import { isValidInstanceId, isValidInstanceSecret, parseEditScope, parseInstanceConfig } from '../utils/instanceForm';
+import { captionLength } from '../utils/bulkMedia';
 import { copyToClipboard } from '../utils/clipboard';
 import { Modal } from './Modal';
 import { useToast } from '../hooks/useToast';
@@ -61,7 +62,10 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
       return;
     }
     if (!isValidInstanceSecret(form.secret)) {
-      setFormError(t('plugins.instances.errors.invalidSecret'));
+      const count = captionLength(form.secret.trim());
+      setFormError(
+        count > 512 ? t('common.fieldTooLong', { max: 512, count }) : t('plugins.instances.errors.invalidSecret'),
+      );
       return;
     }
     try {
@@ -111,9 +115,8 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
     try {
       await updateM.mutateAsync({
         instanceId: editing.instanceId,
-        // Blank → omit (leave scope unchanged); mirrors create. Sending '' would corrupt an
-        // all-sessions (null) instance into a literal empty scope the backend never clears.
-        body: { sessionScope: editForm.sessionScope.trim() || undefined, config: parsed.value ?? {} },
+        // Blank means all sessions (null, or omitted when already unscoped). Never '': the API rejects it.
+        body: { sessionScope: parseEditScope(editing.sessionScope, editForm.sessionScope), config: parsed.value ?? {} },
       });
       setEditing(null);
       toast.success(t('plugins.instances.toasts.updated'), editing.instanceId);
@@ -122,10 +125,13 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
     }
   };
 
+  // A created or regenerated secret is shown once, from its request's answer, by this component. Its dialog stays until
+  // that answer is in: on top of the plugin dialog it keeps an Escape or a click from closing that dialog, and this
+  // component with it, while the request runs (a regenerate has already retired the old secret by then).
+  const confirmPending = deleteM.isPending || regenM.isPending;
   const runConfirm = async () => {
-    if (!confirm) return;
+    if (!confirm || confirmPending) return;
     const { type, inst } = confirm;
-    setConfirm(null);
     try {
       if (type === 'delete') {
         await deleteM.mutateAsync(inst.instanceId);
@@ -138,6 +144,8 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
       }
     } catch (err) {
       toast.error(t('plugins.instances.toasts.actionFailed'), (err as Error).message);
+    } finally {
+      setConfirm(null);
     }
   };
 
@@ -217,12 +225,13 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
       {showForm && (
         <Modal
           open
-          onClose={() => setShowForm(false)}
+          onClose={createM.isPending ? () => {} : () => setShowForm(false)}
+          hideCloseButton={createM.isPending}
           title={t('plugins.instances.create')}
           closeLabel={t('common.close')}
           footer={
             <>
-              <button className="btn-secondary" onClick={() => setShowForm(false)}>
+              <button className="btn-secondary" onClick={() => setShowForm(false)} disabled={createM.isPending}>
                 {t('common.cancel')}
               </button>
               <button
@@ -301,15 +310,42 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
           <label>{t('plugins.instances.created.secret')}</label>
           <div className="pi-secret">
             <code>{minted.secret}</code>
-            <button className="btn-primary" onClick={() => void copy(minted.secret, 'secret')}>
+            <button
+              className="btn-primary"
+              onClick={() => void copy(minted.secret, 'secret')}
+              aria-label={t('plugins.instances.actions.copy')}
+              title={t('plugins.instances.actions.copy')}
+            >
               {copied === 'secret' ? <Check size={16} /> : <Copy size={16} />}
             </button>
           </div>
+          {/* Revealed only here; later reads mask it, so an auto-generated token is lost if not shown. */}
+          {minted.verifyToken && (
+            <>
+              <label>{t('plugins.instances.created.verifyToken')}</label>
+              <div className="pi-secret">
+                <code>{minted.verifyToken}</code>
+                <button
+                  className="btn-primary"
+                  onClick={() => void copy(minted.verifyToken!, 'verifyToken')}
+                  aria-label={t('plugins.instances.actions.copy')}
+                  title={t('plugins.instances.actions.copy')}
+                >
+                  {copied === 'verifyToken' ? <Check size={16} /> : <Copy size={16} />}
+                </button>
+              </div>
+            </>
+          )}
           <label>{t('plugins.instances.created.ingressUrls')}</label>
           {minted.ingressUrls.map(u => (
             <div key={u.route} className="pi-secret">
               <code>{u.url}</code>
-              <button className="btn-primary" onClick={() => void copy(u.url, `mint-${u.route}`)}>
+              <button
+                className="btn-primary"
+                onClick={() => void copy(u.url, `mint-${u.route}`)}
+                aria-label={t('plugins.instances.actions.copy')}
+                title={t('plugins.instances.actions.copy')}
+              >
                 {copied === `mint-${u.route}` ? <Check size={16} /> : <Copy size={16} />}
               </button>
             </div>
@@ -362,20 +398,26 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
       {confirm && (
         <Modal
           open
-          onClose={() => setConfirm(null)}
+          onClose={confirmPending ? () => {} : () => setConfirm(null)}
+          hideCloseButton={confirmPending}
           title={t(`plugins.instances.${confirm.type}.title`)}
           className="confirm-modal"
           closeLabel={t('common.close')}
           footer={
             <>
-              <button className="btn-secondary" onClick={() => setConfirm(null)}>
+              <button className="btn-secondary" onClick={() => setConfirm(null)} disabled={confirmPending}>
                 {t('common.cancel')}
               </button>
               <button
                 className={confirm.type === 'delete' ? 'btn-danger' : 'btn-primary'}
                 onClick={() => void runConfirm()}
+                disabled={confirmPending}
               >
-                {t(`plugins.instances.${confirm.type}.action`)}
+                {confirmPending ? (
+                  <Loader2 className="animate-spin" size={16} />
+                ) : (
+                  t(`plugins.instances.${confirm.type}.action`)
+                )}
               </button>
             </>
           }

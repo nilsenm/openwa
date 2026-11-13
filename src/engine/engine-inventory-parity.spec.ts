@@ -43,12 +43,33 @@ function docText(): string {
   return readFileSync(DOC, 'utf8');
 }
 
-/** Adapter sources, comments removed but string literals kept — for finding `.on('event')`. */
-function adapterSourcesWithStrings(): string {
+/**
+ * The engine an adapter file belongs to, or undefined for a module both adapters share. Mirrors the
+ * attribution in engine-parity.spec.ts: an engine prefix, or one of the two engine-specific
+ * unprefixed files.
+ */
+function adapterFileEngine(file: string): Engine | undefined {
+  if (file.startsWith('baileys') || file === 'safe-link-preview.ts') return 'baileys';
+  if (file.startsWith('wwebjs') || file.startsWith('whatsapp-web-js') || file === 'chromium-profile-hygiene.ts') {
+    return 'wwjs';
+  }
+  return undefined;
+}
+
+/**
+ * Adapter sources, one entry per file, comments removed but string literals kept, for finding
+ * `.on('event')`. Given an engine, only that engine's files and the shared ones: a call or listener
+ * in the other engine's adapter says nothing about this one.
+ */
+function adapterFileSources(engine?: Engine): string[] {
   return readdirSync(ADAPTER_DIR)
     .filter(f => f.endsWith('.ts') && !f.endsWith('.spec.ts'))
-    .map(f => stripComments(readFileSync(join(ADAPTER_DIR, f), 'utf8')))
-    .join('\n');
+    .filter(f => engine === undefined || (adapterFileEngine(f) ?? engine) === engine)
+    .map(f => stripComments(readFileSync(join(ADAPTER_DIR, f), 'utf8')));
+}
+
+function adapterSourcesWithStrings(engine?: Engine): string {
+  return adapterFileSources(engine).join('\n');
 }
 
 function stripComments(src: string): string {
@@ -106,9 +127,24 @@ function readEvents(engine: Engine): EventRow[] {
   return rows;
 }
 
-const registeredEvents = new Set(
-  [...adapterSourcesWithStrings().matchAll(/\.on\(\s*'([a-zA-Z][a-zA-Z_.-]*)'/g)].map(m => m[1]),
-);
+function registeredEvents(engine: Engine): Set<string> {
+  return new Set([...adapterSourcesWithStrings(engine).matchAll(/\.on\(\s*'([a-zA-Z][a-zA-Z_.-]*)'/g)].map(m => m[1]));
+}
+
+function isReachedThroughHandle(symbol: string, engine: Engine, sources: string[]): boolean {
+  const files = sources.map(f => f.replace(/\s+/g, ' '));
+  const code = files.join(' ');
+  const handle =
+    engine === 'wwjs'
+      ? String.raw`(?:\bthis\.client\(\)|\b\w*[Cc]lient\b)`
+      : String.raw`(?:\bthis\.sock\(\)|\bgetSocket\(\)|\bsocket\b|\b\w*[Ss]ock\b)`;
+  const s = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (new RegExp(`${handle}[^;{}]{0,90}?\\.\\s*${s}\\s*[(<.,)\\]]`).test(code)) return true;
+  // Computed dispatch supplies the method name as a literal in the same file.
+  const dispatch = new RegExp(`${handle}\\s*\\[\\s*\\w+\\s*\\]\\s*\\(`);
+  const literal = new RegExp(`['"\`]${s}['"\`]`);
+  return files.some(f => dispatch.test(f) && literal.test(f));
+}
 
 describe('engine inventory (docs/29 §29.5) — drift invariants', () => {
   // Guards against a parser that silently stops matching: an empty or short parse would make every
@@ -153,12 +189,28 @@ describe('engine inventory (docs/29 §29.5) — drift invariants', () => {
     expect(scrubbed).toMatch(/real\.event/);
     // The real adapter corpus must be non-trivial, or the scan proves nothing.
     expect(adapterSourcesWithStrings().length).toBeGreaterThan(50_000);
-    expect(registeredEvents.size).toBeGreaterThanOrEqual(20);
+    expect(registeredEvents('baileys').size).toBeGreaterThanOrEqual(10);
+    expect(registeredEvents('wwjs').size).toBeGreaterThanOrEqual(10);
+  });
+
+  it.each(['addChatLabel', 'removeChatLabel'])('recognizes %s on a captured socket only for Baileys', symbol => {
+    const source = `const socket = this.sock!; socket.${symbol}(jid, labelId);`;
+    expect(isReachedThroughHandle(symbol, 'baileys', [source])).toBe(true);
+    expect(isReachedThroughHandle(symbol, 'wwjs', [source])).toBe(false);
+    for (const unrelated of [
+      `this.${symbol}(jid, labelId);`,
+      `store.${symbol}(jid, labelId);`,
+      `socketStore.${symbol}(jid, labelId);`,
+      `const socket = this.sock!; store.${symbol}(jid, labelId);`,
+      `const message = '${symbol}';`,
+    ]) {
+      expect(isReachedThroughHandle(symbol, 'baileys', [unrelated])).toBe(false);
+    }
   });
 
   describe.each<Engine>(['baileys', 'wwjs'])('%s', engine => {
     it('every ✅/⚙️ exposure mark has the symbol somewhere in adapter CODE, not just a comment', () => {
-      const code = adapterSourcesWithStrings();
+      const code = adapterSourcesWithStrings(engine);
       const unsupported = readInventory(engine)
         .filter(r => r.exposure.startsWith('✅') || r.exposure.startsWith('⚙️'))
         .filter(r => !isUsedInAdapterCode(r.symbol, code))
@@ -175,28 +227,26 @@ describe('engine inventory (docs/29 §29.5) — drift invariants', () => {
      *
      * So this asks the stronger question: is the symbol reached THROUGH a library handle? The
      * handle shapes are taken from what the adapters actually do — `this.sock()`/`this.client()`,
-     * `getSocket()`, and any socket/client-shaped local (`sock`, `sourceSock`, `client`) — and a
+     * `getSocket()`, and any socket/client-shaped local (`sock`, `sourceSock`, `socket`, `client`), and a
      * member may be a reference rather than a call, since `updateMediaMessage` is passed as one.
      * Casts are tolerated: `(this.client() as unknown as BusinessClient).getLabels()` is a real
-     * call, and so is computed dispatch, `this.client()[op](…)` with the name supplied as a literal.
+     * call, and so is computed dispatch, `this.client()[op](…)` with the name supplied as a literal
+     * in the same file. The index must be an identifier: a quoted one is a type position such as
+     * `Client['getContacts']`, and a literal used only as a log context is not a dispatch.
+     *
+     * A row that says the adapter does NOT go through the Client method (`not \`Client.getChats\``)
+     * is held to the opposite: the symbol must not be reached, so the disclaimer cannot go stale.
      */
     it('every ✅/⚙️ exposure mark is reached through a library handle, not just named', () => {
-      const code = adapterSourcesWithStrings().replace(/\s+/g, ' ');
-      const handle =
-        engine === 'wwjs'
-          ? String.raw`(?:\bthis\.client\(\)|\b\w*[Cc]lient\b)`
-          : String.raw`(?:\bthis\.sock\(\)|\bgetSocket\(\)|\b\w*[Ss]ock\b)`;
-      const reached = (symbol: string): boolean => {
-        const s = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        if (new RegExp(`${handle}[^;{}]{0,90}?\\.\\s*${s}\\s*[(<.,)\\]]`).test(code)) return true;
-        // computed dispatch through the handle, with the method name supplied as a literal
-        return new RegExp(`${handle}\\s*\\[`).test(code) && new RegExp(`['"\`]${s}['"\`]`).test(code);
-      };
+      const files = adapterFileSources(engine);
+      const disclaimed = (row: Row): boolean => row.exposure.includes(`not \`Client.${row.symbol}\``);
 
       const marked = readInventory(engine).filter(r => r.exposure.startsWith('✅') || r.exposure.startsWith('⚙️'));
       // Guard the selector: an empty or tiny set would make the assertion vacuous.
       expect(marked.length).toBeGreaterThan(30);
-      expect(marked.filter(r => !reached(r.symbol)).map(r => r.symbol)).toEqual([]);
+      expect(
+        marked.filter(r => isReachedThroughHandle(r.symbol, engine, files) === disclaimed(r)).map(r => r.symbol),
+      ).toEqual([]);
     });
 
     it('every interface method named in a ✅ exposure cell is `supported` for this engine', () => {
@@ -214,9 +264,10 @@ describe('engine inventory (docs/29 §29.5) — drift invariants', () => {
     });
 
     it('the ✅ event marks match the listeners the adapters register', () => {
+      const registered = registeredEvents(engine);
       const wrong = readEvents(engine)
-        .filter(row => row.consumed !== registeredEvents.has(row.event))
-        .map(row => `${row.event}: doc=${row.consumed ? '✅' : '❌'} registered=${registeredEvents.has(row.event)}`);
+        .filter(row => row.consumed !== registered.has(row.event))
+        .map(row => `${row.event}: doc=${row.consumed ? '✅' : '❌'} registered=${registered.has(row.event)}`);
       expect(wrong).toEqual([]);
     });
   });

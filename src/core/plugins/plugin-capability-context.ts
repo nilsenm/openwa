@@ -3,9 +3,9 @@ import { AsyncLocalStorage } from 'async_hooks';
 import type { HookManager, HookEvent } from '../hooks';
 import type { LidMappingStore } from '../../engine/identity/lid-mapping-store.service';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
-import { toNeutralJid } from '../../engine/identity/wa-id';
+import { parseWaId, toNeutralJid } from '../../engine/identity/wa-id';
 import { ConversationMappingConflict } from '../../modules/integration/conversation-mapping.service';
-import { createLogger } from '../../common/services/logger.service';
+import { createLogger, UNPRINTABLE } from '../../common/services/logger.service';
 import { isPluginActiveForSession, resolvePluginConfig } from './plugin-activation';
 import { effectiveNetAllow, isNetHostAllowed, performPluginFetch } from './plugin-net';
 import { buildConversationSendFacade, type ConversationMediaType } from './conversation-send-facade';
@@ -55,6 +55,46 @@ export function dispatchConversationMedia(
       return svc.sendDocument(sessionId, dto);
   }
 }
+
+// Plugin code can pass anything to its logger, and reading a value can throw (a Proxy trap, a getter, a toString): what
+// cannot be read is written as a marker, never thrown into the plugin.
+
+/** The text of a plugin's log message: what String gives for it (a Symbol included), or the marker. */
+const messageText = (message: unknown): string => {
+  try {
+    return String(message);
+  } catch {
+    return UNPRINTABLE;
+  }
+};
+
+/** The trace for a plugin's ctx.logger.error: an Error's message, or the text of whatever else was passed. */
+const errorText = (error: unknown): string => {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return UNPRINTABLE;
+  }
+};
+
+/** A prototype that is the root of a chain (Object.prototype of any realm, or none): what a plain record has. */
+const isRootPrototype = (prototype: object | null): boolean =>
+  prototype === null || Object.getPrototypeOf(prototype) === null;
+
+/**
+ * A plugin's log meta as the fields of the line: a plain record as it is, nothing as no fields, else as one field. An
+ * object whose prototype cannot be read (a Proxy whose getPrototypeOf trap throws, or a revoked one) is taken as a
+ * record, as spreading it took it: the logger copies it by its own properties or writes it as [Unreadable].
+ */
+const metaFields = (meta: unknown): Record<string, unknown> => {
+  if (meta === undefined || meta === null) return {};
+  if (typeof meta !== 'object') return { meta };
+  try {
+    return isRootPrototype(Object.getPrototypeOf(meta) as object | null) ? (meta as Record<string, unknown>) : { meta };
+  } catch {
+    return meta as Record<string, unknown>;
+  }
+};
 
 /**
  * The capability surface a plugin actually touches: ctx.messages, ctx.engine, ctx.net, ctx.storage,
@@ -184,6 +224,7 @@ export class PluginCapabilityContext {
           plugin.sessionConfig,
           hookSession.getStore()?.sessionId,
           plugin.manifest.sessionScoped !== false,
+          plugin.manifest,
         );
       },
       hookManager: this.hookManager,
@@ -220,19 +261,27 @@ export class PluginCapabilityContext {
     };
   }
 
+  // The plugin id is the host's field, passed apart from the plugin's meta so that a meta the logger cuts keeps it.
   private buildPluginLogger(plugin: PluginInstance): PluginLogger {
     return {
       log: (message, meta) =>
-        this.logger.log(`[${plugin.manifest.id}] ${message}`, { ...meta, pluginId: plugin.manifest.id }),
+        this.logger.log(`[${plugin.manifest.id}] ${messageText(message)}`, metaFields(meta), {
+          pluginId: plugin.manifest.id,
+        }),
       debug: (message, meta) =>
-        this.logger.debug(`[${plugin.manifest.id}] ${message}`, { ...meta, pluginId: plugin.manifest.id }),
+        this.logger.debug(`[${plugin.manifest.id}] ${messageText(message)}`, metaFields(meta), {
+          pluginId: plugin.manifest.id,
+        }),
       warn: (message, meta) =>
-        this.logger.warn(`[${plugin.manifest.id}] ${message}`, { ...meta, pluginId: plugin.manifest.id }),
+        this.logger.warn(`[${plugin.manifest.id}] ${messageText(message)}`, metaFields(meta), {
+          pluginId: plugin.manifest.id,
+        }),
       error: (message, error, meta) =>
         this.logger.error(
-          `[${plugin.manifest.id}] ${message}`,
-          error instanceof Error ? error.message : String(error),
-          { ...meta, pluginId: plugin.manifest.id },
+          `[${plugin.manifest.id}] ${messageText(message)}`,
+          error === undefined ? undefined : errorText(error),
+          metaFields(meta),
+          { pluginId: plugin.manifest.id },
         ),
     };
   }
@@ -268,16 +317,17 @@ export class PluginCapabilityContext {
         this.resolveEngineRead(plugin, sessionId).getChatHistory(
           chatId,
           // Clamp to the REST non-deep ceiling (MessageService.MAX_CHAT_HISTORY_LIMIT = 100) so an
-          // untrusted plugin can't request an unbounded history fetch.
-          Math.min(Math.max(Math.trunc(limit ?? 50), 1), 100),
+          // untrusted plugin can't request an unbounded history fetch. A non-finite limit (a sandboxed
+          // caller's arg is unvalidated) takes the default: NaN would reach the engine as "no limit".
+          Math.min(Math.max(typeof limit === 'number' && Number.isFinite(limit) ? Math.trunc(limit) : 50, 1), 100),
           includeMedia ?? false,
         ),
-      canonicalChatId: (sessionId, chatId) => {
-        // resolveEngineRead is the gate only (engine:read permission + live session); the resolution
-        // itself is a synchronous host lid->phone lookup, not an engine call, mirroring the webhook
-        // from-filter. Not `async` (nothing to await) — a resolved promise satisfies the signature.
+      canonicalChatId: async (sessionId, chatId) => {
         this.resolveEngineRead(plugin, sessionId);
-        return Promise.resolve(toNeutralJid(chatId, jid => this.lidMappingStore?.resolveLid(jid) ?? null));
+        const parsed = parseWaId(chatId);
+        const phone =
+          parsed.kind === 'lid' ? await this.lidMappingStore?.findPhoneForLid?.(chatId).catch(() => null) : null;
+        return toNeutralJid(chatId, () => phone ?? null);
       },
     } satisfies PluginEngineReadCapability;
   }
@@ -339,7 +389,7 @@ export class PluginCapabilityContext {
     return {
       fetch: async (url, init) => {
         // Two gates: the declared permission, then the effective host allowlist = manifest net.allow
-        // UNION the hosts of net.allowConfigHosts keys across the base config AND every per-session
+        // UNION the https origins of net.allowConfigHosts keys across the base config AND every per-session
         // override. The host gate has no firing-session context for a sandboxed plugin's cap round-trip,
         // so admit every operator-configured tenant host (all public + still SSRF-guarded at connect)
         // rather than resolving a single, possibly wrong (base-only), one. The SSRF guard inside
@@ -418,11 +468,12 @@ export class PluginCapabilityContext {
         }
         return mapping.chatId;
       },
-      // Re-establish the in-flight hook context around the downstream send so an adapter that calls
-      // conversation.send from within its own ingress handling can't echo-loop back into itself via
-      // its own outbound message:sending hook. Gate on an ALREADY-in-flight event (mirrors the
-      // worker-cap wrap's `inFlight.length > 0` check): a plain top-level send must NOT suppress
-      // message:sending for unrelated observers (audit/moderation) — only genuine re-entrancy does.
+      // Re-establish the in-flight hook context around the downstream send, so a conversation.send made
+      // from a hook handler cannot re-fire that handler's own event (an echo loop through
+      // message:sending). Gate on an ALREADY-in-flight event (mirrors the worker-cap wrap's
+      // `inFlight.length > 0` check): a send from an ingress handler or any other top-level context
+      // carries none, and must NOT suppress message:sending for observers (audit/moderation, or the
+      // adapter's own mirror hook), which then see the reply.
       runGuarded: (events, run) =>
         (events as HookEvent[]).some(e => this.hookManager.isInFlight(e))
           ? this.hookManager.runInFlight(events as HookEvent[], run)
@@ -441,6 +492,13 @@ export class PluginCapabilityContext {
         // it reuses CONVERSATION_SEND rather than adding a new permission.
         this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
         this.assertSessionActive(plugin, key.sessionId);
+        // The sandbox router checks this too; an in-process plain-JS plugin reaches here unchecked,
+        // and any other value would be stored and silently never hold the chat.
+        if (state !== 'bot' && state !== 'human' && state !== 'closed') {
+          throw new PluginCapabilityError(
+            `Plugin ${plugin.manifest.id}: handover state must be 'bot', 'human' or 'closed'`,
+          );
+        }
         const mapping = await this.hostServices.getConversationMappingPort().get({
           sessionId: key.sessionId,
           chatId: key.chatId,

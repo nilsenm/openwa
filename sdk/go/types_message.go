@@ -3,6 +3,7 @@ package openwa
 import (
 	"encoding/json"
 	"net/url"
+	"strconv"
 )
 
 // MessageResponse is the acknowledgement for a sent message.
@@ -22,8 +23,8 @@ type SendTextRequest struct {
 	// engines differ: whatsapp-web.js builds one in-page by default, while on Baileys a preview is
 	// OPT-IN — it needs true, because generating one is a blocking outbound fetch per URL.
 	LinkPreview *bool `json:"linkPreview,omitempty"`
-	// CustomLinkPreview attaches a preview you supply instead of one fetched from the URL. Nothing is
-	// fetched, so it works even for a URL the gateway cannot reach. Baileys only — whatsapp-web.js
+	// CustomLinkPreview attaches a preview you supply instead of one fetched from the URL. The page is
+	// not fetched, so it works even for a URL the gateway cannot reach. Baileys only — whatsapp-web.js
 	// takes a boolean and answers 501. Cannot be combined with LinkPreview=false.
 	CustomLinkPreview *CustomLinkPreview `json:"customLinkPreview,omitempty"`
 	// QuotedMessageID quotes an earlier message, turning this send into a reply. Engine-specific:
@@ -68,7 +69,8 @@ type SendAudioRequest struct {
 	Mentions []string `json:"mentions,omitempty"`
 }
 
-// SendLocationRequest sends a location pin. ChatID/Latitude/Longitude required.
+// SendLocationRequest sends a location pin. ChatID/Latitude/Longitude required. A coordinate left
+// unset is sent as 0, a real place, and the gateway sends a pin there, so always set both.
 type SendLocationRequest struct {
 	ChatID      string  `json:"chatId"`
 	Latitude    float64 `json:"latitude"`
@@ -173,10 +175,17 @@ type EditMessageRequest struct {
 
 // ListMessagesQuery filters GET /sessions/:id/messages.
 type ListMessagesQuery struct {
-	ChatID *string
-	From   *string
-	Limit  *int
-	Offset *int
+	// Inclusive lower/exclusive upper message-time bounds, Unix epoch milliseconds.
+	Since     *float64
+	Until     *float64
+	Direction *string
+	MessageID *string
+	OrderBy   *string
+	Type      *string
+	ChatID    *string
+	From      *string
+	Limit     *int
+	Offset    *int
 	// After is a keyset cursor: the id of the last message of the previous page. Takes
 	// precedence over Offset.
 	After *string
@@ -187,6 +196,16 @@ type ListMessagesQuery struct {
 
 func (q *ListMessagesQuery) values() url.Values {
 	v := url.Values{}
+	if q.Since != nil {
+		v.Set("since", strconv.FormatFloat(*q.Since, 'f', -1, 64))
+	}
+	if q.Until != nil {
+		v.Set("until", strconv.FormatFloat(*q.Until, 'f', -1, 64))
+	}
+	setStr(v, "direction", q.Direction)
+	setStr(v, "orderBy", q.OrderBy)
+	setStr(v, "messageId", q.MessageID)
+	setStr(v, "type", q.Type)
 	setStr(v, "chatId", q.ChatID)
 	setStr(v, "from", q.From)
 	setInt(v, "limit", q.Limit)
@@ -245,13 +264,14 @@ type MessageRecord struct {
 
 // MessageListResponse is the paginated message list payload.
 type MessageListResponse struct {
-	Messages []MessageRecord `json:"messages"`
-	Total    int             `json:"total"`
+	UnknownTimestampTotal *int            `json:"unknownTimestampTotal,omitempty"`
+	Messages              []MessageRecord `json:"messages"`
+	Total                 int             `json:"total"`
 }
 
 // ChatHistoryMedia is the media block on a live history message.
 type ChatHistoryMedia struct {
-	Mimetype  string `json:"mimetype,omitempty"`
+	Mimetype  string `json:"mimetype"`
 	Filename  string `json:"filename,omitempty"`
 	Data      string `json:"data,omitempty"`
 	Omitted   bool   `json:"omitted,omitempty"`
@@ -260,14 +280,14 @@ type ChatHistoryMedia struct {
 
 // QuotedMessage is the quoted-message block on a live history message.
 type QuotedMessage struct {
-	ID   string `json:"id,omitempty"`
-	Body string `json:"body,omitempty"`
+	ID   string `json:"id"`
+	Body string `json:"body"`
 }
 
 // MessageLocation is the location block on a live history message.
 type MessageLocation struct {
-	Latitude    float64 `json:"latitude,omitempty"`
-	Longitude   float64 `json:"longitude,omitempty"`
+	Latitude    float64 `json:"latitude"`
+	Longitude   float64 `json:"longitude"`
 	Description string  `json:"description,omitempty"`
 	Address     string  `json:"address,omitempty"`
 	URL         string  `json:"url,omitempty"`
@@ -276,25 +296,29 @@ type MessageLocation struct {
 // ChatHistoryMessage is a message read live from WhatsApp by Messages.History —
 // the richer engine payload, differently shaped from MessageRecord.
 type ChatHistoryMessage struct {
-	ID                string          `json:"id"`
-	From              string          `json:"from"`
-	To                string          `json:"to"`
-	ChatID            string          `json:"chatId"`
-	Body              string          `json:"body"`
-	Type              MessageType     `json:"type"`
-	Timestamp         int64           `json:"timestamp"`
-	FromMe            bool            `json:"fromMe"`
-	IsGroup           bool            `json:"isGroup"`
-	IsStatusBroadcast bool            `json:"isStatusBroadcast,omitempty"`
-	Kind              ChatKind        `json:"kind"`
-	EphemeralDuration int             `json:"ephemeralDuration,omitempty"`
-	Author            string          `json:"author,omitempty"`
-	MentionedIDs      []string        `json:"mentionedIds,omitempty"`
-	Call              *MessageCall    `json:"call,omitempty"`
-	IsLidSender       bool            `json:"isLidSender,omitempty"`
-	SenderPhone       *string         `json:"senderPhone,omitempty"`
-	Contact           *MessageContact `json:"contact,omitempty"`
-	BackgroundColor   string          `json:"backgroundColor,omitempty"`
+	ID                string      `json:"id"`
+	From              string      `json:"from"`
+	To                string      `json:"to"`
+	ChatID            string      `json:"chatId"`
+	Body              string      `json:"body"`
+	Type              MessageType `json:"type"`
+	Timestamp         int64       `json:"timestamp"`
+	FromMe            bool        `json:"fromMe"`
+	IsGroup           bool        `json:"isGroup"`
+	IsStatusBroadcast bool        `json:"isStatusBroadcast,omitempty"`
+	Kind              ChatKind    `json:"kind"`
+	EphemeralDuration int         `json:"ephemeralDuration,omitempty"`
+	// IsForwarded and ForwardingScore: the score is a sender-written unsigned 32-bit value, held as
+	// 64-bit so it cannot overflow.
+	IsForwarded     bool            `json:"isForwarded,omitempty"`
+	ForwardingScore int64           `json:"forwardingScore,omitempty"`
+	Author          string          `json:"author,omitempty"`
+	MentionedIDs    []string        `json:"mentionedIds,omitempty"`
+	Call            *MessageCall    `json:"call,omitempty"`
+	IsLidSender     bool            `json:"isLidSender,omitempty"`
+	SenderPhone     *string         `json:"senderPhone,omitempty"`
+	Contact         *MessageContact `json:"contact,omitempty"`
+	BackgroundColor string          `json:"backgroundColor,omitempty"`
 	// Pointer because font index 0 is a real style, so a value type could not tell it from absent.
 	// Matches StatusRecord.Font, which carries the same wire field.
 	Font          *int              `json:"font,omitempty"`
@@ -303,6 +327,14 @@ type ChatHistoryMessage struct {
 	Location      *MessageLocation  `json:"location,omitempty"`
 	Order         *MessageOrder     `json:"order,omitempty"`
 	Product       *MessageProduct   `json:"product,omitempty"`
+	Poll          *ChatHistoryPoll  `json:"poll,omitempty"`
+}
+
+// ChatHistoryPoll contains the poll question, choices, and selection mode.
+type ChatHistoryPoll struct {
+	Name                 string   `json:"name"`
+	Options              []string `json:"options"`
+	AllowMultipleAnswers bool     `json:"allowMultipleAnswers"`
 }
 
 // MessageOrder is the order block on a live history message, present on order messages only: the
@@ -359,6 +391,22 @@ type ReactionSender struct {
 type ReactionRecord struct {
 	Emoji   string           `json:"emoji"`
 	Senders []ReactionSender `json:"senders"`
+}
+
+// MessageReceiptParticipant is one recipient within a MessageReceiptsResponse.
+type MessageReceiptParticipant struct {
+	Participant string `json:"participant"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
+// MessageReceiptsResponse groups per-participant delivery, read, and played receipts.
+type MessageReceiptsResponse struct {
+	Delivery          []MessageReceiptParticipant `json:"delivery"`
+	DeliveryRemaining *int                        `json:"deliveryRemaining,omitempty"`
+	Read              []MessageReceiptParticipant `json:"read"`
+	ReadRemaining     *int                        `json:"readRemaining,omitempty"`
+	Played            []MessageReceiptParticipant `json:"played"`
+	PlayedRemaining   *int                        `json:"playedRemaining,omitempty"`
 }
 
 // BulkMediaContent is a per-item media block for a bulk send. It mirrors the
@@ -424,8 +472,8 @@ type BulkMessageResponse struct {
 
 // BatchError is a per-message failure in a batch result.
 type BatchError struct {
-	Code    string `json:"code,omitempty"`
-	Message string `json:"message,omitempty"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 // BatchMessageStatus is one recipient's send outcome inside a batch.
@@ -520,7 +568,7 @@ type BatchProgress struct {
 	Cancelled int `json:"cancelled"`
 }
 
-// BatchStatusResponse is the response from the batch status / cancel endpoints.
+// BatchStatusResponse is the response from the batch status endpoint.
 type BatchStatusResponse struct {
 	BatchID     string               `json:"batchId"`
 	Status      BatchLifecycleStatus `json:"status"`
@@ -528,6 +576,14 @@ type BatchStatusResponse struct {
 	Results     []BatchMessageResult `json:"results"`
 	StartedAt   *string              `json:"startedAt,omitempty"`
 	CompletedAt *string              `json:"completedAt,omitempty"`
+}
+
+// BatchCancelResponse is the response from the batch cancel endpoint: the batch
+// state without the per-recipient results.
+type BatchCancelResponse struct {
+	BatchID  string               `json:"batchId"`
+	Status   BatchLifecycleStatus `json:"status"`
+	Progress BatchProgress        `json:"progress"`
 }
 
 // MessageMedia is a message's stored media: the raw bytes plus the served

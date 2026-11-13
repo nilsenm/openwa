@@ -5,7 +5,7 @@ package openwa
 // HealthResponse is the /health payload.
 type HealthResponse struct {
 	Status    string `json:"status"`
-	Timestamp string `json:"timestamp,omitempty"`
+	Timestamp string `json:"timestamp"`
 	Version   string `json:"version,omitempty"`
 }
 
@@ -19,15 +19,19 @@ type DependencyStatus struct {
 // name (e.g. "mainDatabase", "dataDatabase") to its DependencyStatus.
 type HealthReadyResponse struct {
 	Status  string                      `json:"status"`
-	Details map[string]DependencyStatus `json:"details,omitempty"`
+	Details map[string]DependencyStatus `json:"details"`
 }
 
 // ── Auth ─────────────────────────────────────────────────
 
-// AuthValidateResponse reports whether the API key is valid and its role.
+// AuthValidateResponse reports whether the API key is valid, its role, the
+// engine the gateway runs, and whether the key is restricted to selected
+// sessions.
 type AuthValidateResponse struct {
-	Valid bool   `json:"valid"`
-	Role  string `json:"role,omitempty"`
+	Valid      bool   `json:"valid"`
+	Role       string `json:"role,omitempty"`
+	EngineType string `json:"engineType,omitempty"`
+	Scoped     bool   `json:"scoped,omitempty"`
 }
 
 // ── Template ───────────────────────────────────────────
@@ -70,7 +74,7 @@ type UpdateTemplateRequest struct {
 type LabelRecord struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
-	HexColor string `json:"hexColor,omitempty"`
+	HexColor string `json:"hexColor"`
 }
 
 // AddLabelRequest applies a label to a chat.

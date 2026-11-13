@@ -14,7 +14,8 @@ import { Session } from './entities/session.entity';
  * account rather than about our attempt, so losing it on restart would matter — except that both
  * engines re-report it on the next connection (Baileys is asked directly on every connect, and
  * whatsapp-web.js re-blocks the very next link attempt), so the state re-seeds itself within one
- * session start. That self-healing is what makes the column unnecessary.
+ * session start. That self-healing is what makes the column unnecessary. A passkey request is the exception:
+ * it comes back only when WhatsApp asks again on the next link attempt.
  *
  * Only ACTIVE restrictions are held: a lift removes the entry rather than storing a negative, so the
  * map's size is the count of restricted sessions and `get` returning nothing means "not restricted".
@@ -27,16 +28,7 @@ export class SessionRestrictionStore {
     // The mirrored gauge is refreshed on every mutation, but an expiry is not a mutation: a timelock
     // that lapses on its own left the gauge claiming a session was restricted while get/size/attachTo
     // all reported it was not. Registering the recount makes the gauge read what the API would say.
-    registerRestrictedSessionRecount(() => this.countInForce());
-  }
-
-  /** How many stored restrictions are still in force right now. */
-  private countInForce(): number {
-    let inForce = 0;
-    for (const sessionId of this.restrictions.keys()) {
-      if (this.inForce(sessionId)) inForce++;
-    }
-    return inForce;
+    registerRestrictedSessionRecount(() => this.size());
   }
 
   /**
@@ -48,10 +40,14 @@ export class SessionRestrictionStore {
    * connect, so an un-deduped webhook would fire on a loop for one unchanged fact.
    *
    * The stored entry is refreshed either way, so a re-report with a later `expiresAt` updates what
-   * the API serves without being announced as a new restriction.
+   * the API serves without being announced as a new restriction. Compared against what is in force:
+   * a same-cause restriction imposed after the last one lapsed is a new onset, not a re-report. A
+   * report that is itself already over is compared against the stored entry, so a clock running
+   * ahead of WhatsApp's does not announce the same lapsed timelock on every connect.
    */
   set(sessionId: string, restriction: AccountRestriction): boolean {
-    const previous = this.restrictions.get(sessionId);
+    const lapsed = restriction.expiresAt != null && restriction.expiresAt <= Date.now();
+    const previous = lapsed ? this.restrictions.get(sessionId) : this.inForce(sessionId);
     this.restrictions.set(sessionId, restriction);
     this.publishCount();
     return previous?.kind !== restriction.kind || previous?.code !== restriction.code;
@@ -63,7 +59,7 @@ export class SessionRestrictionStore {
    * read says it is not.
    */
   private publishCount(): void {
-    setRestrictedSessionCount(this.countInForce());
+    setRestrictedSessionCount(this.size());
   }
 
   /** The restriction in force, if any. `attachTo` is the projection; this is the raw read. */
@@ -98,10 +94,10 @@ export class SessionRestrictionStore {
   /**
    * Drop the restriction only if reaching READY disproves it.
    *
-   * `tos_block` and `proxy_block` are refusals of the connection itself, so a session that is now
-   * linked and ready cannot still be under one. A `reachout_timelock` is not connection-scoped — the
-   * account is fully connected while it applies — so READY says nothing about it and it survives
-   * here, waiting for the engine's explicit lift.
+   * `tos_block`, `proxy_block` and `passkey_required` all stop a link or a connection, so a session
+   * that is now linked and ready cannot still be under one. A `reachout_timelock` is not
+   * connection-scoped — the account is fully connected while it applies — so READY says nothing about
+   * it and it survives here, waiting for the engine's explicit lift.
    */
   clearIfDisprovedByReady(sessionId: string): AccountRestriction | undefined {
     const previous = this.restrictions.get(sessionId);

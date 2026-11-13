@@ -54,14 +54,15 @@ export class MediaController {
   @ApiResponse({
     status: 400,
     description:
-      'Neither url nor base64 given, the url answers non-2xx, times out or cannot be reached, or ffmpeg ' +
-      'refused the input.',
+      'Neither url nor base64 given, the url is not an absolute http(s) URL or answers non-2xx, times out or ' +
+      'cannot be reached, or ffmpeg refused the input.',
   })
   @ApiResponse({ status: 413, description: 'The supplied media is above the media size cap.' })
   @ApiResponse({
     status: 503,
     description:
       'Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly. ' +
+      'It also answers 503 once the gateway is shutting down. ' +
       MEDIA_URL_PROXY_503,
   })
   async convertVoice(@Param('sessionId') sessionId: string, @Body() dto: ConvertMediaDto) {
@@ -75,21 +76,22 @@ export class MediaController {
   @ApiResponse({
     status: 200,
     description:
-      'Converted bytes: baseline H.264 with AAC audio, long edge bounded at 1280, index moved to the ' +
-      'front so the recipient can start playing before the whole file arrives.',
+      'Converted bytes: baseline H.264 with AAC audio, fitted inside 1280x720 (720x1280 portrait), index ' +
+      'moved to the front so the recipient can start playing before the whole file arrives.',
     type: ConvertedMediaResponseDto,
   })
   @ApiResponse({
     status: 400,
     description:
-      'Neither url nor base64 given, the url answers non-2xx, times out or cannot be reached, or ffmpeg ' +
-      'refused the input.',
+      'Neither url nor base64 given, the url is not an absolute http(s) URL or answers non-2xx, times out or ' +
+      'cannot be reached, or ffmpeg refused the input.',
   })
   @ApiResponse({ status: 413, description: 'The supplied media is above the media size cap.' })
   @ApiResponse({
     status: 503,
     description:
       'Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly. ' +
+      'It also answers 503 once the gateway is shutting down. ' +
       MEDIA_URL_PROXY_503,
   })
   async convertVideo(@Param('sessionId') sessionId: string, @Body() dto: ConvertMediaDto) {

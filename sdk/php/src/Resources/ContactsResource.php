@@ -35,7 +35,11 @@ class ContactsResource
         return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}");
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Check whether a number is on WhatsApp. Requires an OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
     public function check(string $sessionId, string $number): array
     {
         return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/check/{$this->http->encodeSegment($number)}");
@@ -51,7 +55,7 @@ class ContactsResource
      * Batch-resolve profile picture URLs for up to 50 contacts in one request.
      *
      * @param list<string> $ids
-     * @return array{pictures: array<string,?string>} Map of contact id → URL (null when a lookup fails).
+     * @return array{pictures: array<string,?string>} Map of contact id → URL (null when a lookup fails). An id skipped after a lookup timed out is absent from the map; ask for it again.
      */
     public function profilePictures(string $sessionId, array $ids): array
     {
@@ -68,7 +72,24 @@ class ContactsResource
         return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}/phone");
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Look up the `@lid` WhatsApp holds for a phone number, without sending a message. `lid` is null when WhatsApp
+     * holds none, which an unregistered number also answers. The lookup can query WhatsApp (Baileys on every call,
+     * whatsapp-web.js when the page holds no LID), so bulk lookups put the linked account at risk. Requires an
+     * OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
+    public function lid(string $sessionId, string $number): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($number)}/lid");
+    }
+
+    /**
+     * Block a contact. Requires an OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
     public function block(string $sessionId, string $contactId): array
     {
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}/block");
@@ -95,7 +116,11 @@ class ContactsResource
         return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}") ?? [];
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Unblock a contact. Requires an OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
     public function unblock(string $sessionId, string $contactId): array
     {
         return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}/block");

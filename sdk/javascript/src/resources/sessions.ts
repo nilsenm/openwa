@@ -47,8 +47,9 @@ export class SessionsResource {
   }
 
   /**
-   * Update a running session's configuration. Takes effect without re-linking the account — all three
-   * fields were fixed at creation before this route existed.
+   * Update a session's configuration, in any state, without a restart or re-linking the account (all
+   * three fields were fixed at creation before this route existed). `autoRejectCalls` applies
+   * immediately; `maxReconnectAttempts` and `reconnectBaseDelay` apply on the next start.
    */
   updateConfig(id: string, body: UpdateSessionConfigRequest): Promise<SessionConfig> {
     return this.client.request<SessionConfig>({
@@ -68,7 +69,7 @@ export class SessionsResource {
 
   /**
    * Update per-session proxy settings. No restart is performed — changes apply on the next start.
-   * Send `proxyUrl: null` to clear the proxy. **OPERATOR**
+   * Send `proxyUrl: null` to clear the proxy. **ADMIN** (unscoped key)
    */
   updateProxy(id: string, body: UpdateSessionProxyRequest): Promise<SessionProxy> {
     return this.client.request<SessionProxy>({
@@ -83,7 +84,7 @@ export class SessionsResource {
     return this.client.request<SessionResponse>({ method: 'GET', path: `/api/sessions/${encodeSegment(id)}` });
   }
 
-  /** Create a new session. Requires an OPERATOR-level key. */
+  /** Create a new session. Requires an OPERATOR-level key; setting proxyUrl requires an ADMIN key. */
   create(body: CreateSessionRequest): Promise<SessionResponse> {
     return this.client.request<SessionResponse>({ method: 'POST', path: '/api/sessions', body });
   }
@@ -120,13 +121,21 @@ export class SessionsResource {
    * operation did not complete (no send, no acknowledgement, timeout/transport error, or local
    * cleanup failure); `phone` is cleared and no success audit is written. Start the session again
    * and retry the logout; do not assume the retry reconnects automatically or lands in a
-   * guaranteed QR state.
+   * guaranteed QR state. On Baileys, a session with no linked device rejects with HTTP `409`
+   * instead: it was stopped locally, `phone` is cleared and no success audit is written. Start it
+   * to link a device, or delete it; retrying the logout cannot help.
    */
   logout(id: string): Promise<SessionResponse> {
     return this.client.request<SessionResponse>({ method: 'POST', path: `/api/sessions/${encodeSegment(id)}/logout` });
   }
 
-  /** Force-kill a stuck session (SIGKILL + teardown). */
+  /**
+   * Force-kill a stuck session (SIGKILL + teardown). Rejects with HTTP `502` and
+   * `code: 'SESSION_FORCE_KILL_INCOMPLETE'` when the session was stopped locally but the
+   * force-destroy threw or timed out, so the engine process may still be running; the status is
+   * settled to `disconnected`, no success audit is written, and a retry answers `400` because no
+   * engine is left to kill. Restart the node to reap a leaked process.
+   */
   forceKill(id: string): Promise<SessionResponse> {
     return this.client.request<SessionResponse>({
       method: 'POST',
@@ -139,7 +148,10 @@ export class SessionsResource {
     return this.client.request<QrCodeResponse>({ method: 'GET', path: `/api/sessions/${encodeSegment(id)}/qr` });
   }
 
-  /** Request an 8-character pairing code for phone-based login. */
+  /**
+   * Request an 8-character pairing code for phone-based login. On whatsapp-web.js, never request one for a
+   * number that already has a linked session: WhatsApp can revoke that device. Link it by QR instead.
+   */
   requestPairingCode(id: string, body: RequestPairingCodeRequest): Promise<PairingCodeResponse> {
     return this.client.request<PairingCodeResponse>({
       method: 'POST',

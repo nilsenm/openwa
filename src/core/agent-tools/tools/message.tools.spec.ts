@@ -41,6 +41,90 @@ describe('messageTools', () => {
     expect(out).toEqual([{ id: 'm1' }]);
   });
 
+  // Media rows carry their base64 inline up to a per-response budget (8 MiB by default), and over MCP the list is
+  // the only way to the bytes, so the default stays "inline"; an agent that wants the rows alone opts out, as the
+  // REST list's inlineMedia=false does.
+  it.each([true, false])('MessageList forwards inlineMedia: %s to getMessages', async inlineMedia => {
+    const getMessages = jest.fn().mockResolvedValue({ messages: [], total: 0 });
+    const tools = makeTools({ getMessages } as unknown as MessageService);
+    await run(tools.get('MessageList')!, { sessionId: 's1', chatId: '628111@c.us', inlineMedia });
+    expect(getMessages).toHaveBeenCalledWith('s1', expect.objectContaining({ chatId: '628111@c.us', inlineMedia }));
+  });
+
+  it('MessageList leaves inlineMedia out of the call when it is unset, so the service default applies', async () => {
+    const getMessages = jest.fn().mockResolvedValue({ messages: [], total: 0 });
+    const tools = makeTools({ getMessages } as unknown as MessageService);
+    await run(tools.get('MessageList')!, { sessionId: 's1', chatId: '628111@c.us' });
+    const options = (getMessages.mock.calls[0] as [string, Record<string, unknown>])[1];
+    expect(Object.keys(options)).not.toContain('inlineMedia');
+  });
+
+  it('MessageList refuses a sender filter longer than a chat id, as the chat filter beside it is', async () => {
+    const getMessages = jest.fn();
+    const tools = makeTools({ getMessages } as unknown as MessageService);
+    await expect(
+      run(tools.get('MessageList')!, { sessionId: 's1', chatId: '628111@c.us', from: '6'.repeat(256) }),
+    ).rejects.toMatchObject({
+      response: { message: [expect.stringContaining('from') as unknown as string] },
+    });
+    expect(getMessages).not.toHaveBeenCalled();
+  });
+
+  it('MessageList refuses an inlineMedia that is not a boolean', async () => {
+    const getMessages = jest.fn();
+    const tools = makeTools({ getMessages } as unknown as MessageService);
+    await expect(
+      run(tools.get('MessageList')!, { sessionId: 's1', chatId: '628111@c.us', inlineMedia: 'false' }),
+    ).rejects.toMatchObject({
+      response: { message: [expect.stringContaining('inlineMedia') as unknown as string] },
+    });
+    expect(getMessages).not.toHaveBeenCalled();
+  });
+
+  // The filters the REST list takes, so an agent can window a chat the way an HTTP client does.
+  it('MessageList forwards the REST filters to getMessages', async () => {
+    const getMessages = jest.fn().mockResolvedValue({ messages: [], total: 0 });
+    const tools = makeTools({ getMessages } as unknown as MessageService);
+    const filters = {
+      after: 'row-17',
+      since: 1_700_000_000_000,
+      until: 1_700_000_100_000.5,
+      direction: 'incoming',
+      type: 'image',
+      orderBy: 'timestamp',
+      messageId: 'true_628111@c.us_3EB0ABC',
+    };
+    await run(tools.get('MessageList')!, { sessionId: 's1', chatId: '628111@c.us', ...filters });
+    expect(getMessages).toHaveBeenCalledWith('s1', { chatId: '628111@c.us', ...filters });
+  });
+
+  it.each(['', '   '])('MessageList reads the blank cursor %p as absent, as REST does', async after => {
+    const getMessages = jest.fn().mockResolvedValue({ messages: [], total: 0 });
+    const tools = makeTools({ getMessages } as unknown as MessageService);
+    await run(tools.get('MessageList')!, { sessionId: 's1', chatId: '628111@c.us', after });
+    const options = (getMessages.mock.calls[0] as [string, Record<string, unknown>])[1];
+    expect(options.after).toBeUndefined();
+  });
+
+  it.each([
+    ['direction', 'sideways'],
+    ['orderBy', 'newest'],
+    ['since', -1],
+    ['until', 'yesterday'],
+    ['type', 'x'.repeat(51)],
+    ['messageId', 'x'.repeat(201)],
+    ['after', 'x'.repeat(129)],
+  ])('MessageList refuses %s: %p', async (field, value) => {
+    const getMessages = jest.fn();
+    const tools = makeTools({ getMessages } as unknown as MessageService);
+    await expect(
+      run(tools.get('MessageList')!, { sessionId: 's1', chatId: '628111@c.us', [field]: value }),
+    ).rejects.toMatchObject({
+      response: { message: [expect.stringContaining(field) as unknown as string] },
+    });
+    expect(getMessages).not.toHaveBeenCalled();
+  });
+
   it('MessageHistory delegates to getChatHistory', async () => {
     const getChatHistory = jest.fn().mockResolvedValue([{ id: 'm1' }]);
     const tools = makeTools({ getChatHistory } as unknown as MessageService);
@@ -51,8 +135,25 @@ describe('messageTools', () => {
       includeMedia: true,
       deep: true,
     });
-    expect(getChatHistory).toHaveBeenCalledWith('s1', '628111@c.us', 50, true, true);
+    expect(getChatHistory).toHaveBeenCalledWith('s1', '628111@c.us', 50, true, true, undefined);
     expect(out).toEqual([{ id: 'm1' }]);
+  });
+
+  it('MessageHistory hands the request cancellation signal to getChatHistory', async () => {
+    const getChatHistory = jest.fn().mockResolvedValue([]);
+    const tools = makeTools({ getChatHistory } as unknown as MessageService);
+    const controller = new AbortController();
+    await invokeTool(
+      tools.get('MessageHistory')!,
+      { sessionId: 's1', chatId: '628111@c.us' },
+      'key',
+      makeAuth() as unknown as AuthService,
+      undefined,
+      undefined,
+      undefined,
+      controller.signal,
+    );
+    expect((getChatHistory.mock.calls[0] as unknown[])[5]).toBe(controller.signal);
   });
 
   it('MessageGetReactions delegates to getMessageReactions', async () => {
@@ -250,6 +351,44 @@ describe('messageTools', () => {
     expect(out).toEqual({ id: 'm1' });
   });
 
+  // The REST send-template body takes the same linkPreview as send-text, and the service hands it on to the send:
+  // without the field an agent could neither ask Baileys for a preview nor switch the whatsapp-web.js one off.
+  it.each([true, false])('MessageSendTemplate forwards linkPreview: %s', async linkPreview => {
+    const sendTemplate = jest.fn().mockResolvedValue({ id: 'm1' });
+    const tools = makeTools({ sendTemplate } as unknown as MessageService);
+    await run(tools.get('MessageSendTemplate')!, {
+      sessionId: 's1',
+      chatId: '628111@c.us',
+      templateName: 'welcome',
+      linkPreview,
+    });
+    expect(sendTemplate).toHaveBeenCalledWith('s1', expect.objectContaining({ templateName: 'welcome', linkPreview }));
+  });
+
+  it('MessageSendTemplate leaves linkPreview out of the call when it is unset', async () => {
+    const sendTemplate = jest.fn().mockResolvedValue({ id: 'm1' });
+    const tools = makeTools({ sendTemplate } as unknown as MessageService);
+    await run(tools.get('MessageSendTemplate')!, { sessionId: 's1', chatId: '628111@c.us', templateName: 'welcome' });
+    const dto = (sendTemplate.mock.calls[0] as [string, Record<string, unknown>])[1];
+    expect(Object.keys(dto)).not.toContain('linkPreview');
+  });
+
+  it('MessageSendTemplate refuses a linkPreview that is not a boolean', async () => {
+    const sendTemplate = jest.fn();
+    const tools = makeTools({ sendTemplate } as unknown as MessageService);
+    await expect(
+      run(tools.get('MessageSendTemplate')!, {
+        sessionId: 's1',
+        chatId: '628111@c.us',
+        templateName: 'welcome',
+        linkPreview: 'false',
+      }),
+    ).rejects.toMatchObject({
+      response: { message: [expect.stringContaining('linkPreview') as unknown as string] },
+    });
+    expect(sendTemplate).not.toHaveBeenCalled();
+  });
+
   it('MessageReply delegates to reply', async () => {
     const reply = jest.fn().mockResolvedValue({ id: 'm2' });
     const tools = makeTools({ reply } as unknown as MessageService);
@@ -311,6 +450,24 @@ describe('messageTools', () => {
     expect(sendText).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['MessageSendText', { text: 'hi' }],
+    ['MessageSendLocation', { latitude: 1, longitude: 2 }],
+    ['MessageReact', { messageId: 'm1', emoji: '👍' }],
+  ])('%s refuses a chat id that is no JID before the service sees it', async (name, rest) => {
+    // The tool calls the service directly, so no ValidationPipe holds the rule for it; an id the engine
+    // cannot decode otherwise ends as a 500 and counts against the session's send breaker.
+    const service = { sendText: jest.fn(), sendLocation: jest.fn(), reactToMessage: jest.fn() };
+    const tools = makeTools(service as unknown as MessageService);
+
+    await expect(run(tools.get(name)!, { sessionId: 's1', chatId: '6281270008896', ...rest })).rejects.toMatchObject({
+      response: { message: [expect.stringContaining('localpart@host') as unknown as string] },
+    });
+    expect(service.sendText).not.toHaveBeenCalled();
+    expect(service.sendLocation).not.toHaveBeenCalled();
+    expect(service.reactToMessage).not.toHaveBeenCalled();
+  });
+
   it('forwards a caller-supplied link preview, and enforces the title WhatsApp requires', async () => {
     // REST declares customLinkPreview; the tool did not, so an agent's object was stripped before the
     // handler ran and the send went out with whatever preview the engine chose on its own.
@@ -339,6 +496,34 @@ describe('messageTools', () => {
         chatId: '628111@c.us',
         text: 'see https://example.com/launch',
         customLinkPreview: { url: 'https://example.com/launch' },
+      }),
+    ).rejects.toBeDefined();
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it('forwards a preview image, and refuses an image URL that is not http(s)', async () => {
+    const sendText = jest.fn().mockResolvedValue({ id: 'm1' });
+    const tools = makeTools({ sendText } as unknown as MessageService);
+    const preview = { url: 'https://example.com/launch', title: 'We just launched' };
+
+    await run(tools.get('MessageSendText')!, {
+      sessionId: 's1',
+      chatId: '628111@c.us',
+      text: 'see https://example.com/launch',
+      customLinkPreview: { ...preview, thumbnailUrl: 'https://cdn.example/a.jpg' },
+    });
+    expect(sendText).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ customLinkPreview: { ...preview, thumbnailUrl: 'https://cdn.example/a.jpg' } }),
+    );
+
+    sendText.mockClear();
+    await expect(
+      run(tools.get('MessageSendText')!, {
+        sessionId: 's1',
+        chatId: '628111@c.us',
+        text: 'see https://example.com/launch',
+        customLinkPreview: { ...preview, thumbnailUrl: 'file:///etc/passwd' },
       }),
     ).rejects.toBeDefined();
     expect(sendText).not.toHaveBeenCalled();
@@ -379,6 +564,42 @@ describe('messageTools', () => {
       url: 'http://media_server:8080/a.jpg',
     });
     expect(sendImage).toHaveBeenCalledWith('s1', expect.objectContaining({ url: 'http://media_server:8080/a.jpg' }));
+  });
+
+  describe.each([
+    ['MessageSendImage', 'sendImage'],
+    ['MessageSendVideo', 'sendVideo'],
+    ['MessageSendAudio', 'sendAudio'],
+    ['MessageSendDocument', 'sendDocument'],
+    ['MessageSendSticker', 'sendSticker'],
+  ])('%s url next to base64', (toolName, method) => {
+    const call = (extra: Record<string, unknown>) => {
+      const send = jest.fn().mockResolvedValue({ id: 'm1' });
+      const tools = makeTools({ [method]: send } as unknown as MessageService);
+      const result = run(tools.get(toolName)!, { sessionId: 's1', chatId: '628111@c.us', ...extra });
+      return { send, result };
+    };
+
+    it.each([
+      ['an empty url', ''],
+      ['a url that is not http(s)', 'ftp://example.com/a.bin'],
+    ])('sends the base64 and ignores %s, as the REST route does', async (_label, url) => {
+      const { send, result } = call({ url, base64: 'QUJD', mimetype: 'application/octet-stream' });
+      await result;
+      expect(send).toHaveBeenCalledWith('s1', expect.objectContaining({ url, base64: 'QUJD' }));
+    });
+
+    it.each([
+      ['no base64', undefined],
+      ['an empty base64', ''],
+      ['a base64 that is only a data-URI prefix', 'data:image/png;base64,'],
+    ])('still rejects a url that is not http(s) next to %s', async (_label, base64) => {
+      const { send, result } = call({ url: 'ftp://example.com/a.bin', base64 });
+      await expect(result).rejects.toMatchObject({
+        response: { message: [expect.stringContaining('url: ') as unknown as string] },
+      });
+      expect(send).not.toHaveBeenCalled();
+    });
   });
 
   it('MessageForward delegates to forward', async () => {

@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { IsArray, IsObject, IsString, IsUrl } from 'class-validator';
 import type { PluginConfigSchema, PluginI18n } from '../../../core/plugins';
 import { PluginType, PluginStatus } from '../../../core/plugins';
+import { ToStrictArray, ToStrictString } from '../../../common/utils/strict-boolean';
 
 export class PluginDto {
   @ApiProperty({ description: 'Plugin ID' })
@@ -77,6 +78,7 @@ export class PluginSessionsDto {
     example: ['*'],
     type: [String],
   })
+  @ToStrictArray()
   @IsArray()
   @IsString({ each: true })
   sessions!: string[];
@@ -86,13 +88,22 @@ export class InstallFromUrlDto {
   @ApiProperty({
     description:
       'URL of the plugin .zip to download and install (SSRF-guarded; private-network hosts remain ' +
-      'subject to the guard). https:// is accepted as-is. Plain http:// is only accepted when the URL ' +
+      'subject to the guard). https:// is accepted without a pin, except that NODE_ENV=production (the ' +
+      'Docker image default) requires the `#sha256=` pin described below on every URL unless ' +
+      'PLUGIN_INSTALL_REQUIRE_PIN=false, and PLUGIN_INSTALL_REQUIRE_PIN=true requires it everywhere. ' +
+      'Plain http:// is only accepted when the URL ' +
       'pins the package content — append `#sha256=<64 hex>` (fragment — never sent to the server; query ' +
       'params are ignored) — because the package is executable code and must be integrity-protected in ' +
       'transit. A pinned digest that does not match the downloaded archive fails the install.',
   })
+  @ToStrictString()
   @IsString()
-  @IsUrl({ protocols: ['http', 'https'], require_protocol: true }, { message: 'url must be an absolute http(s) URL' })
+  // require_tld:false + allow_underscores:true so single-label hosts (a compose service, `localhost`) reach
+  // the SSRF guard, which admits them only when SSRF_ALLOWED_HOSTS names them.
+  @IsUrl(
+    { protocols: ['http', 'https'], require_protocol: true, require_tld: false, allow_underscores: true },
+    { message: 'url must be an absolute http(s) URL' },
+  )
   url!: string;
 }
 

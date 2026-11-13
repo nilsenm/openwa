@@ -52,6 +52,9 @@ import { PageHeader } from '../components/PageHeader';
 import { CustomSelect } from '../components/CustomSelect';
 import { Modal } from '../components/Modal';
 import './Sessions.css';
+import { formatLastActive, formatSessionStatus } from '../utils/sessionDisplay';
+import { normalizePhoneText } from '../utils/phone';
+import { isComposingKey } from '../utils/composition';
 
 /**
  * The hover title for a restriction: the engine's own cause token, plus when enforcement ends if
@@ -66,24 +69,69 @@ function restrictionTitle(restriction: AccountRestriction, t: TFunction): string
   return parts.join(' · ');
 }
 
+/**
+ * The restriction row of a session card. Shared by both card layouts: a restriction can arrive on a
+ * session that is not linked yet (WhatsApp asking for a passkey while the card still shows its QR), and
+ * the pairing placeholder is the layout that session has.
+ */
+function RestrictionRow({ restriction, t }: { restriction: AccountRestriction; t: TFunction }) {
+  return (
+    <div className="info-row session-restriction">
+      <span className="info-label">{t('sessions.card.restriction')}</span>
+      <span className="info-value restriction-text" title={restrictionTitle(restriction, t)}>
+        {t(`sessions.restriction.${restriction.kind}`)}
+      </span>
+    </div>
+  );
+}
+
+// How long the list reads that pushes ask for are held so that the pushes around them share one read.
+const PUSHED_READ_WINDOW_MS = 250;
+
+// The most digits a phone number has. A longer paste is kept whole and refused, never cut to a number nobody typed.
+const PAIRING_PHONE_MAX_DIGITS = 15;
+// What a number may be written with besides its digits: a plus, spaces (a no-break space included), hyphens, dots and
+// parentheses. The plus comes first, but may follow an opening parenthesis, as in "(+62) 812-3456-7890".
+const PHONE_FORMATTING = /^[\s(]*\+?[\d\s().-]*$/;
+// A number written that way is read to its digits. Any other text (a letter, an extension, a sentence around the
+// number) is kept as pasted and refused, since joining its digit groups would make a number nobody typed.
+const readPairingPhone = (text: string) => {
+  const normalized = normalizePhoneText(text);
+  return PHONE_FORMATTING.test(normalized.trim()) ? normalized.replace(/\D/g, '') : normalized;
+};
+const pairingPhoneRefused = (text: string) => {
+  const normalized = normalizePhoneText(text);
+  return !PHONE_FORMATTING.test(normalized.trim()) || normalized.replace(/\D/g, '').length > PAIRING_PHONE_MAX_DIGITS;
+};
+
 export function Sessions() {
   const { t } = useTranslation();
   useDocumentTitle(t('sessions.title'));
   const toast = useToast();
-  const { canWrite } = useRole();
+  const { canWrite, isAdmin, scoped } = useRole();
+  // Creating a session and changing its proxy are refused for any session-scoped key, whatever its role.
+  const canCreate = canWrite && !scoped;
+  const canEditProxy = isAdmin && !scoped;
   const queryClient = useQueryClient();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   // The full-page spinner belongs to the FIRST load only (see fetchSessions).
   const initialLoadDone = useRef(false);
   const [error, setError] = useState<string | null>(null);
+  // Whether the last list read failed. `error` also carries a refused create, which says nothing about the list.
+  const [listFailed, setListFailed] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
-  const [selectedSession, setSelectedSession] = useState<Session | null>(null);
+  // Only the id: the detail modal renders the row as it is in `sessions` now, so a status push or a
+  // list read shows there too, and a row that is gone closes it.
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const selectedSession = selectedSessionId ? (sessions.find(s => s.id === selectedSessionId) ?? null) : null;
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [killConfirmId, setKillConfirmId] = useState<string | null>(null);
   const [unlinkConfirmId, setUnlinkConfirmId] = useState<string | null>(null);
   const [unlinkingId, setUnlinkingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [killingId, setKillingId] = useState<string | null>(null);
   // Sessions whose Start or Reconnect click is still being handled. A start can wait seconds before its
   // engine exists, and a second click in that window is refused as "already starting" while the first
   // one proceeds.
@@ -91,7 +139,9 @@ export function Sessions() {
   // Session config is not on the list payload — the API never returns the config column, so it is
   // fetched per session when the detail modal opens rather than N times to render the list.
   const [sessionConfig, setSessionConfig] = useState<SessionConfig | null>(null);
-  const [savingConfig, setSavingConfig] = useState(false);
+  // Ids of sessions with an auto-reject save in flight. Per session, because Close stays enabled while
+  // one saves: the modal reopened for that session must stay locked, and another session's must not.
+  const [savingConfigIds, setSavingConfigIds] = useState<ReadonlySet<string>>(new Set());
   const [proxySession, setProxySession] = useState<Session | null>(null);
   const [proxyInfo, setProxyInfo] = useState<SessionProxy | null>(null);
   const [proxyLoading, setProxyLoading] = useState(false);
@@ -106,22 +156,66 @@ export function Sessions() {
   // Set while the last list read failed. Cleared as a read starts, so a connect that already triggered
   // a reload (onReconnect) is not followed by a second read from the recovery effect below.
   const listReadFailed = useRef(false);
+  // The wait, in ms, the last failed read was told to observe (Retry-After on a throttled read).
+  const listRetryAfterMs = useRef(0);
   // Spends the one retry the recovery effect below is allowed per connect. Given back by a read that
   // actually succeeded, so a later independent failure on the same connection is retried too.
   const retriedThisConnect = useRef(false);
+  // List reads overlap (every status push that needs server fields starts one) and can answer out of
+  // order, and a read is a snapshot from before any row the page wrote while it was in flight. So a
+  // read is applied only if no newer read has been applied and no row was written since it started;
+  // `rowWrites` counts those writes. A read that loses to a write is sent again, unless a newer read
+  // is already on its way, so what it would have brought (a restriction, the rows after a socket gap)
+  // still arrives. A read dropped for a newer applied one returns the rows the page holds; one dropped
+  // while a newer read is in flight answers with that read (`latestList`), so a caller deciding on
+  // server fields (the disconnect handler's engine check) never decides on rows a push wrote.
+  const listRequest = useRef(0);
+  const listApplied = useRef(0);
+  const rowWrites = useRef(0);
+  const latestList = useRef<Promise<Session[]>>(Promise.resolve([]));
+  // The read the pushes of the current window share (see readForPush), until it is sent.
+  const pushedRead = useRef<{ rows: Promise<Session[]>; timer: ReturnType<typeof setTimeout> } | null>(null);
 
-  const fetchSessions = useCallback(async (): Promise<Session[]> => {
+  // Mirror the latest sessions in a ref so the WS handler can compare against the current status without
+  // depending on `sessions` (which would churn the callback identity and re-subscribe the socket). Every
+  // writer moves the ref in the same tick as its setState (a list read directly, row writes through
+  // `updateSessions`), so a push handled before React re-renders sees what the last write produced. No
+  // effect copies `sessions` back in: one flushing after such a push would move the ref to an older list.
+  const sessionsRef = useRef<Session[]>([]);
+  // A row write: applied to the ref now, and to state as a functional update, so it builds on every
+  // write queued before it instead of replacing the list with an older copy.
+  const updateSessions = useCallback((update: (list: Session[]) => Session[]) => {
+    sessionsRef.current = update(sessionsRef.current);
+    setSessions(update);
+  }, []);
+
+  const readSessions = useCallback(async (): Promise<Session[]> => {
     listReadFailed.current = false;
+    let request = 0;
     try {
       // Background refetches — a websocket push, a mutation reloading the list — would otherwise
       // replace the whole page with a spinner for the length of a round-trip, so a restriction
       // arriving on a live page reads as a full reload.
       if (!initialLoadDone.current) setLoading(true);
-      const data = await sessionApi.list();
+      let data: Session[];
+      for (;;) {
+        request = ++listRequest.current;
+        const writes = rowWrites.current;
+        data = await sessionApi.list();
+        if (request < listApplied.current) return sessionsRef.current;
+        if (rowWrites.current === writes) break;
+        // Only the most recently started read can hold the newest request, so this is never itself.
+        if (request !== listRequest.current) return latestList.current;
+        // A read pushes have queued since is sent after that write, so it brings what this one would have.
+        if (pushedRead.current) return pushedRead.current.rows;
+      }
+      listApplied.current = request;
+      sessionsRef.current = data;
       setSessions(data);
       // The list is current again, so an error left by an earlier failed read (or a create, whose toast
       // already reported it) no longer describes the page, and the recovery retry is available again.
       setError(null);
+      setListFailed(false);
       retriedThisConnect.current = false;
       // Keep the shared React Query cache (read by the Dashboard via useSessionsQuery /
       // useSessionStatsQuery) in sync after this page's mutations reload local state — otherwise the
@@ -133,22 +227,33 @@ export function Sessions() {
       void invalidateSessionQueries(queryClient, queryKeys.sessions);
       return data;
     } catch (err) {
+      // A failure older than a read already applied says nothing about the list on screen.
+      if (request < listApplied.current) return sessionsRef.current;
       listReadFailed.current = true;
+      listRetryAfterMs.current = ((err as { retryAfterSeconds?: number }).retryAfterSeconds ?? 0) * 1000;
       setError(err instanceof Error ? err.message : t('sessions.create.errorDefault'));
+      setListFailed(true);
       return [];
     } finally {
       initialLoadDone.current = true;
       setLoading(false);
     }
   }, [t, queryClient]);
-
-  // Mirror the latest sessions in a ref so the WS handler can compare against the current status without
-  // depending on `sessions` (which would churn the callback identity and re-subscribe the socket). Kept
-  // in sync with every state update (fetch / create / delete / WS) via the effect below.
-  const sessionsRef = useRef<Session[]>([]);
-  useEffect(() => {
-    sessionsRef.current = sessions;
-  }, [sessions]);
+  const fetchSessions = useCallback(() => (latestList.current = readSessions()), [readSessions]);
+  // A push needs only the server fields of a read that starts after it, so the pushes of one window share a read
+  // sent when the window closes. One read per push sent a burst (every session coming back after a network drop)
+  // past the gateway's limit on this route, 10 reads a second per client, and the newest read was the one refused.
+  const readForPush = useCallback((): Promise<Session[]> => {
+    if (!pushedRead.current) {
+      let timer!: ReturnType<typeof setTimeout>;
+      const rows = new Promise<void>(resolve => (timer = setTimeout(resolve, PUSHED_READ_WINDOW_MS))).then(() => {
+        pushedRead.current = null;
+        return fetchSessions();
+      });
+      pushedRead.current = { rows, timer };
+    }
+    return pushedRead.current.rows;
+  }, [fetchSessions]);
 
   const {
     qrData,
@@ -183,10 +288,18 @@ export function Sessions() {
     onCreated: newSession => {
       // Functional append: never capture a stale `sessions` (a WS or fetch between the await and the
       // setState would otherwise drop a row). Then invalidate the prefix so stats/groups/chats refresh.
-      setSessions(current => [...current, newSession]);
+      rowWrites.current += 1;
+      updateSessions(current => [...current, newSession]);
+      // A refused earlier attempt left its message in the banner; nothing re-reads the list after a
+      // create, so clear it here. A failed list read keeps its banner.
+      if (!listReadFailed.current) setError(null);
       void invalidateSessionQueries(queryClient, queryKeys.sessions);
     },
-    onFailed: msg => setError(msg),
+    // The hook's toast reports the refusal; a failed list read keeps the banner, since it still
+    // describes the list on screen.
+    onFailed: msg => {
+      if (!listReadFailed.current) setError(msg);
+    },
   });
 
   // Reconcile the LOCAL view with an authoritative Session response. The previous handlers discarded
@@ -198,13 +311,12 @@ export function Sessions() {
   // disconnected session's stale code.
   const applySessionResponse = useCallback(
     async (updated: Session) => {
-      sessionsRef.current = replaceSession(sessionsRef.current, updated);
-      setSessions(sessionsRef.current);
-      setSelectedSession(current => (current?.id === updated.id ? updated : current));
+      rowWrites.current += 1;
+      updateSessions(current => replaceSession(current, updated));
       dismissQrForSession(updated.id);
       await reconcileSessionCache(queryClient, queryKeys.sessions, updated);
     },
-    [queryClient, dismissQrForSession],
+    [queryClient, dismissQrForSession, updateSessions],
   );
 
   // A restriction push and a recovered socket mean the same thing to this page: the local list may be
@@ -212,8 +324,8 @@ export function Sessions() {
   // `session.restriction`, and a restriction can arrive with no status transition at all, because the
   // Baileys reachout timelock rides a connect probe, so that push is purely a refetch signal.)
   const refetchSessions = useCallback(() => {
-    void fetchSessions();
-  }, [fetchSessions]);
+    void readForPush();
+  }, [readForPush]);
 
   const { isConnected, connectionFailed, reconnect } = useSessionFeed({
     sessions,
@@ -227,24 +339,30 @@ export function Sessions() {
       (event: { sessionId: string; status: string }) => {
         const prev = sessionsRef.current.find(s => s.id === event.sessionId);
         // Some engines double-signal one transition; only react to an ACTUAL status change so the toast
-        // and the failed-refresh don't fire on every redundant envelope. Update the ref synchronously so
-        // a duplicate arriving in the same tick (before the sync effect runs) is also caught.
+        // and the failed-refresh don't fire on every redundant envelope. `updateSessions` moves the ref
+        // synchronously, so a duplicate arriving before React re-renders is also caught.
         if (prev && prev.status === event.status) return;
+        // A push for a row the page does not hold yet changes nothing, so it must not void the read
+        // that is about to bring that row (the mount read, before any row is on screen).
+        if (prev) rowWrites.current += 1;
         // Drop `engineLoaded` alongside the status patch: it is server-owned live state the status
         // envelope does not carry, so keeping the previous value would pair a fresh status with a
         // stale engine answer and the card could offer Start to a running session (or Unlink to one
         // with no engine). Clearing it makes isSessionStarted fall back to the status set until an
         // authoritative response arrives — and for `disconnected`, where that fallback is knowingly
         // wrong, the branch below refetches.
-        sessionsRef.current = sessionsRef.current.map(s =>
-          s.id === event.sessionId ? { ...s, status: event.status as Session['status'], engineLoaded: undefined } : s,
+        updateSessions(current =>
+          current.map(s =>
+            s.id === event.sessionId ? { ...s, status: event.status as Session['status'], engineLoaded: undefined } : s,
+          ),
         );
-        setSessions(sessionsRef.current);
         // Mark the shared session queries stale so sibling views refetch — but ONLY on a real
         // transition (the dedup guard above already swallows the redundant double-signals, so this
         // does not re-invalidate on duplicate envelopes).
         void invalidateSessionQueries(queryClient, queryKeys.sessions);
         if (event.status === 'ready') {
+          // Refresh so the card picks up the phone and lastActive the gateway writes on READY.
+          void readForPush();
           toast.success(t('sessions.toasts.readyTitle'), t('sessions.toasts.readyDesc'));
         } else if (event.status === 'disconnected') {
           // Refresh so the card picks up `engineLoaded` from the API. `disconnected` is the one status
@@ -256,7 +374,7 @@ export function Sessions() {
           // first: scanning it cannot work, and the modal shows its loading state until the session
           // is back at `qr_ready` with a fresh one.
           clearQrCodeForSession(event.sessionId);
-          void fetchSessions().then(rows => {
+          void readForPush().then(rows => {
             if (rows.find(s => s.id === event.sessionId)?.engineLoaded === false) {
               // Only if nothing arrived while the answer was in flight: a reconnect that completed
               // in that window has already pushed a fresh code into the modal blanked above, and
@@ -267,22 +385,29 @@ export function Sessions() {
           toast.warning(t('sessions.toasts.disconnectedTitle'), t('sessions.toasts.disconnectedDesc'));
         } else if (event.status === 'action_required') {
           // Refresh so the card picks up the lastError reason (what the operator must do) from the API.
-          void fetchSessions();
+          void readForPush();
           toast.warning(t('sessions.toasts.actionRequiredTitle'), t('sessions.toasts.actionRequiredDesc'));
         } else if (event.status === 'failed') {
           // Refresh so the card picks up the lastError reason from the API. Every FAILED write evicts the
           // engine, so an open QR modal for this session can never show a code: close it, uncovering the card.
-          void fetchSessions();
+          void readForPush();
           dismissQrForSession(event.sessionId);
           toast.error(t('sessions.toasts.failedTitle'), t('sessions.toasts.failedDesc'));
+        } else if (event.status === 'initializing' && prev?.status === 'qr_ready') {
+          // The wait to be linked ended with its connection (on Baileys also a pairing code left unused for five
+          // minutes), and the session registers again with a new QR. Neither the QR nor a pairing code on screen can
+          // link any more. From authenticating the code was used, and the modal closes on the ready that follows.
+          clearQrCodeForSession(event.sessionId);
         }
       },
-      [toast, t, fetchSessions, queryClient, dismissQrForSession, clearQrCodeForSession],
+      [toast, t, readForPush, queryClient, dismissQrForSession, clearQrCodeForSession, updateSessions],
     ),
   });
 
   useEffect(() => {
     fetchSessions();
+    // A read still waiting for its window goes with the page, so nothing reads the list for a page that is gone.
+    return () => clearTimeout(pushedRead.current?.timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -293,24 +418,39 @@ export function Sessions() {
   // only once per connect: failures whose messages differ (a 502, then a 504) would otherwise each
   // change `error` and re-read the list with no backoff for as long as the upstream stays down. The
   // allowance (declared with `listReadFailed` above) is given back by a successful read, so the loop
-  // stays closed while a later failure on the same connection is still retried.
+  // stays closed while a later failure on the same connection is still retried. A refused read names its wait
+  // (Retry-After), and a retry sent sooner is refused in the same window, so the retry waits it out. It goes through
+  // readForPush, so it shares the read a connect's onReconnect has queued instead of adding one.
   useEffect(() => {
     if (!isConnected) {
       retriedThisConnect.current = false;
       return;
     }
-    if (listReadFailed.current && !retriedThisConnect.current) {
-      retriedThisConnect.current = true;
-      void fetchSessions();
-    }
-  }, [isConnected, error, fetchSessions]);
+    if (!listReadFailed.current || retriedThisConnect.current) return;
+    retriedThisConnect.current = true;
+    let asked = false;
+    const timer = setTimeout(() => {
+      asked = true;
+      void readForPush();
+    }, listRetryAfterMs.current);
+    // Cleared before it asked (another failure changed `error`, or the page closed), the retry is not spent.
+    return () => {
+      clearTimeout(timer);
+      if (!asked) retriedThisConnect.current = false;
+    };
+  }, [isConnected, error, readForPush]);
 
   const handleDelete = async (id: string) => {
+    // The confirm modal stays open until the request answers, so a double-click would delete twice and
+    // report the second, failed delete after the first one's success.
+    if (deletingId) return;
+    setDeletingId(id);
     const session = sessions.find(s => s.id === id);
     try {
       await sessionApi.delete(id);
       // Functional removal (no stale `sessions` capture), then invalidate the prefix.
-      setSessions(current => current.filter(s => s.id !== id));
+      rowWrites.current += 1;
+      updateSessions(current => current.filter(s => s.id !== id));
       await invalidateSessionQueries(queryClient, queryKeys.sessions);
       toast.success(
         t('sessions.delete.successTitle'),
@@ -323,6 +463,7 @@ export function Sessions() {
       console.error('Failed to delete:', err);
       toast.error(t('sessions.delete.errorTitle'), msg);
     } finally {
+      setDeletingId(null);
       setDeleteConfirmId(null);
     }
   };
@@ -338,7 +479,8 @@ export function Sessions() {
       // from before the start, which now includes `engineLoaded` and would leave the card offering
       // Start for a session that just acquired an engine.
       const started = await sessionApi.start(id);
-      setSessions(current => replaceSession(current, started));
+      rowWrites.current += 1;
+      updateSessions(current => replaceSession(current, started));
       // A 200 does not promise the engine is still there when the list is read back: a concurrent stop
       // retires the start, and an engine can fail right after answering. Skip the modal when the re-read
       // shows the session without one. A failed re-read gives no answer, so the start's success decides.
@@ -346,9 +488,10 @@ export function Sessions() {
       // A session that came back already linked has nothing to scan. Decided from the re-read rather
       // than left to handleShowQR's own guard, which reads the sessions state this render still
       // holds: that state predates both the start response and the re-read, so it would let the
-      // modal open over a connected session and then poll for a QR that can never arrive.
+      // modal open over a connected session and then poll for a QR that can never arrive. A stopped session keeps
+      // its link, and a start answers before the engine connects, so `initializing` with a phone is linked too.
       if (row?.status === 'ready') return;
-      if (!row || isSessionStarted(row)) handleShowQR(id);
+      if (!row || (isSessionStarted(row) && awaitsPairing(row))) handleShowQR(id);
     } catch (err) {
       console.error('Failed to start:', err);
       // A credential teardown for this name is still settling — the backend fails closed with 409 +
@@ -368,7 +511,7 @@ export function Sessions() {
       const fresh = await fetchSessions();
       const current = fresh.find(s => s.id === id);
       if (current && isSessionStarted(current)) {
-        if (current.status !== 'ready') handleShowQR(id);
+        if (awaitsPairing(current)) handleShowQR(id);
         return;
       }
       // The answer to this request, not the row's lastError: that is shown on the card, and it can be the
@@ -387,9 +530,11 @@ export function Sessions() {
   };
 
   // Load the config when the detail modal opens and drop it when it closes, so a value fetched for
-  // one session can never render against another.
-  const selectedSessionId = selectedSession?.id ?? null;
+  // one session can never render against another. A toggle's answer checks `configSessionId` for the
+  // same reason: Close stays enabled while it saves, so another session's modal may be open by then.
+  const configSessionId = useRef<string | null>(null);
   useEffect(() => {
+    configSessionId.current = selectedSessionId;
     setSessionConfig(null);
     if (!selectedSessionId) return;
     let cancelled = false;
@@ -409,23 +554,34 @@ export function Sessions() {
 
   const handleAutoRejectToggle = async (next: boolean) => {
     if (!selectedSessionId || !sessionConfig) return;
+    const id = selectedSessionId;
     const previous = sessionConfig;
     setSessionConfig({ ...sessionConfig, autoRejectCalls: next });
-    setSavingConfig(true);
+    setSavingConfigIds(current => new Set(current).add(id));
     try {
-      setSessionConfig(await sessionApi.updateConfig(selectedSessionId, { autoRejectCalls: next }));
+      const saved = await sessionApi.updateConfig(id, { autoRejectCalls: next });
+      if (configSessionId.current === id) setSessionConfig(saved);
     } catch (err) {
       // Revert: an optimistic toggle left flipped would tell the operator calls are being rejected
       // when the gateway never accepted the change.
-      setSessionConfig(previous);
+      if (configSessionId.current === id) setSessionConfig(previous);
       toast.error(t('sessions.details.autoRejectCalls'), err instanceof Error ? err.message : t('common.unknownError'));
     } finally {
-      setSavingConfig(false);
+      setSavingConfigIds(current => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
     }
   };
 
   const proxySessionId = proxySession?.id ?? null;
+  // Cancel stays enabled while a save runs, so a save that answers after its modal closed must neither
+  // close nor unlock whichever proxy modal is open by then.
+  const proxyVisit = useRef(0);
   useEffect(() => {
+    proxyVisit.current += 1;
+    setProxySaving(false);
     setProxyInfo(null);
     setProxyEnabled(false);
     setProxyUrl('');
@@ -452,6 +608,7 @@ export function Sessions() {
       });
     return () => {
       cancelled = true;
+      proxyVisit.current += 1;
     };
     // Only the session being edited belongs in here. `t` and `toast` are recreated on every render of
     // their providers (ToastContext hands out a fresh object literal), so listing them re-runs this
@@ -473,12 +630,14 @@ export function Sessions() {
       }
     }
     setProxyUrlError(null);
+    const id = proxySession.id;
+    const visit = proxyVisit.current;
     setProxySaving(true);
     try {
       if (!proxyEnabled) {
-        await sessionApi.updateProxy(proxySession.id, { proxyUrl: null });
+        await sessionApi.updateProxy(id, { proxyUrl: null });
       } else if (proxyUrl.trim()) {
-        await sessionApi.updateProxy(proxySession.id, { proxyUrl: proxyUrl.trim() });
+        await sessionApi.updateProxy(id, { proxyUrl: proxyUrl.trim() });
       } else if (proxyInfo?.enabled) {
         setProxySession(null);
         return;
@@ -486,11 +645,11 @@ export function Sessions() {
         return;
       }
       toast.success(t('sessions.proxy.saveSuccessTitle'), t('sessions.proxy.saveSuccess'));
-      setProxySession(null);
+      if (proxyVisit.current === visit) setProxySession(null);
     } catch (err) {
       toast.error(t('sessions.proxy.saveError'), err instanceof Error ? err.message : t('common.unknownError'));
     } finally {
-      setProxySaving(false);
+      if (proxyVisit.current === visit) setProxySaving(false);
     }
   };
 
@@ -508,15 +667,26 @@ export function Sessions() {
   };
 
   const handleForceKill = async (id: string) => {
+    // Same double-click guard as handleDelete.
+    if (killingId) return;
+    setKillingId(id);
     try {
       const updated = await sessionApi.forceKill(id);
       await applySessionResponse(updated);
       toast.success(t('sessions.forceKill.successTitle'), t('sessions.forceKill.success'));
     } catch (err) {
       console.error('Failed to force-kill:', err);
-      toast.error(t('sessions.forceKill.failedTitle'), t('sessions.forceKill.failed'));
+      // 502 + SESSION_FORCE_KILL_INCOMPLETE: the session is stopped, but the engine process may still
+      // run. Show the gateway's guidance (restart the node). Any other error, a reverse-proxy 502
+      // without that code included, stays generic.
+      const incomplete = (err as { code?: string } | null)?.code === 'SESSION_FORCE_KILL_INCOMPLETE';
+      toast.error(
+        t('sessions.forceKill.failedTitle'),
+        incomplete && err instanceof Error && err.message ? err.message : t('sessions.forceKill.failed'),
+      );
       await fetchSessions();
     } finally {
+      setKillingId(null);
       setKillConfirmId(null);
     }
   };
@@ -535,11 +705,16 @@ export function Sessions() {
       // The error response carries no Session body, so re-fetch authoritative state regardless of
       // how we classify the toast — phone:null/status come from the list endpoint.
       await fetchSessions();
-      if (classifyUnlinkError(err) === 'incomplete') {
+      const kind = classifyUnlinkError(err);
+      if (kind === 'incomplete') {
         // 502 + SESSION_LOGOUT_INCOMPLETE — the session stopped locally but the unlink operation is
         // incomplete. Surface the server's specific message/retry guidance as a warning, not an error.
         const msg = err instanceof Error && err.message ? err.message : t('sessions.unlink.incomplete');
         toast.warning(t('sessions.unlink.incompleteTitle'), msg);
+      } else if (kind === 'notLinked') {
+        // 409: the session has no linked device, so there was nothing to unlink. The gateway's message says it was
+        // stopped and to start or delete it instead.
+        toast.error(t('sessions.unlink.failedTitle'), err instanceof Error ? err.message : t('sessions.unlink.failed'));
       } else {
         // A reverse-proxy 502 (bare or JSON without the exact code) may never have reached the
         // gateway, so nothing was stopped — generic failure, not retry guidance.
@@ -551,23 +726,19 @@ export function Sessions() {
     }
   };
 
-  const formatLastActive = (date?: string | null) => {
-    if (!date) return t('common.never');
-    const diff = Date.now() - new Date(date).getTime();
-    if (diff < 60000) return t('common.justNow');
-    if (diff < 3600000) return t('common.minAgo', { count: Math.floor(diff / 60000) });
-    return new Date(date).toLocaleDateString();
-  };
-
-  const formatStatus = (status: string) => t(`sessionStatus.${status}`, { defaultValue: status });
-
+  const pairingPhoneInvalid = pairingPhoneRefused(phoneNumber);
   const filteredSessions = filterSessions(sessions, searchQuery, statusFilter);
+  // A failed read says nothing about how many sessions there are: with none held, the banner is the only message.
+  const listUnknown = listFailed && sessions.length === 0;
   const existingSessionNames = sessions.map(s => s.name);
   // Empty is a disabled button, not a message: the form stays quiet until the user types something.
   const nameIssues = newSessionName ? sessionNameIssues(newSessionName, existingSessionNames) : [];
   // One term: isValidProxyUrl rejects '' too, so the emptiness check was redundant, and its
   // `string && boolean` shape widened this to `boolean | ""`, which the disabled prop rejects.
   const createProxyInvalid = useProxy && !isValidProxyUrl(createProxyUrl.trim());
+  // Shared by the Create button and the name field's Enter key, which would otherwise post a name
+  // the button refuses, or post the same name twice while the first create is in flight.
+  const createDisabled = creating || !canCreateSession(newSessionName, existingSessionNames) || createProxyInvalid;
 
   if (loading) {
     return (
@@ -586,7 +757,7 @@ export function Sessions() {
         title={t('sessions.title')}
         subtitle={t('sessions.subtitle')}
         actions={
-          canWrite && (
+          canCreate && (
             <button className="btn-primary" onClick={() => setShowCreateModal(true)}>
               <Plus size={18} />
               {t('sessions.newSession')}
@@ -630,6 +801,7 @@ export function Sessions() {
               { value: 'inactive', label: t('sessions.filter.inactive') },
               { value: 'connecting', label: t('sessions.filter.connecting') },
             ]}
+            ariaLabel={t('sessions.details.status')}
           />
         </div>
       </div>
@@ -640,7 +812,7 @@ export function Sessions() {
             background: 'rgba(239, 68, 68, 0.12)',
             padding: '1rem',
             borderRadius: '8px',
-            color: 'var(--error)',
+            color: 'var(--error-text)',
             marginBottom: '1rem',
           }}
         >
@@ -659,11 +831,7 @@ export function Sessions() {
               <button className="btn-secondary" onClick={() => setShowCreateModal(false)}>
                 {t('common.cancel')}
               </button>
-              <button
-                className="btn-primary"
-                onClick={handleCreate}
-                disabled={creating || !canCreateSession(newSessionName, existingSessionNames) || createProxyInvalid}
-              >
+              <button className="btn-primary" onClick={handleCreate} disabled={createDisabled}>
                 {creating ? <Loader2 className="animate-spin" size={16} /> : t('common.create')}
               </button>
             </>
@@ -679,43 +847,47 @@ export function Sessions() {
               const value = e.target.value.toLowerCase().replace(/\s+/g, '-');
               setNewSessionName(value);
             }}
-            onKeyDown={e => e.key === 'Enter' && handleCreate()}
+            onKeyDown={e => e.key === 'Enter' && !isComposingKey(e.nativeEvent) && !createDisabled && handleCreate()}
           />
           <p className="input-hint">
             <Trans i18nKey="sessions.create.hint" components={{ code: <code /> }} />
           </p>
           {nameIssues.includes('format') && <p className="input-error">{t('sessions.create.invalidChars')}</p>}
+          {nameIssues.includes('too-short') && <p className="input-error">{t('sessions.create.tooShort')}</p>}
           {nameIssues.includes('too-long') && (
             <p className="input-error">{t('sessions.create.tooLong', { length: newSessionName.length })}</p>
           )}
           {nameIssues.includes('duplicate') && <p className="input-error">{t('sessions.create.duplicate')}</p>}
-          <div className="proxy-form-section">
-            <label className="detail-toggle-row" htmlFor="create-use-proxy">
-              <span>{t('sessions.proxy.enabled')}</span>
-              <input
-                id="create-use-proxy"
-                type="checkbox"
-                checked={useProxy}
-                onChange={e => setUseProxy(e.target.checked)}
-              />
-            </label>
-            {useProxy && (
-              <>
-                <label htmlFor="create-proxy-url">{t('sessions.proxy.url')}</label>
+          {/* The API refuses proxyUrl from a key below ADMIN, so the section is not offered. */}
+          {canEditProxy && (
+            <div className="proxy-form-section">
+              <label className="detail-toggle-row" htmlFor="create-use-proxy">
+                <span>{t('sessions.proxy.enabled')}</span>
                 <input
-                  id="create-proxy-url"
-                  type="text"
-                  placeholder={t('sessions.proxy.urlPlaceholder')}
-                  value={createProxyUrl}
-                  onChange={e => setCreateProxyUrl(e.target.value)}
+                  id="create-use-proxy"
+                  type="checkbox"
+                  checked={useProxy}
+                  onChange={e => setUseProxy(e.target.checked)}
                 />
-                {createProxyInvalid && createProxyUrl.trim() && (
-                  <p className="input-error">{t('sessions.proxy.invalidUrl')}</p>
-                )}
-                <p className="input-hint">{t('sessions.proxy.createHint')}</p>
-              </>
-            )}
-          </div>
+              </label>
+              {useProxy && (
+                <>
+                  <label htmlFor="create-proxy-url">{t('sessions.proxy.url')}</label>
+                  <input
+                    id="create-proxy-url"
+                    type="text"
+                    placeholder={t('sessions.proxy.urlPlaceholder')}
+                    value={createProxyUrl}
+                    onChange={e => setCreateProxyUrl(e.target.value)}
+                  />
+                  {createProxyInvalid && createProxyUrl.trim() && (
+                    <p className="input-error">{t('sessions.proxy.invalidUrl')}</p>
+                  )}
+                  <p className="input-hint">{t('sessions.proxy.createHint')}</p>
+                </>
+              )}
+            </div>
+          )}
         </Modal>
       )}
 
@@ -754,6 +926,12 @@ export function Sessions() {
               </div>
             )}
 
+            {sessions.find(s => s.id === qrData.sessionId)?.restriction?.kind === 'passkey_required' ? (
+              <p className="qr-restriction-note" role="status">
+                {t('sessions.restriction.passkey_required_note')}
+              </p>
+            ) : null}
+
             {!pairingMode ? (
               // QR Code Content
               qrData.qrCode ? (
@@ -784,10 +962,9 @@ export function Sessions() {
               // Pairing Code Content
               <div className="pairing-container" role="tabpanel">
                 {pairingError && <div className="pairing-error">{pairingError}</div>}
-                {/* The guards behind this button check the session's state, never the number: a code
-                    requested for a number linked elsewhere has been seen to unlink that device on the
-                    whatsapp-web.js engine. Shown on both engines, since the page cannot tell which one
-                    a session runs without another round-trip, and the copy names the engine. */}
+                {/* On whatsapp-web.js a code requested for a number linked elsewhere has been seen to unlink
+                    that device. The gateway refuses a number another of its sessions holds, but it cannot
+                    know of a device linked outside it. The copy names the engine, so it is shown on both. */}
                 <div className="pairing-warning">{t('sessions.pairing.relinkWarning')}</div>
 
                 {!pairingCode ? (
@@ -800,12 +977,32 @@ export function Sessions() {
                       className="pairing-input"
                       type="tel"
                       inputMode="numeric"
-                      maxLength={15}
                       placeholder={t('sessions.pairing.phonePlaceholder')}
                       value={phoneNumber}
-                      onChange={e => setPhoneNumber(e.target.value.replace(/\D/g, ''))}
-                      onKeyDown={e => e.key === 'Enter' && handleGeneratePairingCode()}
+                      // A composition in progress is left as typed, since rewriting it garbles what the IME commits;
+                      // it is read when the composition ends. Pasted and directly typed text is read at once.
+                      // No native maxLength: it counts the separators of a pasted "+62 812-3456-7890" and cuts it
+                      // short. A paste of more than 15 digits, or with other characters, is kept and refused below.
+                      aria-invalid={pairingPhoneInvalid || undefined}
+                      aria-describedby={pairingPhoneInvalid ? 'pairing-phone-error' : undefined}
+                      onChange={e =>
+                        setPhoneNumber(
+                          (e.nativeEvent as InputEvent).isComposing ? e.target.value : readPairingPhone(e.target.value),
+                        )
+                      }
+                      onCompositionEnd={e => setPhoneNumber(readPairingPhone(e.currentTarget.value))}
+                      onKeyDown={e =>
+                        e.key === 'Enter' &&
+                        !isComposingKey(e.nativeEvent) &&
+                        !pairingPhoneInvalid &&
+                        handleGeneratePairingCode()
+                      }
                     />
+                    {pairingPhoneInvalid && (
+                      <p id="pairing-phone-error" className="input-error" role="alert">
+                        {t('sessions.pairing.invalidPhone')}
+                      </p>
+                    )}
                     <p className="input-hint" style={{ marginBottom: '1.5rem' }}>
                       {t('sessions.pairing.phoneHint')}
                     </p>
@@ -818,7 +1015,7 @@ export function Sessions() {
                       {requestingPairing ? (
                         <>
                           <Loader2 className="animate-spin" size={16} />
-                          <span style={{ marginLeft: '0.5rem' }}>{t('sessions.pairing.generating')}</span>
+                          <span style={{ marginInlineStart: '0.5rem' }}>{t('sessions.pairing.generating')}</span>
                         </>
                       ) : (
                         t('sessions.pairing.generateButton')
@@ -870,11 +1067,11 @@ export function Sessions() {
       {selectedSession && (
         <Modal
           open
-          onClose={() => setSelectedSession(null)}
+          onClose={() => setSelectedSessionId(null)}
           title={t('sessions.details.title')}
           closeLabel={t('common.close')}
           footer={
-            <button className="btn-secondary" onClick={() => setSelectedSession(null)}>
+            <button className="btn-secondary" onClick={() => setSelectedSessionId(null)}>
               {t('common.close')}
             </button>
           }
@@ -886,7 +1083,9 @@ export function Sessions() {
             </div>
             <div className="detail-item">
               <span className="detail-label">{t('sessions.details.status')}</span>
-              <span className={`status-badge ${selectedSession.status}`}>{formatStatus(selectedSession.status)}</span>
+              <span className={`status-badge ${selectedSession.status}`}>
+                {formatSessionStatus(t, selectedSession.status)}
+              </span>
             </div>
             <div className="detail-item">
               <span className="detail-label">{t('sessions.details.sessionId')}</span>
@@ -917,7 +1116,7 @@ export function Sessions() {
                       type="checkbox"
                       aria-labelledby="auto-reject-calls-label"
                       checked={sessionConfig.autoRejectCalls}
-                      disabled={!canWrite || savingConfig}
+                      disabled={!canWrite || savingConfigIds.has(selectedSession.id)}
                       onChange={e => void handleAutoRejectToggle(e.target.checked)}
                     />
                     <span className="toggle-slider"></span>
@@ -946,7 +1145,7 @@ export function Sessions() {
               <button className="btn-secondary" onClick={() => setProxySession(null)}>
                 {t('common.cancel')}
               </button>
-              {canWrite && !proxyLoadFailed && (
+              {canEditProxy && !proxyLoadFailed && (
                 <button
                   className="btn-primary"
                   onClick={() => void handleProxySave()}
@@ -996,7 +1195,7 @@ export function Sessions() {
                       type="checkbox"
                       aria-labelledby="proxy-enabled-label"
                       checked={proxyEnabled}
-                      disabled={!canWrite || proxySaving}
+                      disabled={!canEditProxy || proxySaving}
                       onChange={e => setProxyEnabled(e.target.checked)}
                     />
                     <span className="toggle-slider"></span>
@@ -1018,7 +1217,7 @@ export function Sessions() {
                           : t('sessions.proxy.urlPlaceholder')
                       }
                       value={proxyUrl}
-                      disabled={!canWrite || proxySaving}
+                      disabled={!canEditProxy || proxySaving}
                       onChange={e => {
                         setProxyUrl(e.target.value);
                         setProxyUrlError(null);
@@ -1046,7 +1245,11 @@ export function Sessions() {
               <button className="btn-secondary" onClick={() => setDeleteConfirmId(null)}>
                 {t('common.cancel')}
               </button>
-              <button className="btn-danger" onClick={() => handleDelete(deleteConfirmId)}>
+              <button
+                className="btn-danger"
+                onClick={() => handleDelete(deleteConfirmId)}
+                disabled={deletingId !== null}
+              >
                 {t('common.delete')}
               </button>
             </>
@@ -1075,7 +1278,11 @@ export function Sessions() {
               <button className="btn-secondary" onClick={() => setKillConfirmId(null)}>
                 {t('common.cancel')}
               </button>
-              <button className="btn-danger" onClick={() => handleForceKill(killConfirmId)}>
+              <button
+                className="btn-danger"
+                onClick={() => handleForceKill(killConfirmId)}
+                disabled={killingId !== null}
+              >
                 {t('sessions.forceKill.confirm')}
               </button>
             </>
@@ -1126,7 +1333,7 @@ export function Sessions() {
       )}
 
       <div className="sessions-grid">
-        {filteredSessions.length === 0 ? (
+        {filteredSessions.length === 0 && !listUnknown ? (
           <div className="empty-state">
             <QrCode size={48} />
             <h3>{t('sessions.empty.title')}</h3>
@@ -1137,25 +1344,32 @@ export function Sessions() {
             <div key={session.id} className="session-card">
               <div className="card-header">
                 <h3 title={session.name}>{session.name}</h3>
-                <span className={`status-pill ${session.status}`}>{formatStatus(session.status)}</span>
+                <span className={`status-pill ${session.status}`}>{formatSessionStatus(t, session.status)}</span>
               </div>
 
               {awaitsPairing(session) ? (
-                <div className="qr-placeholder">
-                  <QrCode size={80} className="qr-icon" />
-                  <p>{session.status === 'qr_ready' ? t('sessions.qr.scanToConnect') : t('sessions.qr.preparing')}</p>
-                  {/* The QR is operator-only over REST and the socket, so a read-only key would open a
+                <>
+                  <div className="qr-placeholder">
+                    <QrCode size={80} className="qr-icon" />
+                    <p>{session.status === 'qr_ready' ? t('sessions.qr.scanToConnect') : t('sessions.qr.preparing')}</p>
+                    {/* The QR is operator-only over REST and the socket, so a read-only key would open a
                       modal that never gets a code. */}
-                  {canWrite && (
-                    <button
-                      className="btn-sm"
-                      onClick={() => handleShowQR(session.id)}
-                      disabled={session.status !== 'qr_ready'}
-                    >
-                      {session.status === 'qr_ready' ? t('sessions.qr.showQr') : t('sessions.qr.loading')}
-                    </button>
-                  )}
-                </div>
+                    {canWrite && (
+                      <button
+                        className="btn-sm"
+                        onClick={() => handleShowQR(session.id)}
+                        disabled={session.status !== 'qr_ready'}
+                      >
+                        {session.status === 'qr_ready' ? t('sessions.qr.showQr') : t('sessions.qr.loading')}
+                      </button>
+                    )}
+                  </div>
+                  {session.restriction ? (
+                    <div className="session-info">
+                      <RestrictionRow restriction={session.restriction} t={t} />
+                    </div>
+                  ) : null}
+                </>
               ) : (
                 <div className="session-info">
                   <div className="info-row">
@@ -1168,7 +1382,7 @@ export function Sessions() {
                   </div>
                   <div className="info-row">
                     <span className="info-label">{t('sessions.card.lastActive')}</span>
-                    <span className="info-value">{formatLastActive(session.lastActive)}</span>
+                    <span className="info-value">{formatLastActive(t, session.lastActive)}</span>
                   </div>
                   {(session.status === 'failed' || session.status === 'action_required') && session.lastError ? (
                     <div className="info-row session-error">
@@ -1181,19 +1395,12 @@ export function Sessions() {
                   {/* Not gated on status, unlike the error above: a reachout timelock applies to a
                       session that is perfectly `ready`, and hiding it behind a status would make it
                       invisible exactly when the operator needs it. */}
-                  {session.restriction ? (
-                    <div className="info-row session-restriction">
-                      <span className="info-label">{t('sessions.card.restriction')}</span>
-                      <span className="info-value restriction-text" title={restrictionTitle(session.restriction, t)}>
-                        {t(`sessions.restriction.${session.restriction.kind}`)}
-                      </span>
-                    </div>
-                  ) : null}
+                  {session.restriction ? <RestrictionRow restriction={session.restriction} t={t} /> : null}
                 </div>
               )}
 
               <div className="card-actions">
-                <button className="btn-action" onClick={() => setSelectedSession(session)}>
+                <button className="btn-action" onClick={() => setSelectedSessionId(session.id)}>
                   <Eye size={16} />
                   {t('sessions.actions.view')}
                 </button>

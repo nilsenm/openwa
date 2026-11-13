@@ -1,5 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
-import { Callback } from 'puppeteer-core/lib/cjs/puppeteer/common/CallbackRegistry.js';
+import { execFile } from 'node:child_process';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { Client } from 'whatsapp-web.js';
 import configuration, { MAX_TIMER_MS } from '../../config/configuration';
 import { validateEnv } from '../../config/env.validation';
@@ -25,13 +27,20 @@ import { LabelNotFoundError } from '../../common/errors/label-not-found.error';
  * method name, with no `Protocol error (...)` prefix for the death pattern to match.
  */
 const puppeteerProtocolTimeoutMessage = async (): Promise<string> => {
-  const callback = new Callback(1, 'Runtime.callFunctionOn', 1);
-  try {
-    await callback.promise;
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error);
-  }
-  throw new Error('puppeteer-core did not reject on an expired protocolTimeout');
+  // Load the ESM dependency in Node, outside Jest's CommonJS module loader.
+  const { stdout } = await promisify(execFile)(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import { Callback } from 'puppeteer-core/internal/common/CallbackRegistry.js';
+       const callback = new Callback(1, 'Runtime.callFunctionOn', 1);
+       try { await callback.promise; throw new Error('protocolTimeout did not expire'); }
+       catch (error) { console.log(error.message); }`,
+    ],
+    { cwd: join(__dirname, '../../..'), encoding: 'utf8', timeout: 10_000 },
+  );
+  return stdout.trim();
 };
 
 /**
@@ -217,6 +226,41 @@ describe('a protocol timeout is a 503, never a not-found verdict', () => {
     const { host, reportIfPageTransportError } = makeHost({ [method]: jest.fn().mockRejectedValue(timeout) });
 
     await expect(call(host)).rejects.toBeInstanceOf(EngineTransportError);
+    expect(reportIfPageTransportError).not.toHaveBeenCalled();
+  });
+
+  // Mute and pin resolve the chat first, so the write itself is where a slow renderer runs out the budget.
+  it.each([
+    ['muteChat', (host: WwebjsEngineHost) => chats(host).muteChat(CHAT, Date.now() + 60_000)],
+    ['unmuteChat', (host: WwebjsEngineHost) => chats(host).muteChat(CHAT, null)],
+    ['pinChat', (host: WwebjsEngineHost) => chats(host).pinChat(CHAT, true)],
+    ['unpinChat', (host: WwebjsEngineHost) => chats(host).pinChat(CHAT, false)],
+  ] as const)('%s answers a protocolTimeout on its write with a 503 and reports no death', async (method, call) => {
+    const timeout = new Error(await puppeteerProtocolTimeoutMessage());
+    const { host, reportIfPageTransportError } = makeHost({
+      getChatById: jest.fn().mockResolvedValue({ id: { _serialized: CHAT } }),
+      [method]: jest.fn().mockRejectedValue(timeout),
+    });
+
+    await expect(call(host)).rejects.toBeInstanceOf(EngineTransportError);
+    expect(reportIfPageTransportError).not.toHaveBeenCalled();
+  });
+
+  // The list reads walk the whole store in one command, so they are the ones a large account
+  // pushes past the budget; none has a not-found verdict, but a raw rethrow would answer 500.
+  it.each([
+    ['getContacts', (host: WwebjsEngineHost) => new WwebjsContacts(host).getContacts()],
+    ['getChats', (host: WwebjsEngineHost) => chats(host).getChats()],
+    ['getGroups', (host: WwebjsEngineHost) => new WwebjsGroups(host).getGroups()],
+  ] as const)('%s answers an expired protocolTimeout with a 503 and reports no death', async (_op, call) => {
+    const timeout = jest.fn().mockRejectedValue(new Error(await puppeteerProtocolTimeoutMessage()));
+    const { host, reportIfPageTransportError } = makeHost({ pupPage: { evaluate: timeout } } as unknown as Record<
+      string,
+      jest.Mock
+    >);
+
+    await expect(call(host)).rejects.toBeInstanceOf(EngineTransportError);
+    expect(timeout).toHaveBeenCalledTimes(1);
     expect(reportIfPageTransportError).not.toHaveBeenCalled();
   });
 

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Plus, X } from 'lucide-react';
 import {
@@ -9,6 +9,10 @@ import {
   type WebhookFilterCondition,
   type WebhookFilterOperator,
 } from '../services/api';
+import { filterValueLabel } from '../utils/enumLabels';
+import { normalizePhoneText } from '../utils/phone';
+import { MAX_FILTER_CONDITIONS, MAX_FILTER_TEXT_LENGTH } from '../utils/webhookFilters';
+import { isComposingKey } from '../utils/composition';
 import './FilterBuilder.css';
 
 type FieldKind = 'id' | 'idArray' | 'text' | 'enum' | 'boolean';
@@ -37,19 +41,37 @@ const MESSAGE_FIELDS: FieldDescriptor[] = [
 const descriptorFor = (field: string): FieldDescriptor =>
   MESSAGE_FIELDS.find(f => f.field === field) ?? MESSAGE_FIELDS[0];
 
+// Rows are keyed by condition, not by index: with an index key, removing a row hands its unsent chip text
+// to the row that moves into its place. An edited condition is a new object, so it inherits the old key.
+const rowKeys = new WeakMap<WebhookFilterCondition, number>();
+let nextRowKey = 0;
+function rowKeyFor(condition: WebhookFilterCondition): number {
+  let key = rowKeys.get(condition);
+  if (key === undefined) rowKeys.set(condition, (key = nextRowKey++));
+  return key;
+}
+
 function defaultValueFor(kind: FieldKind): WebhookFilterCondition['value'] {
   if (kind === 'boolean') return true;
   if (kind === 'text') return '';
   return [];
 }
 
-/** Accepts a full JID or a phone number; normalizes bare numbers to `<digits>@c.us`. */
+const PHONE_MAX_DIGITS = 15;
+const phoneDigits = (value: string) => normalizePhoneText(value).replace(/[^0-9]/g, '');
+// A typed number that cannot be added, so the field says why instead of ignoring Enter.
+const isTooLong = (raw: string) => !raw.includes('@') && phoneDigits(raw).length > PHONE_MAX_DIGITS;
+
+/**
+ * Accepts a full JID or a phone number; normalizes bare numbers to `<digits>@c.us`. More than 15 digits (E.164) is no
+ * phone number, such as two numbers typed with a space between them, so it is not added.
+ */
 function normalizeToJid(raw: string): string | null {
   const value = raw.trim();
   if (!value) return null;
   if (value.includes('@')) return value.toLowerCase();
-  const digits = value.replace(/[^0-9]/g, '');
-  return digits ? `${digits}@c.us` : null;
+  const digits = phoneDigits(value);
+  return digits && digits.length <= PHONE_MAX_DIGITS ? `${digits}@c.us` : null;
 }
 
 interface ContactChipsInputProps {
@@ -62,6 +84,9 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
   const { t } = useTranslation();
   const [text, setText] = useState('');
   const [open, setOpen] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const blurTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(blurTimer.current), []);
 
   const suggestions = useMemo(() => {
     const query = text.trim().toLowerCase();
@@ -80,6 +105,8 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
   const add = (jid: string) => {
     if (jid && !value.includes(jid)) onChange([...value, jid]);
     setText('');
+    // A suggestion picked with the keyboard holds focus and is about to leave the list; keep focus in the field.
+    inputRef.current?.focus();
   };
   const addTyped = () => {
     const jid = normalizeToJid(text);
@@ -87,24 +114,45 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
   };
 
   return (
-    <div className="chips-input">
+    <div
+      className="chips-input"
+      // The list closes only when focus leaves the whole widget: Tab from the field lands on the first suggestion,
+      // which a close on the field's own blur would remove from under the keyboard.
+      onFocus={() => clearTimeout(blurTimer.current)}
+      onBlur={e => {
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+        blurTimer.current = setTimeout(() => setOpen(false), 120);
+      }}
+    >
       <div className="chips-row">
         {value.map(jid => (
           <span key={jid} className="chip" title={jid}>
             {labelFor(jid)}
-            <button type="button" className="chip-remove" onClick={() => onChange(value.filter(v => v !== jid))}>
+            <button
+              type="button"
+              className="chip-remove"
+              onClick={e => {
+                // A focused X is about to leave the page, and focus with it, unseen by the widget's blur; keep it in
+                // the field. An X clicked without taking focus (Safari) leaves focus where it was.
+                if (document.activeElement === e.currentTarget) inputRef.current?.focus();
+                onChange(value.filter(v => v !== jid));
+              }}
+              aria-label={t('webhooks.filters.removeValue', { value: labelFor(jid) })}
+              title={t('webhooks.filters.removeValue', { value: labelFor(jid) })}
+            >
               <X size={12} />
             </button>
           </span>
         ))}
         <input
+          ref={inputRef}
           className="chips-text"
           value={text}
           placeholder={t('webhooks.filters.contactPlaceholder')}
           onChange={e => setText(e.target.value)}
           onFocus={() => setOpen(true)}
-          onBlur={() => setTimeout(() => setOpen(false), 120)}
           onKeyDown={e => {
+            if (isComposingKey(e.nativeEvent)) return;
             if (e.key === 'Enter') {
               e.preventDefault();
               addTyped();
@@ -138,6 +186,11 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
               {t('webhooks.filters.addValue', { value: normalizeToJid(text) })}
             </button>
           )}
+          {isTooLong(text) && (
+            <div className="chips-suggestion-note" role="status">
+              {t('messageTester.tooLong', { max: PHONE_MAX_DIGITS })}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -157,7 +210,14 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
   const emit = (next: WebhookFilterCondition[]) => onChange(next.length ? { conditions: next } : null);
 
   const updateAt = (index: number, patch: Partial<WebhookFilterCondition>) =>
-    emit(conditions.map((c, i) => (i === index ? { ...c, ...patch } : c)));
+    emit(
+      conditions.map((c, i) => {
+        if (i !== index) return c;
+        const next = { ...c, ...patch };
+        rowKeys.set(next, rowKeyFor(c));
+        return next;
+      }),
+    );
 
   const addCondition = () => {
     const def = MESSAGE_FIELDS[0];
@@ -179,7 +239,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
       {conditions.map((condition, index) => {
         const def = descriptorFor(condition.field);
         return (
-          <div key={index} className="filter-row">
+          <div key={rowKeyFor(condition)} className="filter-row">
             <select
               className="filter-field"
               aria-label={t('webhooks.filters.fieldLabel')}
@@ -223,6 +283,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
                       <button
                         key={option}
                         type="button"
+                        aria-pressed={selected}
                         className={`enum-tag ${selected ? 'selected' : ''}`}
                         onClick={() => {
                           const current = Array.isArray(condition.value) ? (condition.value as string[]) : [];
@@ -231,7 +292,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
                           });
                         }}
                       >
-                        {option}
+                        {filterValueLabel(t, def.field, option)}
                       </button>
                     );
                   })}
@@ -243,6 +304,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
                   <input
                     type="text"
                     value={typeof condition.value === 'string' ? condition.value : ''}
+                    maxLength={MAX_FILTER_TEXT_LENGTH}
                     placeholder={t('webhooks.filters.textPlaceholder')}
                     onChange={e => updateAt(index, { value: e.target.value })}
                   />
@@ -282,7 +344,12 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
         );
       })}
 
-      <button type="button" className="filter-add" onClick={addCondition}>
+      <button
+        type="button"
+        className="filter-add"
+        onClick={addCondition}
+        disabled={conditions.length >= MAX_FILTER_CONDITIONS}
+      >
         <Plus size={14} />
         {t('webhooks.filters.addCondition')}
       </button>

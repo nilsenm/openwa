@@ -9,8 +9,9 @@ import {
 import { Reflector } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { Request } from 'express';
-import { AuthService } from '../auth.service';
+import { AuthService, UnresolvedApiKeyException } from '../auth.service';
 import { ChatScopeService } from '../chat-scope.service';
+import type { ChatScope } from '../../../common/security/chat-scope';
 import { BULK_MESSAGES_MAX } from '../../message/dto/bulk-message.dto';
 import { ApiKey, ApiKeyRole } from '../entities/api-key.entity';
 import {
@@ -23,9 +24,11 @@ import {
   ChatScopeKind,
 } from '../decorators/auth.decorators';
 import { resolveClientIp } from '../../../common/utils/ip';
+import { presentedApiKey } from '../../../common/security/bearer-token';
 import { setRequestActor } from '../../../common/services/request-context';
 import { AuditService } from '../../audit/audit.service';
 import { AuditAction } from '../../audit/entities/audit-log.entity';
+import { allowUnauthenticatedAuditRow } from '../../audit/auth-failure-audit-limiter';
 
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
@@ -55,13 +58,18 @@ export class ApiKeyGuard implements CanActivate {
       if (err instanceof UnauthorizedException || err instanceof ForbiddenException) {
         // Stamp at least the IP so the failed-auth audit row below is attributable even though the
         // key was never resolved. setRequestActor is a no-op outside a request scope.
-        setRequestActor({ ipAddress: this.getClientIp(request) });
-        void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
-          ipAddress: this.getClientIp(request),
-          method: request.method,
-          path: request.path,
-          errorMessage: err.message,
-        });
+        const clientIp = this.getClientIp(request);
+        setRequestActor({ ipAddress: clientIp });
+        // A 401 that resolved no key is bounded per client IP (see UnresolvedApiKeyException); any
+        // rejection of a stored key, 401 or 403, is always recorded.
+        if (!(err instanceof UnresolvedApiKeyException) || allowUnauthenticatedAuditRow(clientIp)) {
+          void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
+            ipAddress: clientIp,
+            method: request.method,
+            path: request.path,
+            errorMessage: err.message,
+          });
+        }
       }
       throw err;
     }
@@ -71,7 +79,7 @@ export class ApiKeyGuard implements CanActivate {
     const apiKeyHeader = this.extractApiKey(request);
 
     if (!apiKeyHeader) {
-      throw new UnauthorizedException('API key is required');
+      throw new UnresolvedApiKeyException('API key is required');
     }
 
     const requiredRole = this.reflector.getAllAndOverride<ApiKeyRole>(REQUIRED_ROLE_KEY, [
@@ -178,6 +186,8 @@ export class ApiKeyGuard implements CanActivate {
       throw new BadRequestException(`messages must contain at most ${ApiKeyGuard.CHAT_BULK_MAX} entries`);
     }
     messages.forEach((item, i) => {
+      // An array entry would hide its chatId from the read below, so it is refused rather than skipped.
+      if (Array.isArray(item)) throw new BadRequestException(`messages[${i}] must be an object`);
       if (item === null || typeof item !== 'object') return;
       out.push([`messages[${i}].chatId`, (item as { chatId?: unknown }).chatId]);
     });
@@ -191,6 +201,8 @@ export class ApiKeyGuard implements CanActivate {
   private async assertChatsAllowed(request: Request, apiKey: ApiKey, context: ExecutionContext): Promise<void> {
     // A bulk send repeats the same chat freely; each distinct id is expanded once.
     const checked = new Set<string>();
+    // The allowlist is the same for every id the request names, so it is compiled on the first one.
+    let scope: ChatScope | null | undefined;
     for (const [field, value] of this.chatIdsIn(request)) {
       if (value === undefined || value === null) continue;
       if (typeof value !== 'string') {
@@ -198,7 +210,8 @@ export class ApiKeyGuard implements CanActivate {
       }
       if (value.length === 0 || checked.has(value)) continue;
       checked.add(value);
-      if (!(await this.chatScope.allows(apiKey, value))) {
+      scope ??= this.chatScope.scopeFor(apiKey);
+      if (!(await this.chatScope.allows(apiKey, value, scope))) {
         throw new ForbiddenException('API key not authorized for this chat');
       }
     }
@@ -221,16 +234,8 @@ export class ApiKeyGuard implements CanActivate {
   }
 
   private extractApiKey(request: Request): string | undefined {
-    // Support both X-API-Key header and Authorization Bearer
-    const xApiKey = request.headers['x-api-key'] as string;
-    if (xApiKey) return xApiKey;
-
-    const authHeader = request.headers['authorization'];
-    if (authHeader?.startsWith('Bearer ')) {
-      return authHeader.substring(7);
-    }
-
-    return undefined;
+    // Both the X-API-Key header and Authorization Bearer are supported.
+    return presentedApiKey(request.headers);
   }
 
   /**

@@ -1,7 +1,8 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
-import { isAddressableParticipant, toParticipantWid } from '../../engine/identity/wa-id';
+import { isAddressableParticipant, isChannelJid, toParticipantWid } from '../../engine/identity/wa-id';
+import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
 
 /**
  * Owns engine access for channel/newsletter operations so the "session not started" guard
@@ -44,17 +45,34 @@ export class ChannelService {
 
   /** Create a channel. The account owns it, which is what makes deleting it possible later. */
   createChannel(sessionId: string, name: string, description?: string) {
-    return this.getEngine(sessionId).createChannel(name, description);
+    // The DTO lets a JSON null through as "no description". whatsapp-web.js echoes a non-undefined one back in
+    // the created channel, which would answer `"description": null` for a field typed as an optional string.
+    return this.getEngine(sessionId).createChannel(name, description ?? undefined);
+  }
+
+  /**
+   * A channel id, or 404. whatsapp-web.js resolves any other id to an ordinary chat, creating one if
+   * needed, before its channel delete or unsubscribe fails with a 500, and Baileys hands it to WhatsApp,
+   * which refuses it with a 403 or an opaque failure. Every channel id ends in `@newsletter` on both
+   * engines.
+   */
+  private requireChannelId(channelId: string): string {
+    if (!channelId.endsWith('@newsletter') || !isChannelJid(channelId)) {
+      throw new ChannelNotFoundError(channelId);
+    }
+    return channelId;
   }
 
   /** Delete a channel this account owns. Irreversible, and its subscribers lose it. */
   deleteChannel(sessionId: string, channelId: string) {
-    return this.getEngine(sessionId).deleteChannel(channelId);
+    const engine = this.getEngine(sessionId);
+    return engine.deleteChannel(this.requireChannelId(channelId));
   }
 
   /** Mute or unmute a channel's notifications. Subscription is untouched either way. */
   muteChannel(sessionId: string, channelId: string, mute: boolean) {
-    return this.getEngine(sessionId).muteChannel(channelId, mute);
+    const engine = this.getEngine(sessionId);
+    return engine.muteChannel(this.requireChannelId(channelId), mute);
   }
 
   /**
@@ -83,13 +101,13 @@ export class ChannelService {
   /** Demote a channel admin back to a subscriber. There is no promote counterpart on either engine. */
   demoteChannelAdmin(sessionId: string, channelId: string, userId: string) {
     const engine = this.getEngine(sessionId);
-    return engine.demoteChannelAdmin(channelId, this.addressableUser(userId));
+    return engine.demoteChannelAdmin(this.requireChannelId(channelId), this.addressableUser(userId));
   }
 
   /** Hand the channel to a new owner. Irreversible — the account stops being the owner. */
   transferChannelOwnership(sessionId: string, channelId: string, newOwnerId: string) {
     const engine = this.getEngine(sessionId);
-    return engine.transferChannelOwnership(channelId, this.addressableUser(newOwnerId));
+    return engine.transferChannelOwnership(this.requireChannelId(channelId), this.addressableUser(newOwnerId));
   }
 
   subscribeToChannel(sessionId: string, inviteCode: string) {
@@ -97,6 +115,7 @@ export class ChannelService {
   }
 
   unsubscribeFromChannel(sessionId: string, channelId: string) {
-    return this.getEngine(sessionId).unsubscribeFromChannel(channelId);
+    const engine = this.getEngine(sessionId);
+    return engine.unsubscribeFromChannel(this.requireChannelId(channelId));
   }
 }

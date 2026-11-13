@@ -1,12 +1,15 @@
 import { Body, Controller, Get, Post, Put, Delete, Param, Query, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery } from '@nestjs/swagger';
 import { ContactService } from './contact.service';
-import { ChatScoped, RequireRole } from '../auth/decorators/auth.decorators';
-import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { ChatScoped, CurrentApiKey, RequireRole } from '../auth/decorators/auth.decorators';
+import { type ApiKey, ApiKeyRole } from '../auth/entities/api-key.entity';
+import { ChatScopeService } from '../auth/chat-scope.service';
+import { paginate } from '../../common/utils/paginate';
 import { UpsertContactDto } from './dto/upsert-contact.dto';
 import {
   ContactAckResponseDto,
   ContactDto,
+  ContactLidResponseDto,
   NumberCheckResponseDto,
   ProfilePictureResponseDto,
   ProfilePicturesResponseDto,
@@ -17,8 +20,12 @@ import { ENGINE_NOT_READY_409 } from '../../common/openapi/engine-status-respons
 @ApiTags('contacts')
 @Controller('sessions/:sessionId/contacts')
 export class ContactController {
-  constructor(private readonly contactService: ContactService) {}
+  constructor(
+    private readonly contactService: ContactService,
+    private readonly chatScope: ChatScopeService,
+  ) {}
 
+  @ChatScoped('filtered')
   @Get()
   @ApiOperation({ summary: 'Get all contacts for a session' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
@@ -27,32 +34,54 @@ export class ContactController {
     description: 'List of contacts, windowed by limit/offset. A bare array — there is no envelope.',
     type: [ContactDto],
   })
-  @ApiResponse({ status: 400, description: 'Session not ready' })
-  @ApiResponse({ status: 503, description: 'The WhatsApp page died while reading contacts, retry shortly' })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'The WhatsApp page died while reading contacts, or WhatsApp Web did not answer within the protocol ' +
+      'timeout. Retry shortly.',
+  })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
-  @ApiQuery({ name: 'limit', required: false, description: 'Max contacts to return (1–1000, default 1000)' })
-  @ApiQuery({ name: 'offset', required: false, description: 'Number of contacts to skip (for paging)' })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: 'integer',
+    description: 'Max contacts to return (1-1000, default 1000)',
+  })
+  @ApiQuery({
+    name: 'offset',
+    required: false,
+    type: 'integer',
+    description: 'Number of contacts to skip (for paging)',
+  })
   async findAll(
     @Param('sessionId') sessionId: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
+    @CurrentApiKey() apiKey?: ApiKey,
   ) {
-    return this.contactService.getContacts(sessionId, {
-      limit: limit ? parseInt(limit, 10) : undefined,
-      offset: offset ? parseInt(offset, 10) : undefined,
-    });
+    // Filtered before paging so a chat-restricted key sees only its contacts, in full windows.
+    const skip = offset ? parseInt(offset, 10) : undefined;
+    const visible = await this.chatScope.filter(
+      apiKey,
+      await this.contactService.listContacts(sessionId, skip),
+      c => c.id,
+    );
+    return paginate(visible, limit ? parseInt(limit, 10) : undefined, skip);
   }
 
   @Get('profile-pictures')
   @ApiOperation({
     summary: 'Batch-resolve profile picture URLs for up to 50 contacts',
     description:
-      'One request for a whole chat sidebar — avoids the burst of parallel single fetches that ' +
-      'would exhaust the per-IP throttle. Engine lookups run 5 at a time; per-id failures return null.',
+      'Resolve a chat sidebar in one request to avoid bursts of per-contact HTTP calls. ' +
+      'Engine lookups run 5 at a time; per-id failures return null. After a lookup times out, ' +
+      'later chunks are skipped and their ids are absent from the response.',
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
-  @ApiQuery({ name: 'ids', required: true, description: 'Comma-separated contact ids (max 50 used)' })
+  @ApiQuery({ name: 'ids', required: false, description: 'Comma-separated contact ids (max 50 used)' })
   @ApiResponse({ status: 200, description: 'Picture URL per requested id', type: ProfilePicturesResponseDto })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   // NOTE: declared BEFORE @Get(':contactId') so the literal segment wins over the param route.
   async getProfilePictures(@Param('sessionId') sessionId: string, @Query('ids') ids?: string) {
@@ -75,6 +104,7 @@ export class ContactController {
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({ status: 200, description: 'Blocked contact ids', type: [String] })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
   @ApiResponse({ status: 503, description: 'WhatsApp did not answer the blocklist query — retry shortly' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   // NOTE: declared BEFORE @Get(':contactId') so the literal segment wins over the param route.
@@ -92,6 +122,7 @@ export class ContactController {
     description: 'Contact details',
     type: ContactDto,
   })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
   @ApiResponse({ status: 404, description: 'Contact not found' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({
@@ -106,14 +137,18 @@ export class ContactController {
     return this.contactService.getContactById(sessionId, contactId);
   }
 
+  // OPERATOR, unlike the other reads here: each call is an outbound WhatsApp query about a third
+  // party, and bulk number checks put the linked account's standing at risk.
   @Get('check/:number')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({
     summary: 'Check if a phone number exists on WhatsApp',
     description:
       'Returns whether the number is a registered WhatsApp account and its canonical id. Use this to ' +
-      'pre-validate a recipient before sending: the send endpoints return 201 on accepting a message ' +
-      'even for numbers that are not on WhatsApp, so this is the only way to confirm a new number is ' +
-      'reachable before you send to it.',
+      'pre-validate a recipient before sending. Only the digits of `number` are queried, so a `+`, spaces ' +
+      'or an `@c.us` suffix are tolerated. Baileys also checks unmapped phone destinations before ' +
+      'sending: a number reported as unregistered is rejected with 400. A successful check does not ' +
+      'confirm message delivery. Requires an OPERATOR key.',
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'number', description: 'Phone number to check (e.g., 628123456789)' })
@@ -121,6 +156,12 @@ export class ContactController {
     status: 200,
     description: 'Number existence check result',
     type: NumberCheckResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Session is not started, or `number` is an id of another kind (a privacy id, a group or a channel) or holds ' +
+      'no digits, so it names no phone number',
   })
   @ApiResponse({
     status: 503,
@@ -131,14 +172,51 @@ export class ContactController {
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async checkNumber(@Param('sessionId') sessionId: string, @Param('number') number: string) {
-    // The engine returns the canonical chat id in its native format; we don't build the JID here
-    // (decoupled from the whatsapp-web.js `@c.us` scheme).
+    // The engine returns the id already in the neutral `<phone>@c.us` form (the Baileys adapter neutralizes its
+    // own answer, the whatsapp-web.js one folds an `@lid` back to the phone id); we don't build the JID here.
     const whatsappId = await this.contactService.getNumberId(sessionId, number);
     return {
       number,
       exists: whatsappId !== null,
       whatsappId,
     };
+  }
+
+  // OPERATOR for the same reason as the number check: it is an outbound WhatsApp query about a third party.
+  // No @ChatScoped: the route names a phone number, not a chat, so a chat-restricted key is refused.
+  @Get(':number/lid')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({
+    summary: 'Look up the LID of a phone number',
+    description:
+      'Returns the `<lid>@lid` WhatsApp holds for a phone number, the reverse of `GET /contacts/{contactId}/phone`, ' +
+      'without sending a message. A number WhatsApp holds no LID for answers `lid: null`, as does an unregistered ' +
+      'one; use `check/{number}` to tell them apart. The gateway stores nothing from the lookup. Both engines ' +
+      'may send a query to WhatsApp, so bulk lookups put the linked account at risk. Requires an OPERATOR key.',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'number', description: 'Phone number to look up (e.g., 628123456789)' })
+  @ApiResponse({
+    status: 200,
+    description: 'The number and its LID, or null',
+    type: ContactLidResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Session is not started, or `number` is an id of another kind (a privacy id, a group or a channel) rather ' +
+      'than a phone number',
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer the lookup. Deliberately not reported as `lid: null`, which says WhatsApp holds ' +
+      'no LID for the number. Retry once the session is ready again.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async getContactLid(@Param('sessionId') sessionId: string, @Param('number') number: string) {
+    const lid = await this.contactService.getContactLid(sessionId, number);
+    return { number, lid };
   }
 
   // ========== Gap Quick Wins: Profile Picture, Block/Unblock ==========
@@ -153,11 +231,13 @@ export class ContactController {
     description: 'Profile picture URL',
     type: ProfilePictureResponseDto,
   })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
   @ApiResponse({
     status: 503,
     description:
       'WhatsApp did not answer the lookup. Deliberately not reported as `url: null` — that is the ' +
-      'same answer a contact with no picture gives, and a caller cannot tell them apart.',
+      'same answer a contact with no picture gives, and a caller cannot tell them apart. On Baileys, also ' +
+      'answered when WhatsApp rate-limits, times out or fails on its side (code 429, 408 or 5xx); retry after a pause.',
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async getProfilePicture(@Param('sessionId') sessionId: string, @Param('contactId') contactId: string) {
@@ -175,6 +255,7 @@ export class ContactController {
     description: 'Resolved phone number (MSISDN digits), or null when the engine cannot map it',
     type: ResolvedPhoneResponseDto,
   })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async resolvePhone(@Param('sessionId') sessionId: string, @Param('contactId') contactId: string) {
     const phone = await this.contactService.resolveContactPhone(sessionId, contactId);
@@ -189,7 +270,10 @@ export class ContactController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'contactId', description: 'Contact ID (e.g., 628xxx@c.us)' })
   @ApiResponse({ status: 200, description: 'Contact saved', type: ContactAckResponseDto })
-  @ApiResponse({ status: 400, description: 'Session not active or invalid request' })
+  @ApiResponse({
+    status: 400,
+    description: 'Session is not started, an invalid body, or a contact id that is not a phone-based individual id',
+  })
   @ApiResponse({
     status: 503,
     description:
@@ -215,7 +299,10 @@ export class ContactController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'contactId', description: 'Contact ID (e.g., 628xxx@c.us)' })
   @ApiResponse({ status: 200, description: 'Contact deleted', type: ContactAckResponseDto })
-  @ApiResponse({ status: 400, description: 'Session not active' })
+  @ApiResponse({
+    status: 400,
+    description: 'Session is not started, or a contact id that is not a phone-based individual id',
+  })
   @ApiResponse({
     status: 503,
     description:
@@ -241,6 +328,13 @@ export class ContactController {
     type: ContactAckResponseDto,
   })
   @ApiResponse({
+    status: 400,
+    description:
+      'Session is not started, or the id does not name an individual. On Baileys also an id the session ' +
+      'cannot map between phone and privacy-id form (a `@lid` with no known phone to block, a phone-based ' +
+      'id with no known `@lid`).',
+  })
+  @ApiResponse({
     status: 503,
     description:
       'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
@@ -262,6 +356,12 @@ export class ContactController {
     status: 200,
     description: 'Contact unblocked',
     type: ContactAckResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Session is not started, or the id does not name an individual. On Baileys also a phone-based id ' +
+      'the session cannot map to its privacy id (`@lid`).',
   })
   @ApiResponse({
     status: 503,

@@ -6,6 +6,9 @@ jest.mock('../../adapters/baileys.adapter', () => ({
 
 import { BaileysPlugin } from './index';
 import { BaileysAdapter } from '../../adapters/baileys.adapter';
+import type { LidMappingStore } from '../../identity/lid-mapping-store.service';
+import type { ChatStateStore } from '../../adapters/baileys-chat-state-store.service';
+import type { StoredChatPreviewSource } from '../../adapters/baileys-stored-chat-previews.service';
 
 describe('BaileysPlugin.createEngine (opaque config)', () => {
   beforeEach(() => jest.clearAllMocks());
@@ -17,7 +20,7 @@ describe('BaileysPlugin.createEngine (opaque config)', () => {
       logger: { log: jest.fn() },
     } as unknown as PluginContext);
 
-    plugin.createEngine({ sessionId: 'sess-1', dbSessionId: 'db-1', proxyUrl: 'http://p', proxyType: 'http' });
+    plugin.createEngine({ sessionId: 'sess-1', dbSessionId: 'db-1', proxyUrl: 'http://p' });
 
     expect(BaileysAdapter).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -25,7 +28,6 @@ describe('BaileysPlugin.createEngine (opaque config)', () => {
         dbSessionId: 'db-1',
         authDir: '/data/baileys',
         proxyUrl: 'http://p',
-        proxyType: 'http',
       }),
     );
   });
@@ -38,7 +40,7 @@ describe('BaileysPlugin.createEngine (opaque config)', () => {
     );
   });
 
-  it('advertises the slice-3b supported feature set', () => {
+  it('advertises the supported feature set', () => {
     expect(new BaileysPlugin().getFeatures()).toEqual([
       'text-messages',
       'typing-indicator',
@@ -51,6 +53,9 @@ describe('BaileysPlugin.createEngine (opaque config)', () => {
       'message-deletion',
       'group-management',
       'read-receipts',
+      'channels',
+      'status-updates',
+      'catalog',
     ]);
   });
 
@@ -59,10 +64,35 @@ describe('BaileysPlugin.createEngine (opaque config)', () => {
   });
 
   it('passes the message store to the adapter', () => {
-    const store = { put: jest.fn(), getMessage: jest.fn(), getMessages: jest.fn(), clearSession: jest.fn() };
+    const store = {
+      put: jest.fn(),
+      getMessage: jest.fn(),
+      getMessages: jest.fn(),
+      update: jest.fn(),
+      remove: jest.fn(),
+      clearSession: jest.fn(),
+    };
     const plugin = new BaileysPlugin(store);
     plugin.createEngine({ sessionId: 'sess-1' });
     expect(BaileysAdapter).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess-1', messageStore: store }));
+  });
+
+  // Both stores are optional in the adapter, so a dropped hop would silently stop persisting learned
+  // lid pairs and chat state across restarts instead of failing anything.
+  it('passes the lid-mapping and chat-state stores to the adapter', () => {
+    const lidMappingStore = {} as LidMappingStore;
+    const chatStateStore = {} as ChatStateStore;
+    new BaileysPlugin(undefined, undefined, lidMappingStore, chatStateStore).createEngine({ sessionId: 'sess-1' });
+    expect(BaileysAdapter).toHaveBeenCalledWith(expect.objectContaining({ lidMappingStore, chatStateStore }));
+  });
+
+  // Optional too: a dropped hop would leave the chat list of a restarted engine empty again.
+  it('passes the stored chat previews to the adapter', () => {
+    const storedChatPreviews = {} as StoredChatPreviewSource;
+    new BaileysPlugin(undefined, undefined, undefined, undefined, storedChatPreviews).createEngine({
+      sessionId: 'sess-1',
+    });
+    expect(BaileysAdapter).toHaveBeenCalledWith(expect.objectContaining({ storedChatPreviews }));
   });
 
   it('Uses the constructor-supplied engine config when onLoad never ran (enable-failure path)', () => {
@@ -82,6 +112,20 @@ describe('BaileysPlugin.createEngine (opaque config)', () => {
     plugin.createEngine({ sessionId: 'sess-4' });
     expect(BaileysAdapter).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: 'sess-4', authDir: '/context/baileys' }),
+    );
+  });
+
+  // The factory hardens and purges credential dirs under its own base, so the engine must write there
+  // even when a persisted plugin-config override names another directory.
+  it('Prefers the per-call authDir over a context.config override', () => {
+    const plugin = new BaileysPlugin();
+    void plugin.onLoad({
+      config: { baileys: { authDir: '/override/baileys' } },
+      logger: { log: jest.fn() },
+    } as unknown as PluginContext);
+    plugin.createEngine({ sessionId: 'sess-5', authDir: '/factory/baileys' });
+    expect(BaileysAdapter).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'sess-5', authDir: '/factory/baileys' }),
     );
   });
 });

@@ -19,11 +19,16 @@ export class ChatState {
   @PrimaryColumn()
   sessionId!: string;
 
-  /** Chat id in the engine's stored (raw Baileys) dialect, the same key `upsertChats` uses. */
+  /**
+   * Chat id in the raw Baileys dialect, one row per conversation: `<phone>@s.whatsapp.net` for a person
+   * (also when WhatsApp synced the state under their lid, once the lid resolves), `<lid>@lid` while it
+   * does not, and a group's own id. A row filed under a lid twin is folded onto the phone JID on the
+   * chat's next change.
+   */
   @PrimaryColumn()
   chatId!: string;
 
-  /** Epoch MILLISECONDS the mute ends, or null when the chat is not muted. */
+  /** Epoch MILLISECONDS the mute ends, -1 for a mute with no end ("Always"), or null when not muted. */
   @Column({
     type: 'bigint',
     nullable: true,
@@ -36,6 +41,29 @@ export class ChatState {
 
   @Column({ type: 'boolean', default: false })
   pinned!: boolean;
+
+  /**
+   * The state fields this row has observed, comma-separated (`muteEndTime`, `archived`, `pinned`); the
+   * others hold their default only because the row was created by a patch that did not carry them.
+   * Null on a row written before this column existed, read as having observed its set fields. Lets two
+   * rows of one chat merge field by field without mistaking an explicit unpin, unarchive or unmute for
+   * "not seen".
+   */
+  @Column({ type: 'varchar', nullable: true })
+  observed!: string | null;
+
+  /**
+   * Epoch MILLISECONDS WhatsApp deleted the chat (on the phone, or through the API), else null. WhatsApp
+   * keeps nothing of a deleted chat while the gateway keeps its stored messages, so the row stays with
+   * its state reset and this set: a message from before it neither keys a chat write nor brings the chat
+   * back. A later message re-creates the chat on WhatsApp, and the row goes.
+   */
+  @Column({
+    type: 'bigint',
+    nullable: true,
+    transformer: { to: (v: number | null) => v, from: (v: string | null) => (v == null ? null : Number(v)) },
+  })
+  deletedAt!: number | null;
 
   @UpdateDateColumn()
   updatedAt!: Date;

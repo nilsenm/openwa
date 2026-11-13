@@ -2,6 +2,10 @@ import { BadRequestException, ConflictException, NotFoundException } from '@nest
 import { ContactService } from './contact.service';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { WwebjsContacts } from '../../engine/adapters/wwebjs-contacts';
+import type { WwebjsEngineHost } from '../../engine/adapters/wwebjs-host';
 
 describe('ContactService', () => {
   const makeService = (engine: Partial<IWhatsAppEngine> | undefined) => {
@@ -24,6 +28,13 @@ describe('ContactService', () => {
     expect(() => makeService(undefined).getBlockedContacts('s1')).toThrow(BadRequestException);
   });
 
+  it('listContacts returns the whole set, unwindowed', async () => {
+    const big = Array.from({ length: 1500 }, (_, i) => ({ id: `${i}@c.us` }));
+    const getContacts = jest.fn().mockResolvedValue(big);
+    await expect(makeService({ getContacts }).listContacts('s1')).resolves.toHaveLength(1500);
+    expect(() => makeService(undefined).listContacts('s1')).toThrow(BadRequestException);
+  });
+
   it('caps an unbounded contacts list at the default limit (1000)', async () => {
     const big = Array.from({ length: 1500 }, (_, i) => ({ id: `${i}@c.us` }));
     const getContacts = jest.fn().mockResolvedValue(big);
@@ -43,12 +54,6 @@ describe('ContactService', () => {
     await expect(svc.getContactById('s1', 'c404')).rejects.toBeInstanceOf(NotFoundException);
   });
 
-  it('delegates checkNumberExists to the engine', async () => {
-    const checkNumberExists = jest.fn().mockResolvedValue(true);
-    await expect(makeService({ checkNumberExists }).checkNumberExists('s1', '628123')).resolves.toBe(true);
-    expect(checkNumberExists).toHaveBeenCalledWith('628123');
-  });
-
   it('delegates getNumberId to the engine (canonical JID resolution)', async () => {
     const getNumberId = jest.fn().mockResolvedValue('628123@c.us');
     await expect(makeService({ getNumberId }).getNumberId('s1', '628123')).resolves.toBe('628123@c.us');
@@ -63,6 +68,49 @@ describe('ContactService', () => {
     expect(resolveContactPhone).toHaveBeenCalledWith('123@lid');
   });
 
+  describe('getContactLid', () => {
+    it('delegates to the engine', async () => {
+      const getContactLid = jest.fn().mockResolvedValue('123@lid');
+      await expect(makeService({ getContactLid }).getContactLid('s1', '628123456789')).resolves.toBe('123@lid');
+      expect(getContactLid).toHaveBeenCalledWith('628123456789');
+    });
+
+    it('lets a failed lookup through: unlike resolveContactPhone, a null here would claim "no lid"', async () => {
+      const failure = new EngineTransportError('WhatsApp did not answer the LID lookup');
+      const svc = makeService({ getContactLid: jest.fn().mockRejectedValue(failure) });
+      await expect(svc.getContactLid('s1', '628123456789')).rejects.toBe(failure);
+    });
+
+    it('throws 400 when the session is not started', () => {
+      expect(() => makeService(undefined).getContactLid('s1', '628123456789')).toThrow(BadRequestException);
+    });
+
+    // The digits of a privacy id or a group id are no phone number: the engines keep nothing but digits, so the
+    // id would be looked up as a stranger's number and answer null, or that stranger's LID.
+    it.each([
+      '234767895240796@lid',
+      '120363021234567890@g.us',
+      '123456789@newsletter',
+      'status@broadcast',
+      '6281@c.us@c.us',
+    ])('refuses %s with 400 before an engine is asked', id => {
+      const getContactLid = jest.fn();
+
+      expect(() => makeService({ getContactLid }).getContactLid('s1', id)).toThrow(BadRequestException);
+      expect(getContactLid).not.toHaveBeenCalled();
+    });
+
+    it.each(['628123456789', '+62 812-7000-8896', '628123456789@c.us', '628123456789@s.whatsapp.net', 'abc'])(
+      'hands %s to the engine, which keeps its digits',
+      async typed => {
+        const getContactLid = jest.fn().mockResolvedValue(null);
+
+        await expect(makeService({ getContactLid }).getContactLid('s1', typed)).resolves.toBeNull();
+        expect(getContactLid).toHaveBeenCalledWith(typed);
+      },
+    );
+  });
+
   it('batch-resolves profile pictures, nulling per-id failures without aborting', async () => {
     const getProfilePicture = jest
       .fn()
@@ -71,6 +119,26 @@ describe('ContactService', () => {
       .mockResolvedValueOnce('https://pps/3.jpg');
     const out = await makeService({ getProfilePicture }).getProfilePictures('s1', ['a@c.us', 'b@c.us', 'c@c.us']);
     expect(out).toEqual({ 'a@c.us': 'https://pps/1.jpg', 'b@c.us': null, 'c@c.us': 'https://pps/3.jpg' });
+  });
+
+  // Not ready is a fact about the session, not about one avatar: a 200 with every picture null would
+  // be cached by the dashboard as "nobody has a picture" for the whole stale window.
+  it('fails the whole batch with 409 when the engine is not ready, without starting further chunks', async () => {
+    const getProfilePicture = jest.fn().mockRejectedValue(new EngineNotReadyError());
+    const ids = Array.from({ length: 12 }, (_, i) => `${i}@c.us`);
+    const batch = makeService({ getProfilePicture }).getProfilePictures('s1', ids);
+    await expect(batch).rejects.toBeInstanceOf(EngineNotReadyError);
+    await expect(batch).rejects.toMatchObject({ status: 409 });
+    expect(getProfilePicture).toHaveBeenCalledTimes(5);
+  });
+
+  it('still nulls a single id whose lookup fails with a transport error', async () => {
+    const getProfilePicture = jest
+      .fn()
+      .mockRejectedValueOnce(new EngineTransportError('query stalled'))
+      .mockResolvedValueOnce('https://pps/2.jpg');
+    const out = await makeService({ getProfilePicture }).getProfilePictures('s1', ['a@c.us', 'b@c.us']);
+    expect(out).toEqual({ 'a@c.us': null, 'b@c.us': 'https://pps/2.jpg' });
   });
 
   it('ignores ids beyond the 50-id batch cap', async () => {
@@ -101,16 +169,82 @@ describe('ContactService', () => {
       .fn()
       .mockResolvedValueOnce('https://pps/1.jpg')
       .mockImplementationOnce(() => new Promise(() => undefined)); // never settles
-    const started = Date.now();
-    const out = await makeService({ getProfilePicture }).getProfilePictures('s1', ['a@c.us', 'b@c.us']);
-    expect(out).toEqual({ 'a@c.us': 'https://pps/1.jpg', 'b@c.us': null });
-    expect(Date.now() - started).toBeLessThan(12_000);
-  }, 15_000);
+    jest.useFakeTimers();
+    try {
+      const out = makeService({ getProfilePicture }).getProfilePictures('s1', ['a@c.us', 'b@c.us']);
+      await jest.advanceTimersByTimeAsync(8000);
+      await expect(out).resolves.toEqual({ 'a@c.us': 'https://pps/1.jpg', 'b@c.us': null });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'stops later avatar chunks after a timeout and handles a late %s',
+    async outcome => {
+      jest.useFakeTimers();
+      let active = 0;
+      let peak = 0;
+      let calls = 0;
+      const getProfilePicture = jest.fn().mockImplementation(() => {
+        active += 1;
+        peak = Math.max(peak, active);
+        const call = ++calls;
+        if (call > 5) return Promise.resolve(null).finally(() => active--);
+        return new Promise<string | null>((resolve, reject) => {
+          setTimeout(() => {
+            if (outcome === 'reject' && call === 1) reject(new Error('lookup failed'));
+            else resolve('https://pps/picture.jpg');
+          }, 9000);
+        }).finally(() => active--);
+      });
+      const ids = Array.from({ length: 6 }, (_, i) => String(628100000000 + i) + '@c.us');
+      try {
+        const result = makeService({ getProfilePicture }).getProfilePictures('s1', ids);
+        await jest.advanceTimersByTimeAsync(8000);
+        await expect(result).resolves.toEqual(Object.fromEntries(ids.slice(0, 5).map(id => [id, null])));
+        expect(active).toBe(5);
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(active).toBe(0);
+        expect(getProfilePicture).toHaveBeenCalledTimes(5);
+        expect(peak).toBeLessThanOrEqual(5);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        await jest.advanceTimersByTimeAsync(30000);
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    },
+  );
+
+  it('preserves not-ready when other lookups in the chunk time out', async () => {
+    jest.useFakeTimers();
+    const getProfilePicture = jest
+      .fn()
+      .mockRejectedValueOnce(new EngineNotReadyError())
+      .mockImplementation(() => new Promise(resolve => setTimeout(() => resolve(null), 9000)));
+    try {
+      const result = makeService({ getProfilePicture })
+        .getProfilePictures(
+          's1',
+          Array.from({ length: 6 }, (_, i) => String(628100000000 + i) + '@c.us'),
+        )
+        .catch((error: unknown) => error);
+      await jest.advanceTimersByTimeAsync(8000);
+      expect(await result).toBeInstanceOf(EngineNotReadyError);
+      expect(getProfilePicture).toHaveBeenCalledTimes(5);
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      await jest.advanceTimersByTimeAsync(30000);
+      jest.clearAllTimers();
+      jest.useRealTimers();
+    }
+  });
 
   describe('block/unblock reject ids that do not name a person', () => {
     // whatsapp-web.js's Contact.block()/unblock() return false for a group id (nothing blocked,
-    // answered 200 "blocked"); Baileys hands the id to updateBlockStatus whose Boom for an
-    // unresolvable jid surfaces as an opaque 500. Both engines share this 400 guard.
+    // answered 200 "blocked"). Both engines share this 400 guard.
     it.each([
       ['blockContact', (svc: ContactService) => svc.blockContact('s1', '120363000000000000@g.us')],
       ['unblockContact', (svc: ContactService) => svc.unblockContact('s1', '120363000000000000@g.us')],
@@ -227,6 +361,31 @@ describe('ContactService', () => {
       expect(upsertContact).toHaveBeenCalledWith('628123@c.us', 'Ada', 'Lovelace');
     });
 
+    // UpsertContactDto lets a JSON null through (@IsOptional skips it). A default parameter ignores null, so
+    // the whatsapp-web.js delegate's `lastName = ''` never applied and the page-side save received null.
+    it.each([undefined, null])('hands the engine no last name for lastName %p', async lastName => {
+      const upsertContact = jest.fn().mockResolvedValue(undefined);
+      await makeService({ upsertContact }).upsertContact('s1', '628123@c.us', 'Ada', lastName as string | undefined);
+      expect(upsertContact).toHaveBeenCalledWith('628123@c.us', 'Ada', undefined);
+    });
+
+    it('reaches the whatsapp-web.js save with an empty last name when the body sent null', async () => {
+      const save = jest.fn().mockResolvedValue(undefined);
+      const host = {
+        ensureReady: jest.fn(),
+        getClient: () => ({ saveOrEditAddressbookContact: save }),
+        isPageTransportError: () => false,
+        reportIfPageTransportError: jest.fn(),
+        logger: { debug: jest.fn() },
+      } as unknown as WwebjsEngineHost;
+      const contacts = new WwebjsContacts(host);
+      const svc = makeService({
+        upsertContact: (id: string, first: string, last?: string) => contacts.upsertContact(id, first, last),
+      });
+      await svc.upsertContact('s1', '628123@c.us', 'Ada', null as unknown as string);
+      expect(save).toHaveBeenCalledWith('628123', 'Ada', '');
+    });
+
     // Same hazard as the lid, different ids: a group/newsletter/broadcast id also carries digits
     // that would be stored as a phone number for a contact that does not exist.
     it.each(['120363000000000000@g.us', '120363000000000000@newsletter', 'status@broadcast'])(
@@ -268,9 +427,81 @@ describe('ContactService', () => {
       ['the engine dialect', '628123456789@s.whatsapp.net'],
       ['a bare number', '628123456789'],
     ])('still accepts %s', async (_label, id) => {
-      const upsertContact = jest.fn();
+      const upsertContact = jest.fn().mockResolvedValue(undefined);
       await makeService({ upsertContact }).upsertContact('s1', id, 'Ada');
       expect(upsertContact).toHaveBeenCalled();
+    });
+  });
+
+  describe('one engine read per walk', () => {
+    const contactsOf = (prefix: string, count: number) =>
+      Array.from({ length: count }, (_, i) => ({ id: `${prefix}${i}@c.us` }));
+    const walk = async (svc: ContactService, sessionId = 's1') => {
+      const ids: string[] = [];
+      for (let offset = 0; ; offset += 1000) {
+        const page = (await svc.getContacts(sessionId, { limit: 1000, offset })) as { id: string }[];
+        ids.push(...page.map(c => c.id));
+        if (page.length < 1000) return ids;
+      }
+    };
+
+    it('reads the engine once for every page of one walk, and afresh for the next walk', async () => {
+      const getContacts = jest.fn().mockResolvedValue(contactsOf('62', 5000));
+      const svc = makeService({ getContacts });
+      expect(new Set(await walk(svc)).size).toBe(5000);
+      expect(getContacts).toHaveBeenCalledTimes(1);
+      await walk(svc);
+      expect(getContacts).toHaveBeenCalledTimes(2);
+    });
+
+    it("never serves one session's listing to another session", async () => {
+      const engines = new EngineRegistry();
+      const first = { getContacts: jest.fn().mockResolvedValue(contactsOf('62', 5000)) };
+      const second = { getContacts: jest.fn().mockResolvedValue(contactsOf('63', 1500)) };
+      engines.set('s1', first as unknown as IWhatsAppEngine);
+      engines.set('s2', second as unknown as IWhatsAppEngine);
+      const svc = new ContactService(engines);
+      await svc.getContacts('s1', { offset: 0 });
+      const page = (await svc.getContacts('s2', { offset: 1000 })) as { id: string }[];
+      expect(second.getContacts).toHaveBeenCalledTimes(1);
+      expect(page).toHaveLength(500);
+      expect(page.every(c => c.id.startsWith('63'))).toBe(true);
+    });
+
+    it('reads afresh once the engine it came from was retired, and answers 400 while none runs', async () => {
+      const engines = new EngineRegistry();
+      const getContacts = jest.fn().mockResolvedValue(contactsOf('62', 1500));
+      const engine = { getContacts } as unknown as IWhatsAppEngine;
+      engines.set('s1', engine);
+      const svc = new ContactService(engines);
+      await svc.getContacts('s1', { offset: 0 });
+      engines.delete('s1');
+      expect(() => svc.getContacts('s1', { offset: 1000 })).toThrow(BadRequestException);
+      // The same engine object registered again: only the retire notification can drop the listing.
+      engines.set('s1', engine);
+      await svc.getContacts('s1', { offset: 1000 });
+      expect(getContacts).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      ['upsertContact', (svc: ContactService) => svc.upsertContact('s1', '628123@c.us', 'Ada')],
+      ['deleteContact', (svc: ContactService) => svc.deleteContact('s1', '628123@c.us')],
+      ['blockContact', (svc: ContactService) => svc.blockContact('s1', '628123@c.us')],
+      ['unblockContact', (svc: ContactService) => svc.unblockContact('s1', '628123@c.us')],
+    ])('a %s call makes the next page read afresh, even when it fails', async (method, write) => {
+      const getContacts = jest.fn().mockResolvedValue(contactsOf('62', 5000));
+      const engine: Partial<Record<string, jest.Mock>> = { getContacts, [method]: jest.fn().mockResolvedValue(true) };
+      const svc = makeService(engine as Partial<IWhatsAppEngine>);
+      await svc.getContacts('s1', { offset: 0 });
+      await write(svc);
+      await svc.getContacts('s1', { offset: 1000 });
+      expect(getContacts).toHaveBeenCalledTimes(2);
+
+      // A timed-out write may still have been applied, so a failure drops the listing too.
+      engine[method] = jest.fn().mockRejectedValue(new Error('timed out'));
+      await expect(write(svc)).rejects.toThrow('timed out');
+      await svc.getContacts('s1', { offset: 2000 });
+      expect(getContacts).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -292,20 +523,6 @@ describe('ContactService', () => {
         resolveContactPhone: jest.fn().mockRejectedValue(new Error('Protocol error: Target closed')),
       });
       await expect(svc.resolveContactPhone('s1', '123@lid')).resolves.toBeNull();
-    });
-  });
-
-  describe('resolveContactPhone null-on-failure boundary', () => {
-    it('returns null (200 contract) when the engine lookup throws', async () => {
-      const svc = makeService({
-        resolveContactPhone: jest.fn().mockRejectedValue(new Error('Protocol error: Target closed')),
-      });
-      await expect(svc.resolveContactPhone('s1', '123@lid')).resolves.toBeNull();
-    });
-
-    it('returns the engine answer verbatim on success', async () => {
-      const svc = makeService({ resolveContactPhone: jest.fn().mockResolvedValue('628123') });
-      await expect(svc.resolveContactPhone('s1', '123@lid')).resolves.toBe('628123');
     });
   });
 });

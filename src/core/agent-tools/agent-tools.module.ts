@@ -1,4 +1,5 @@
 import { Global, Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { ToolRegistryService } from './tool-registry.service';
 import { SessionModule } from '../../modules/session/session.module';
 import { MessageModule } from '../../modules/message/message.module';
@@ -9,11 +10,13 @@ import { LabelModule } from '../../modules/label/label.module';
 import { AutomationModule } from '../../modules/automation/automation.module';
 import { SessionService } from '../../modules/session/session.service';
 import { MessageService } from '../../modules/message/message.service';
+import { SendIdempotencyService } from '../../modules/message/idempotency/send-idempotency.service';
 import { ContactService } from '../../modules/contact/contact.service';
 import { GroupService } from '../../modules/group/group.service';
 import { WebhookService } from '../../modules/webhook/webhook.service';
 import { LabelService } from '../../modules/label/label.service';
 import { AutomationRulesService } from '../../modules/automation/automation-rules.service';
+import { SearchService } from '../../modules/search/search.service';
 import { allAgentTools } from './tools';
 
 @Global()
@@ -30,6 +33,10 @@ import { allAgentTools } from './tools';
         WebhookService,
         LabelService,
         AutomationRulesService,
+        SendIdempotencyService,
+        // Optional: SEARCH_ENABLED=false leaves SearchModule (global, so no import here) out of the app.
+        { token: SearchService, optional: true },
+        ConfigService,
       ],
       useFactory: (
         session: SessionService,
@@ -39,7 +46,24 @@ import { allAgentTools } from './tools';
         webhook: WebhookService,
         labels: LabelService,
         automation: AutomationRulesService,
-      ) => new ToolRegistryService(allAgentTools({ session, message, contact, group, webhook, labels, automation })),
+        idempotency: SendIdempotencyService,
+        search: SearchService | undefined,
+        config: ConfigService,
+      ) =>
+        new ToolRegistryService(
+          allAgentTools({
+            session,
+            message,
+            contact,
+            group,
+            webhook,
+            labels,
+            automation,
+            idempotency,
+            search,
+            searchContainsEnabled: config.get<boolean>('search.containsEnabled') === true,
+          }),
+        ),
     },
   ],
   exports: [ToolRegistryService],

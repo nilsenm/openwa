@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
+  ArrayMaxSize,
   ArrayMinSize,
   IsArray,
   IsBoolean,
@@ -20,7 +21,8 @@ import { MAX_CONDITIONS } from '../filters/filter-types';
 import type { FilterOperator, WebhookFilters } from '../filters/filter-types';
 import { IsValidWebhookFilters } from '../filters/filter-validation';
 import { IsHeaderMap } from './is-header-map.validator';
-import { ToStrictBoolean, ToStrictNumber } from '../../../common/utils/strict-boolean';
+import { ToStrictArray, ToStrictBoolean, ToStrictNumber, ToStrictString } from '../../../common/utils/strict-boolean';
+import { MaxCodePoints } from '../../../common/validation/max-code-points';
 
 /**
  * Swagger metadata for the smart-filter shape — `WebhookFilters` in filters/filter-types.ts is a
@@ -49,15 +51,18 @@ class WebhookFilterConditionDto {
 class WebhookFiltersDto {
   @ApiProperty({
     type: [WebhookFilterConditionDto],
-    minItems: 1,
     maxItems: MAX_CONDITIONS,
-    description: 'Every condition must match (AND) for the webhook to fire.',
+    description:
+      'Every condition must match (AND) for the webhook to fire. An empty list means no filter: the webhook fires on every subscribed event.',
   })
   conditions!: WebhookFilterConditionDto[];
 }
 
 const FILTERS_API_DESCRIPTION =
   'Optional smart pre-filter. When set, every condition must match (AND) for the webhook to fire. Omit or null to fire on every subscribed event.';
+// An update applies `filters` only when the field is present, so omission keeps the stored filter.
+const UPDATE_FILTERS_API_DESCRIPTION =
+  'Optional smart pre-filter. When set, every condition must match (AND) for the webhook to fire. Omit to keep the stored filters; send null or { conditions: [] } to clear them, so the webhook fires on every subscribed event.';
 const FILTERS_API_EXAMPLE = {
   conditions: [
     { field: 'sender', operator: 'is', value: ['1234567890@c.us'] },
@@ -75,6 +80,7 @@ export const WEBHOOK_EVENTS = [
   'message.received',
   'message.sent',
   'message.ack',
+  'message.receipt',
   'message.failed',
   'message.revoked',
   'message.reaction',
@@ -87,6 +93,8 @@ export const WEBHOOK_EVENTS = [
   'session.reconnect_loop',
   'session.restriction',
   'presence.update',
+  'event.response',
+  'poll.vote',
   'group.join',
   'group.leave',
   'group.update',
@@ -98,27 +106,38 @@ export const WEBHOOK_EVENTS = [
   ...WEBHOOK_RESERVED_EVENTS,
 ] as const;
 
+const WEBHOOK_URL_OPTIONS = { require_tld: false, require_protocol: true, protocols: ['http', 'https'] };
+
 export class CreateWebhookDto {
   @ApiProperty({
     description: 'Webhook URL to receive events',
     example: 'https://your-server.com/webhook',
+    maxLength: 2048,
   })
   // require_tld:false allows hostnames without a dot (e.g. http://localhost:3000); the SSRF
-  // guard still decides whether the host is actually allowed to be delivered to.
-  @IsUrl({ require_tld: false })
+  // guard still decides whether the host is actually allowed to be delivered to. The scheme is
+  // required and must be http(s): the defaults also took 'example.com/hook' and 'ftp://...', which
+  // were stored and then failed every delivery. 2048 is the column width; PostgreSQL refuses a
+  // longer value on insert with a 500.
+  @IsUrl(WEBHOOK_URL_OPTIONS)
+  @MaxCodePoints(2048)
   url!: string;
 
   @ApiPropertyOptional({
-    description: "Event types to subscribe to. '*' subscribes to all events.",
+    description:
+      "Event types to subscribe to. '*' subscribes to all events except `message.receipt`, which must be named explicitly.",
     example: ['message.received', 'session.status'],
     enum: [...WEBHOOK_EVENTS, '*'],
     type: String,
     isArray: true,
     minItems: 1,
+    maxItems: WEBHOOK_EVENTS.length + 1,
   })
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @ArrayMinSize(1)
+  @ArrayMaxSize(WEBHOOK_EVENTS.length + 1)
   // Must include '*' (wildcard subscribe-all) alongside the known events.
   @IsIn([...WEBHOOK_EVENTS, '*'], { each: true })
   events?: string[];
@@ -136,17 +155,21 @@ export class CreateWebhookDto {
     example: 'your-webhook-signing-secret',
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   // A short secret signs webhooks badly: HMAC-SHA256 over a 4-char key is brute-forcible from one
   // observed signature. 16 is the floor, not a recommendation.
   @MinLength(16)
-  @MaxLength(255)
+  @MaxCodePoints(255)
   secret?: string;
 
   @ApiPropertyOptional({
     description:
-      'Custom headers to include in webhook requests. Never returned by any webhook route. At delivery, ' +
-      '`content-type` and `x-openwa-*` names are stripped so a custom header cannot shadow a system one.',
+      'Custom headers to include in webhook requests. Names must be unique ignoring case. Never returned by ' +
+      'any webhook route. At delivery, `content-type`, `user-agent` and `x-openwa-*` names are stripped so a ' +
+      'custom header cannot shadow a system one, ' +
+      'and so are the connection-level names the HTTP client owns (`connection`, `content-length`, ' +
+      '`expect`, `keep-alive`, `te`, `trailer`, `transfer-encoding`, `upgrade`).',
     example: { 'X-Custom-Header': 'value' },
   })
   @IsOptional()
@@ -185,21 +208,28 @@ export class CreateWebhookDto {
 }
 
 export class UpdateWebhookDto {
-  @ApiPropertyOptional({ description: 'Webhook URL' })
-  @IsOptional()
-  @IsUrl({ require_tld: false })
+  @ApiPropertyOptional({ description: 'Webhook URL', maxLength: 2048 })
+  // Not @IsOptional: that also skips validation for null, which these NOT NULL columns cannot store
+  // (save() then failed with a 500). Only an omitted field means "leave unchanged".
+  @ValidateIf((_: UpdateWebhookDto, v: unknown) => v !== undefined)
+  @IsUrl(WEBHOOK_URL_OPTIONS)
+  @MaxCodePoints(2048)
   url?: string;
 
   @ApiPropertyOptional({
-    description: "Event types to subscribe to. '*' subscribes to all events.",
+    description:
+      "Event types to subscribe to. '*' subscribes to all events except `message.receipt`, which must be named explicitly.",
     enum: [...WEBHOOK_EVENTS, '*'],
     type: String,
     isArray: true,
     minItems: 1,
+    maxItems: WEBHOOK_EVENTS.length + 1,
   })
-  @IsOptional()
+  @ValidateIf((_: UpdateWebhookDto, v: unknown) => v !== undefined)
+  @ToStrictArray()
   @IsArray()
   @ArrayMinSize(1)
+  @ArrayMaxSize(WEBHOOK_EVENTS.length + 1)
   @IsIn([...WEBHOOK_EVENTS, '*'], { each: true })
   events?: string[];
 
@@ -218,20 +248,21 @@ export class UpdateWebhookDto {
     // here, where it costs a `400` to ignore rather than a silent downgrade.
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   // Same floor as create: a short secret is brute-forcible from one observed signature. The
   // floor is skipped only for the empty string, which this route treats as "clear the secret"
   // (the service stores null for it); a non-string value is still rejected by @IsString.
   @ValidateIf((o: UpdateWebhookDto) => o.secret !== '')
   @MinLength(16)
-  @MaxLength(255)
+  @MaxCodePoints(255)
   secret?: string;
 
   @ApiPropertyOptional({
     description: 'Custom headers. Replaces the stored map wholesale. Never returned by any webhook route.',
     example: { 'X-Custom-Header': 'value' },
   })
-  @IsOptional()
+  @ValidateIf((_: UpdateWebhookDto, v: unknown) => v !== undefined)
   @IsHeaderMap()
   headers?: Record<string, string>;
 
@@ -241,7 +272,7 @@ export class UpdateWebhookDto {
   // sends and accepts.
   @ApiPropertyOptional({
     type: WebhookFiltersDto,
-    description: FILTERS_API_DESCRIPTION,
+    description: UPDATE_FILTERS_API_DESCRIPTION,
     example: FILTERS_API_EXAMPLE,
     nullable: true,
   })
@@ -251,7 +282,7 @@ export class UpdateWebhookDto {
 
   @ApiPropertyOptional({ description: 'Enable/disable webhook' })
   @ToStrictBoolean()
-  @IsOptional()
+  @ValidateIf((_: UpdateWebhookDto, v: unknown) => v !== undefined)
   @IsBoolean()
   active?: boolean;
 
@@ -264,7 +295,7 @@ export class UpdateWebhookDto {
     maximum: 5,
   })
   @ToStrictNumber()
-  @IsOptional()
+  @ValidateIf((_: UpdateWebhookDto, v: unknown) => v !== undefined)
   @IsInt()
   @Min(0)
   @Max(5)
@@ -345,7 +376,12 @@ export class WebhookResponseDto {
   }
 }
 
-/** A webhook delivery that exhausted every retry — the shape `GET /webhooks/delivery-failures` serves. */
+/**
+ * A webhook delivery that exhausted its retries, or one not sent (attempts 0); the shape
+ * `GET /webhooks/delivery-failures` serves. A shed or shutdown-refused delivery is replayed by the outbox
+ * sweep; one rejected before sending (an over-cap or unserializable payload) is recorded once and not
+ * replayed. A later successful delivery removes the row.
+ */
 export class WebhookDeliveryFailureDto {
   @ApiProperty({ example: '0a941dac-a965-45e7-b318-74ae8be134f0' })
   id!: string;
@@ -372,22 +408,124 @@ export class WebhookDeliveryFailureDto {
   @ApiPropertyOptional({ type: String, nullable: true })
   deliveryId?: string | null;
 
-  @ApiProperty({ description: 'Total attempts made before giving up.', example: 5 })
+  @ApiProperty({
+    description:
+      'Attempts recorded for the delivery; 0 when it was shed, refused or failed before sending. With the ' +
+      'queue disabled, a delivery that shutdown caught in a retry backoff also records 0, although earlier ' +
+      'attempts were sent.',
+    example: 5,
+  })
   attempts!: number;
 
   @ApiPropertyOptional({
     type: Number,
     nullable: true,
-    description: 'Last HTTP status when the failure was a non-2xx response; null for a network/timeout error.',
+    description:
+      'Last HTTP status when the failure was a non-2xx response; null for a network/timeout error, a blocked ' +
+      'destination, or a redirect (a 3xx answer is not followed, unless WEBHOOK_SSRF_PROTECT=false and ' +
+      'WEBHOOK_SSRF_REDIRECTS=true are both set, and is recorded without its status).',
     example: null,
   })
   lastStatusCode?: number | null;
 
-  @ApiProperty({ example: 'connect ECONNREFUSED 10.0.0.1:443' })
+  @ApiProperty({ example: 'fetch failed' })
   lastError!: string;
 
-  @ApiProperty({ type: String, format: 'date-time', description: 'When the delivery was finally abandoned.' })
+  @ApiProperty({ type: String, format: 'date-time', description: 'When the failure was first recorded.' })
   createdAt!: Date;
+
+  @ApiProperty({
+    description:
+      'True when the row still holds the event data and its webhook still exists in the same session. Only ' +
+      'terminal rows (attempts > 0) recorded while `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` > 0 hold it, until ' +
+      'that window passes. `POST /webhooks/delivery-failures/redrive` replays such a row while its webhook is ' +
+      'active and subscribed to the event, so a row of a disabled or unsubscribed webhook stays replayable for ' +
+      'when the webhook is switched back.',
+    example: false,
+  })
+  replayable!: boolean;
+}
+
+/** Body of `POST /webhooks/delivery-failures/redrive`. Every field narrows; an empty body takes eligible rows with the fewest attempts. */
+export class RedriveWebhookDeliveriesDto {
+  @ApiPropertyOptional({
+    description: "Only rows of this session. Narrows within the calling key's allowedSessions, never past it.",
+    example: 'my-session',
+  })
+  @IsOptional()
+  @ToStrictString()
+  @IsString()
+  @MaxLength(128)
+  sessionId?: string;
+
+  @ApiPropertyOptional({ description: 'Only rows of this webhook.', example: '0a941dac-a965-45e7-b318-74ae8be134f0' })
+  @IsOptional()
+  @ToStrictString()
+  @IsString()
+  @MaxLength(128)
+  webhookId?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description: 'Only these failure rows (ids from `GET /webhooks/delivery-failures`).',
+    example: ['0a941dac-a965-45e7-b318-74ae8be134f0'],
+    maxItems: 500,
+    items: { type: 'string', maxLength: 128 },
+  })
+  @IsOptional()
+  @ToStrictArray()
+  @IsArray()
+  @ArrayMaxSize(500)
+  @IsString({ each: true })
+  @MaxLength(128, { each: true })
+  ids?: string[];
+
+  @ApiPropertyOptional({
+    description: 'Max rows replayed by this call (1-500, default 100).',
+    example: 100,
+    minimum: 1,
+    maximum: 500,
+  })
+  @ToStrictNumber()
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(500)
+  limit?: number;
+}
+
+/** Outcome of `POST /webhooks/delivery-failures/redrive`. */
+export class WebhookRedriveResultDto {
+  @ApiProperty({ description: 'Rows replayed by this call; equals delivered.', example: 2 })
+  redriven!: number;
+
+  @ApiProperty({ description: 'Delivered by a direct POST; their failure rows were removed.', example: 2 })
+  delivered!: number;
+
+  @ApiProperty({
+    description: 'Reserved for response compatibility; operator redrive uses direct POST and returns zero.',
+    example: 0,
+  })
+  enqueued!: number;
+
+  @ApiProperty({ description: 'Replays that failed again; their rows stay, with attempts raised by one.', example: 0 })
+  failed!: number;
+
+  @ApiProperty({
+    description:
+      'Selected rows not replayed: a hook cancelled the replay, or the row or its webhook changed during the call. ' +
+      'Rows of a removed, disabled or unsubscribed webhook are left out before the batch and not counted.',
+    example: 0,
+  })
+  skipped!: number;
+
+  @ApiProperty({
+    description:
+      'Rows the redrive would still take after this call: replayable, in scope, with an active webhook subscribed ' +
+      'to the event.',
+    example: 0,
+  })
+  remaining!: number;
 }
 
 /** Outcome of `POST /sessions/:sessionId/webhooks/:id/test`. */
@@ -395,7 +533,13 @@ export class WebhookTestResponseDto {
   @ApiProperty({ description: 'True when the receiver answered 2xx.', example: true })
   success!: boolean;
 
-  @ApiPropertyOptional({ description: 'The HTTP status the receiver answered, when it answered.', example: 200 })
+  @ApiPropertyOptional({
+    description:
+      'The HTTP status the receiver answered, when it answered. A redirect (3xx) is not followed, unless ' +
+      'WEBHOOK_SSRF_PROTECT=false and WEBHOOK_SSRF_REDIRECTS=true are both set, and is reported as an error ' +
+      'with no status.',
+    example: 200,
+  })
   statusCode?: number;
 
   @ApiPropertyOptional({ description: 'The delivery error, when the attempt failed.', example: 'timeout' })

@@ -1,5 +1,6 @@
 import { RedisThrottlerStorage, THROTTLER_REDIS_QUIT_TIMEOUT_MS } from './redis-throttler.storage';
 import type { Redis } from 'ioredis';
+import { LoggerService } from '../services/logger.service';
 
 type MockRedis = { eval: jest.Mock; on: jest.Mock; quit: jest.Mock; disconnect: jest.Mock };
 
@@ -29,24 +30,27 @@ describe('RedisThrottlerStorage', () => {
     expect(rec).toEqual({ totalHits: 1, timeToExpire: 2, isBlocked: false, timeToBlockExpire: 0 });
   });
 
-  it('treats a repaired legacy TTL-less counter as a fresh first hit', async () => {
-    const redis = makeRedis({ hits: 1, ttlMs: 1000 });
-    const rec = await new RedisThrottlerStorage(redis as unknown as Redis).increment('k', 1000, 10, 60000, 'short');
-    expect(redis.eval).toHaveBeenCalledWith(
-      expect.stringContaining("redis.call('SET', KEYS[1], 1, 'PX'"),
-      1,
-      expect.any(String),
-      '1000',
+  // The block is the counter itself, so it lifts when the window key expires, not after blockDuration:
+  // advertising blockDuration made a client that honours Retry-After wait up to an hour for nothing.
+  it('over the limit (incr>limit) is blocked until the window expires, in seconds', async () => {
+    const redis = makeRedis({ hits: 1001, ttlMs: 4200 });
+    const rec = await new RedisThrottlerStorage(redis as unknown as Redis).increment(
+      'k',
+      3600000,
+      1000,
+      3600000,
+      'long',
     );
-    expect(rec).toEqual({ totalHits: 1, timeToExpire: 1, isBlocked: false, timeToBlockExpire: 0 });
+    expect(rec.isBlocked).toBe(true);
+    expect(rec.totalHits).toBe(1001);
+    expect(rec.timeToBlockExpire).toBe(5); // ceil(4200ms / 1000), not the 3600 s blockDuration
   });
 
-  it('over the limit (incr>limit) is blocked with blockDuration in seconds', async () => {
-    const redis = makeRedis({ hits: 11, ttlMs: 500 });
+  it('never advertises a zero Retry-After on a blocked request', async () => {
+    const redis = makeRedis({ hits: 11, ttlMs: 0 });
     const rec = await new RedisThrottlerStorage(redis as unknown as Redis).increment('k', 1000, 10, 60000, 'short');
     expect(rec.isBlocked).toBe(true);
-    expect(rec.totalHits).toBe(11);
-    expect(rec.timeToBlockExpire).toBe(60); // 60000ms / 1000
+    expect(rec.timeToBlockExpire).toBe(1);
   });
 
   it('fails OPEN on a Redis error (returns a non-blocking record so the limiter never self-DoSes)', async () => {
@@ -67,6 +71,41 @@ describe('RedisThrottlerStorage', () => {
       new Promise<'slow'>(resolve => setTimeout(() => resolve('slow'), 100)),
     ]);
     expect(result).toEqual({ totalHits: 0, timeToExpire: 0, isBlocked: false, timeToBlockExpire: 0 });
+  });
+
+  it('warns once while Redis stays down, says when it answers again, and warns again on the next outage', async () => {
+    const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+    const log = jest.spyOn(LoggerService.prototype, 'log').mockImplementation(() => undefined);
+    try {
+      const redis = makeRedis({ hits: 1, ttlMs: 1000 });
+      redis.eval.mockRejectedValue(new Error('ECONNREFUSED'));
+      const storage = new RedisThrottlerStorage(redis as unknown as Redis);
+      // Each guarded request checks three throttlers.
+      for (let i = 0; i < 100; i++) {
+        for (const name of ['short', 'medium', 'long']) {
+          expect(await storage.increment('k', 1000, 10, 60000, name)).toEqual({
+            totalHits: 0,
+            timeToExpire: 0,
+            isBlocked: false,
+            timeToBlockExpire: 0,
+          });
+        }
+      }
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      redis.eval.mockResolvedValue([1, 1000]);
+      await storage.increment('k', 1000, 10, 60000, 'short');
+      await storage.increment('k', 1000, 10, 60000, 'medium');
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0]).toContain('300');
+
+      redis.eval.mockRejectedValue(new Error('ECONNREFUSED'));
+      await storage.increment('k', 1000, 10, 60000, 'short');
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
   });
 
   it('attaches an error listener so connection failures surface as structured logs, never unhandled events', () => {

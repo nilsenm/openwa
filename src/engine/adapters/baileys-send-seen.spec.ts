@@ -31,12 +31,16 @@ function makeHost(overrides: Partial<Record<keyof BaileysContactsHost, unknown>>
     listContacts: () => [],
     findContact: () => null,
     resolvePhone: () => null,
+    findPersistedLidPhone: () => Promise.resolve(null),
     listChats: () => [],
-    lastMessage: () => ({ key: { id: 'M1', remoteJid: '628123@s.whatsapp.net' }, timestamp: 1 }),
+    lastInboundMessage: () => ({ key: { id: 'M1', remoteJid: '628123@s.whatsapp.net' }, timestamp: 1 }),
+    chatDeletedAt: () => null,
     getStoredMessages: () => Promise.resolve([]),
     toEngineJid,
     ...overrides,
   } as unknown as BaileysContactsHost;
+  const socket = host.getSocket();
+  host.getSocket = () => socket;
   // Wired the way the adapter wires it: the real fold, reading the session's lid mapping through
   // this host's own resolvePhone, so a test can hand it a mapping and exercise the lid dialect.
   host.toNeutralJid = (jid: string): string => toNeutralJid(jid, id => host.resolvePhone(id));
@@ -100,6 +104,7 @@ describe('sendSeen', () => {
     const host = makeHost({
       getSocket: () => ({ readMessages }) as unknown as WASocket,
       resolvePhone: (jid: string) => (jid === '9988@lid' ? '628123' : null),
+      findPersistedLidPhone: (jid: string) => Promise.resolve(jid === '9988@lid' ? '628123' : null),
       getStoredMessages: () =>
         Promise.resolve([stored({ id: 'L1', remoteJid: '9988@lid', fromMe: true, participant: '9988@lid' })]),
     });
@@ -134,6 +139,20 @@ describe('sendSeen', () => {
 
     await expect(new BaileysContacts(host, 500).sendSeen('628123@s.whatsapp.net', ['D1'])).resolves.toBe(true);
     expect(readMessages).toHaveBeenCalledWith([{ id: 'D1', remoteJid: '628123@c.us', fromMe: true }]);
+  });
+
+  it('keeps the stored key of a received broadcast-list message addressed by its sender chat', async () => {
+    // The message is reported under the sender's chat, but its key names the list and the sender.
+    // Synthesising a key for the sender's chat dropped the participant the receipt needs.
+    const readMessages = jest.fn().mockResolvedValue(undefined);
+    const key = { id: 'B1', remoteJid: '1700000000@broadcast', participant: '628123@s.whatsapp.net', fromMe: false };
+    const host = makeHost({
+      getSocket: () => ({ readMessages }) as unknown as WASocket,
+      getStoredMessages: () => Promise.resolve([stored(key)]),
+    });
+
+    await expect(new BaileysContacts(host, 500).sendSeen('628123@c.us', ['B1'])).resolves.toBe(true);
+    expect(readMessages).toHaveBeenCalledWith([key]);
   });
 
   it('treats a null id list as absent rather than dereferencing it', async () => {
@@ -192,11 +211,97 @@ describe('sendSeen', () => {
     ]);
   });
 
+  describe('ids of a group the message store never held', () => {
+    // History backfill is emitted and persisted for the chat view only, so a group message of that kind has no
+    // stored key. A group receipt names its sender through `participant`; without it WhatsApp cannot attribute
+    // the receipt, so the id takes the gateway's stored author or is left out.
+    const GROUP = '628999-1@g.us';
+    const authors = (entries: Array<[string, string]>): ReadonlyMap<string, string> => new Map(entries);
+
+    it('builds the key with the stored author as its participant', async () => {
+      const readMessages = jest.fn().mockResolvedValue(undefined);
+      const host = makeHost({ getSocket: () => ({ readMessages }) as unknown as WASocket });
+
+      await expect(
+        new BaileysContacts(host, 500).sendSeen(GROUP, ['H1'], authors([['H1', '628123@c.us']])),
+      ).resolves.toBe(true);
+
+      expect(readMessages).toHaveBeenCalledWith([
+        { remoteJid: GROUP, id: 'H1', fromMe: false, participant: '628123@s.whatsapp.net' },
+      ]);
+    });
+
+    it('leaves a lid author in its own dialect', async () => {
+      const readMessages = jest.fn().mockResolvedValue(undefined);
+      const host = makeHost({ getSocket: () => ({ readMessages }) as unknown as WASocket });
+
+      await new BaileysContacts(host, 500).sendSeen(GROUP, ['H1'], authors([['H1', '9988@lid']]));
+
+      expect(readMessages).toHaveBeenCalledWith([
+        { remoteJid: GROUP, id: 'H1', fromMe: false, participant: '9988@lid' },
+      ]);
+    });
+
+    it('sends no key at all for an id whose author is unknown, and says nothing was acknowledged', async () => {
+      const readMessages = jest.fn().mockResolvedValue(undefined);
+      const host = makeHost({ getSocket: () => ({ readMessages }) as unknown as WASocket });
+
+      await expect(new BaileysContacts(host, 500).sendSeen(GROUP, ['H1', 'H2'])).resolves.toBe(false);
+      await expect(
+        new BaileysContacts(host, 500).sendSeen(GROUP, ['H1'], authors([['OTHER', '628123@c.us']])),
+      ).resolves.toBe(false);
+
+      expect(readMessages).not.toHaveBeenCalled();
+    });
+
+    it('acknowledges the ids it can name and skips the rest without failing the read', async () => {
+      const readMessages = jest.fn().mockResolvedValue(undefined);
+      const stored1 = { id: 'S1', remoteJid: GROUP, fromMe: false, participant: '628111@s.whatsapp.net' };
+      const host = makeHost({
+        getSocket: () => ({ readMessages }) as unknown as WASocket,
+        getStoredMessages: () => Promise.resolve([stored(stored1)]),
+      });
+
+      await expect(
+        new BaileysContacts(host, 500).sendSeen(
+          GROUP,
+          ['S1', 'H1', 'LOST', 'H2'],
+          // S1 has an author too: the stored key wins, as it carries the dialect WhatsApp used.
+          authors([
+            ['S1', '628000@c.us'],
+            ['H1', '628123@c.us'],
+            ['H2', '628456@c.us'],
+          ]),
+        ),
+      ).resolves.toBe(true);
+
+      expect(readMessages).toHaveBeenCalledWith([
+        stored1,
+        { remoteJid: GROUP, id: 'H1', fromMe: false, participant: '628123@s.whatsapp.net' },
+        { remoteJid: GROUP, id: 'H2', fromMe: false, participant: '628456@s.whatsapp.net' },
+      ]);
+    });
+
+    it('keeps a stored key and leaves a one to one chat on its synthesised key whatever authors say', async () => {
+      const readMessages = jest.fn().mockResolvedValue(undefined);
+      const host = makeHost({ getSocket: () => ({ readMessages }) as unknown as WASocket });
+
+      await expect(
+        new BaileysContacts(host, 500).sendSeen('628123@c.us', ['M1'], authors([['M1', '628555@c.us']])),
+      ).resolves.toBe(true);
+
+      expect(readMessages).toHaveBeenCalledWith([{ remoteJid: '628123@s.whatsapp.net', id: 'M1', fromMe: false }]);
+    });
+  });
+
   it('marks supplied messages even when the store has nothing cached', async () => {
     // The restart case: the in-memory store is empty, so the old code returned false under a 200
     // and no receipt was ever sent. A caller that persisted the IDs is not subject to that.
     const readMessages = jest.fn().mockResolvedValue(undefined);
-    const host = makeHost({ getSocket: () => ({ readMessages }) as unknown as WASocket, lastMessage: () => null });
+    const host = makeHost({
+      getSocket: () => ({ readMessages }) as unknown as WASocket,
+      lastInboundMessage: () => null,
+    });
     await expect(new BaileysContacts(host, 500).sendSeen('628123@c.us', ['M9'])).resolves.toBe(true);
     expect(readMessages).toHaveBeenCalledWith([{ remoteJid: '628123@s.whatsapp.net', id: 'M9', fromMe: false }]);
   });
@@ -219,14 +324,14 @@ describe('sendSeen', () => {
     expect(readMessages).not.toHaveBeenCalled();
   });
 
-  it('falls back to the cached last message when no list is supplied', async () => {
+  it('falls back to the newest received message when no list is supplied', async () => {
     const readMessages = jest.fn().mockResolvedValue(undefined);
     await expect(contacts({ readMessages }, 500).sendSeen('628123@c.us')).resolves.toBe(true);
     expect(readMessages).toHaveBeenCalledWith([{ id: 'M1', remoteJid: '628123@s.whatsapp.net' }]);
   });
 
-  it('still short-circuits when there is no last message to mark', async () => {
-    const host = makeHost({ getSocket: () => ({}) as unknown as WASocket, lastMessage: () => null });
+  it('still short-circuits when no received message is known', async () => {
+    const host = makeHost({ getSocket: () => ({}) as unknown as WASocket, lastInboundMessage: () => null });
     await expect(new BaileysContacts(host, 15).sendSeen('628123@c.us')).resolves.toBe(false);
   });
 });

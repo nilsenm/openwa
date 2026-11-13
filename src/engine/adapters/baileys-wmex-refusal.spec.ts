@@ -73,21 +73,33 @@ describe('a refused channel lookup is "no such channel", not a bare 500', () => 
     expect(sock.newsletterFollow).not.toHaveBeenCalled();
   });
 
-  it('a dead socket or the no-answer shape on the lookup still propagates', async () => {
+  it('a dead socket on the lookup answers 503 and the no-answer shape still propagates, neither as 404', async () => {
     const connectionClosed = new Boom('Connection Closed', { statusCode: 428 });
+    const closedLookup = jest.fn().mockRejectedValue(connectionClosed);
+    await expect(
+      channels({ newsletterMetadata: closedLookup }, 500).getChannelById('120363@newsletter'),
+    ).rejects.toBeInstanceOf(EngineTransportError);
     const noAnswer = new Boom('Failed to newsletter metadata, unexpected response structure.', { statusCode: 400 });
-    for (const error of [connectionClosed, noAnswer]) {
-      const newsletterMetadata = jest.fn().mockRejectedValue(error);
-      await expect(channels({ newsletterMetadata }, 500).getChannelById('120363@newsletter')).rejects.toBe(error);
-    }
+    const newsletterMetadata = jest.fn().mockRejectedValue(noAnswer);
+    await expect(channels({ newsletterMetadata }, 500).getChannelById('120363@newsletter')).rejects.toBe(noAnswer);
   });
 
-  it("Baileys' own send timeout or a rate limit on the lookup propagates, not as 404", async () => {
+  it("Baileys' own send timeout on the lookup propagates, not as 404", async () => {
     // promiseTimeout (Utils/generics.js) rejects a stalled send with an OBJECT data and a 408 code.
     const timedOut = new Boom('Timed Out', { statusCode: 408, data: { stack: 'Error\n    at x' } });
-    for (const error of [timedOut, wmexRefusal(429)]) {
-      const newsletterMetadata = jest.fn().mockRejectedValue(error);
-      await expect(channels({ newsletterMetadata }, 500).getChannelById('120363@newsletter')).rejects.toBe(error);
+    const newsletterMetadata = jest.fn().mockRejectedValue(timedOut);
+    await expect(channels({ newsletterMetadata }, 500).getChannelById('120363@newsletter')).rejects.toBe(timedOut);
+  });
+
+  it('a lookup WhatsApp rate-limits or times out answers 503, not 404 or a bare 500', async () => {
+    for (const code of [408, 429]) {
+      const newsletterMetadata = jest.fn().mockRejectedValue(wmexRefusal(code));
+      await expect(channels({ newsletterMetadata }, 500).getChannelById('120363@newsletter')).rejects.toBeInstanceOf(
+        EngineTransportError,
+      );
+      const sock = { newsletterMetadata, newsletterFollow: jest.fn() };
+      await expect(channels(sock, 500).subscribeToChannel('INVITE')).rejects.toBeInstanceOf(EngineTransportError);
+      expect(sock.newsletterFollow).not.toHaveBeenCalled();
     }
   });
 
@@ -100,10 +112,12 @@ describe('a refused channel lookup is "no such channel", not a bare 500', () => 
 });
 
 describe('what must NOT be classified as a refusal', () => {
-  it('a dead socket still propagates rather than becoming a 403', async () => {
+  it('a dead socket answers a retryable 503 rather than becoming a 403', async () => {
     const connectionClosed = new Boom('Connection Closed', { statusCode: 428 });
     const newsletterDelete = jest.fn().mockRejectedValue(connectionClosed);
-    await expect(channels({ newsletterDelete }, 500).deleteChannel('120363@newsletter')).rejects.toBe(connectionClosed);
+    await expect(channels({ newsletterDelete }, 500).deleteChannel('120363@newsletter')).rejects.toBeInstanceOf(
+      EngineTransportError,
+    );
   });
 
   it("Baileys' own send timeout still propagates rather than becoming a 403", async () => {
@@ -119,6 +133,15 @@ describe('what must NOT be classified as a refusal', () => {
     await expect(channels({ newsletterDelete }, 15).deleteChannel('120363@newsletter')).rejects.toBeInstanceOf(
       EngineTransportError,
     );
+  });
+
+  it('a WhatsApp 408 on channel create stays opaque rather than becoming a retryable 503', async () => {
+    // A server timeout does not say whether the channel was created, and a 503 invites a retried POST.
+    const timedOut = wmexRefusal(408);
+    const newsletterCreate = jest.fn().mockRejectedValue(timedOut);
+    const result = channels({ newsletterCreate }, 500).createChannel('N');
+    await expect(result).rejects.toBe(timedOut);
+    await expect(result).rejects.not.toBeInstanceOf(EngineTransportError);
   });
 
   it('the WMex no-answer shape is not a refusal either — its data is null', async () => {

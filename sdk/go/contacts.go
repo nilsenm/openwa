@@ -31,7 +31,8 @@ func (s *ContactsService) Get(ctx context.Context, sessionID, contactID string) 
 	return &out, nil
 }
 
-// Check reports whether a number is on WhatsApp.
+// Check reports whether a number is on WhatsApp. Requires an OPERATOR-level
+// key.
 func (s *ContactsService) Check(ctx context.Context, sessionID, number string) (*CheckNumberResponse, error) {
 	var out CheckNumberResponse
 	err := s.client.do(ctx, "GET", s.base(sessionID)+"/check/"+pathEscape(number), nil, nil, &out)
@@ -53,7 +54,7 @@ func (s *ContactsService) ProfilePicture(ctx context.Context, sessionID, contact
 
 // ProfilePictures batch-resolves profile picture URLs for up to 50 contacts
 // in one request. The result maps each requested id to its URL (nil when the
-// lookup failed).
+// lookup failed). An id skipped after a lookup timed out is absent from the map; ask for it again.
 func (s *ContactsService) ProfilePictures(ctx context.Context, sessionID string, ids []string) (*ProfilePicturesResponse, error) {
 	var out ProfilePicturesResponse
 	q := url.Values{"ids": []string{strings.Join(ids, ",")}}
@@ -74,8 +75,21 @@ func (s *ContactsService) Phone(ctx context.Context, sessionID, contactID string
 	return &out, nil
 }
 
-// Block blocks a contact.
-// Upsert saves a contact to the addressbook, or edits an existing entry.
+// Lid looks up the @lid WhatsApp holds for a phone number, without sending a message. Lid is nil when
+// WhatsApp holds none, which an unregistered number also answers. The lookup can query WhatsApp (Baileys
+// on every call, whatsapp-web.js when the page holds no LID), so bulk lookups put the linked account at
+// risk. Requires an OPERATOR-level key.
+func (s *ContactsService) Lid(ctx context.Context, sessionID, number string) (*ContactLidResponse, error) {
+	var out ContactLidResponse
+	err := s.client.do(ctx, "GET", s.base(sessionID)+"/"+pathEscape(number)+"/lid", nil, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Upsert saves a contact to the addressbook, or edits an existing entry. Requires an OPERATOR-level
+// key.
 func (s *ContactsService) Upsert(ctx context.Context, sessionID, contactID string, body UpsertContactRequest) (*SuccessResult, error) {
 	var out SuccessResult
 	if err := s.client.do(ctx, "PUT", s.base(sessionID)+"/"+pathEscape(contactID), nil, body, &out); err != nil {
@@ -84,7 +98,7 @@ func (s *ContactsService) Upsert(ctx context.Context, sessionID, contactID strin
 	return &out, nil
 }
 
-// Delete removes a contact from the addressbook.
+// Delete removes a contact from the addressbook. Requires an OPERATOR-level key.
 func (s *ContactsService) Delete(ctx context.Context, sessionID, contactID string) (*SuccessResult, error) {
 	var out SuccessResult
 	if err := s.client.do(ctx, "DELETE", s.base(sessionID)+"/"+pathEscape(contactID), nil, nil, &out); err != nil {
@@ -93,6 +107,7 @@ func (s *ContactsService) Delete(ctx context.Context, sessionID, contactID strin
 	return &out, nil
 }
 
+// Block blocks a contact. Requires an OPERATOR-level key.
 func (s *ContactsService) Block(ctx context.Context, sessionID, contactID string) (*SuccessResult, error) {
 	var out SuccessResult
 	err := s.client.do(ctx, "POST", s.base(sessionID)+"/"+pathEscape(contactID)+"/block", nil, nil, &out)
@@ -102,7 +117,7 @@ func (s *ContactsService) Block(ctx context.Context, sessionID, contactID string
 	return &out, nil
 }
 
-// Unblock unblocks a contact.
+// Unblock unblocks a contact. Requires an OPERATOR-level key.
 func (s *ContactsService) Unblock(ctx context.Context, sessionID, contactID string) (*SuccessResult, error) {
 	var out SuccessResult
 	err := s.client.do(ctx, "DELETE", s.base(sessionID)+"/"+pathEscape(contactID)+"/block", nil, nil, &out)

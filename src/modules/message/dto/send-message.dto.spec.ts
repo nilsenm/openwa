@@ -1,6 +1,8 @@
+import { DECORATORS } from '@nestjs/swagger';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import {
+  CustomLinkPreviewDto,
   SendTextMessageDto,
   SendMediaMessageDto,
   SendAudioMessageDto,
@@ -15,10 +17,14 @@ import {
   SEND_POLL_BODY_EXAMPLES,
 } from './send-message.dto';
 import { SendLocationDto, SendContactDto, SendPollDto } from './message-actions.dto';
+import { SendTemplateMessageDto } from './send-template.dto';
+import { GLOBAL_VALIDATION_OPTIONS } from '../../../config/app-validation';
 
-// Mirror the global ValidationPipe (main.ts): whitelist + forbidNonWhitelisted strip/reject unknown props.
+// Read the production pipe's own options rather than restating them, so these cases cannot assert a
+// contract the running app does not apply (a restated copy left out implicit conversion). Validated
+// directly instead of through pipe.transform so the cases can name the property that failed.
 const validateDto = (cls: new () => object, obj: unknown) =>
-  validate(plainToInstance(cls, obj), { whitelist: true, forbidNonWhitelisted: true });
+  validate(plainToInstance(cls, obj, GLOBAL_VALIDATION_OPTIONS.transformOptions), GLOBAL_VALIDATION_OPTIONS);
 
 describe('SendTextMessageDto mentions', () => {
   it('accepts an optional array of mention WIDs', async () => {
@@ -249,5 +255,144 @@ describe('SendMediaMessageDto url', () => {
       url: 'cdn/banner.jpg',
     });
     expect(errors.map(e => e.property)).toContain('url');
+  });
+});
+
+describe('SendMediaMessageDto base64', () => {
+  // A url next to it must not switch the type check off: buildMediaInput reads base64 first, so a
+  // non-string there reached the engine whatever the url said.
+  it('rejects a non-string base64 even when a url is present', async () => {
+    const errors = await validateDto(SendMediaMessageDto, {
+      chatId: 'c@c.us',
+      url: 'https://example.com/a.jpg',
+      base64: ['x'],
+      mimetype: 'image/jpeg',
+    });
+    expect(errors.map(e => e.property)).toContain('base64');
+  });
+});
+
+// @nestjs/swagger derives no bounds from the validators, so each one is declared on the decorator;
+// without it the published schema advertises an unbounded field the server answers 400 for.
+describe('SendTemplateMessageDto identifiers', () => {
+  // TemplateService.resolve reads templateId first, so a templateName next to it must not switch the
+  // type check off.
+  it('rejects a non-string templateId even when a templateName is present', async () => {
+    const errors = await validateDto(SendTemplateMessageDto, {
+      chatId: 'c@c.us',
+      templateId: ['a'],
+      templateName: 'x',
+    });
+    expect(errors.map(e => e.property)).toContain('templateId');
+  });
+
+  it('rejects a non-string templateName even when a templateId is present', async () => {
+    const errors = await validateDto(SendTemplateMessageDto, {
+      chatId: 'c@c.us',
+      templateId: 'a',
+      templateName: ['x'],
+    });
+    expect(errors.map(e => e.property)).toContain('templateName');
+  });
+});
+
+describe('SendTextMessageDto customLinkPreview', () => {
+  const base = { chatId: 'g@g.us', text: 'hi https://example.com' };
+  const preview = { url: 'https://example.com', title: 'Example' };
+  const previewErrors = async (customLinkPreview: unknown) =>
+    (await validateDto(SendTextMessageDto, { ...base, customLinkPreview })).filter(
+      e => e.property === 'customLinkPreview',
+    );
+
+  it('accepts the preview as an object', async () => {
+    expect(await previewErrors(preview)).toHaveLength(0);
+  });
+
+  // @ValidateNested checks an array element by element, so [] and [{...}] passed and reached the engine as
+  // an array, which Baileys read .url and .title off to send an empty preview without an error.
+  it.each([[[]], [[preview]]])('refuses an array: %j', async value => {
+    expect(await previewErrors(value)).toHaveLength(1);
+  });
+
+  it('accepts a preview image as an http(s) URL or as base64', async () => {
+    expect(await previewErrors({ ...preview, thumbnailUrl: 'https://cdn.example/a.jpg' })).toHaveLength(0);
+    expect(await previewErrors({ ...preview, thumbnailBase64: 'AAAA' })).toHaveLength(0);
+  });
+
+  it('refuses a preview image URL that is not http(s)', async () => {
+    expect(await previewErrors({ ...preview, thumbnailUrl: 'file:///etc/passwd' })).toHaveLength(1);
+  });
+
+  // base64 wins, as on the media routes, so the URL beside it is never fetched and not checked.
+  it('does not check a preview image URL beside a base64', async () => {
+    expect(await previewErrors({ ...preview, thumbnailUrl: 'not a url', thumbnailBase64: 'AAAA' })).toHaveLength(0);
+  });
+});
+
+// Implicit conversion rewrote a boolean or an object into its string form before @IsString ran, so
+// {"text":{"order":42}} was sent as the literal text "[object Object]". A number keeps the conversion: no-code
+// clients post a phone number or a chat id held as a number, and every release has read it as its decimal
+// string. Every field below is documented as a string, in docs/06 and in the request types of all five SDKs.
+describe('string fields refuse a boolean or an object', () => {
+  const invalid: Array<[unknown]> = [[{ order: 42 }], [true], [['a']]];
+
+  it.each(invalid)('SendTextMessageDto refuses text %j', async text => {
+    const errors = await validateDto(SendTextMessageDto, { chatId: 'g@g.us', text });
+    expect(errors.map(e => e.property)).toEqual(['text']);
+  });
+
+  it.each(invalid)('SendTextMessageDto refuses chatId %j', async chatId => {
+    const errors = await validateDto(SendTextMessageDto, { chatId, text: 'hi' });
+    expect(errors.map(e => e.property)).toEqual(['chatId']);
+  });
+
+  it.each(invalid)('SendMediaMessageDto refuses caption %j', async caption => {
+    const errors = await validateDto(SendMediaMessageDto, {
+      chatId: 'g@g.us',
+      url: 'https://example.com/a.jpg',
+      caption,
+    });
+    expect(errors.map(e => e.property)).toEqual(['caption']);
+  });
+
+  it.each(invalid)('SendContactDto refuses contactNumber %j', async contactNumber => {
+    const errors = await validateDto(SendContactDto, { chatId: 'g@g.us', contactName: 'Alice', contactNumber });
+    expect(errors.map(e => e.property)).toEqual(['contactNumber']);
+  });
+
+  it('still reads a number as its decimal string', async () => {
+    const contact = plainToInstance(
+      SendContactDto,
+      { chatId: 'g@g.us', contactName: 'Alice', contactNumber: 628999888777 },
+      GLOBAL_VALIDATION_OPTIONS.transformOptions,
+    );
+    expect(contact.contactNumber).toBe('628999888777');
+    expect(await validate(contact, GLOBAL_VALIDATION_OPTIONS)).toHaveLength(0);
+
+    expect(await validateDto(SendTextMessageDto, { chatId: 'g@g.us', text: 5 })).toHaveLength(0);
+  });
+
+  it('still takes the same values spelled as strings', async () => {
+    expect(await validateDto(SendTextMessageDto, { chatId: 'g@g.us', text: '{"order":42}' })).toHaveLength(0);
+    expect(await validateDto(SendTextMessageDto, { chatId: 'g@g.us', text: '628123456789' })).toHaveLength(0);
+    expect(await validateDto(SendTextMessageDto, { chatId: 'g@g.us', text: 'true' })).toHaveLength(0);
+  });
+});
+
+describe('published schema bounds', () => {
+  const published = (cls: new () => object, key: string): Record<string, unknown> | undefined =>
+    Reflect.getMetadata(DECORATORS.API_MODEL_PROPERTIES, cls.prototype as object, key) as
+      Record<string, unknown> | undefined;
+
+  it.each([SendTextMessageDto, SendMediaMessageDto, SendTemplateMessageDto])('%p bounds mentions', cls => {
+    expect(published(cls, 'mentions')).toMatchObject({
+      maxItems: 1024,
+      items: { type: 'string', maxLength: 64 },
+    });
+  });
+
+  it('bounds the media filename and the custom preview url', () => {
+    expect(published(SendMediaMessageDto, 'filename')?.maxLength).toBe(255);
+    expect(published(CustomLinkPreviewDto, 'url')?.maxLength).toBe(2048);
   });
 });

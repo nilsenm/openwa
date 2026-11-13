@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -63,6 +66,33 @@ func TestNewValidation(t *testing.T) {
 	}
 }
 
+func TestNewTrimsTheKeyAndRefusesAControlCharacterWithoutRepeatingIt(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{"valid":true}`}
+	c, err := New("https://x", " owa_k1_test\n", WithTransport(rt))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := c.Auth.Validate(context.Background()); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := rt.lastReq.Header.Get("X-API-Key"); got != "owa_k1_test" {
+		t.Fatalf("X-API-Key = %q, want the trimmed key", got)
+	}
+	// An inner space is part of a passphrase key.
+	if _, err := New("https://x", "correct horse battery"); err != nil {
+		t.Fatalf("a key with an inner space: %v", err)
+	}
+	for _, bad := range []string{"owa_k1_se\ncret", "owa_k1_se\x00cret", "owa_k1_se\x7fcret"} {
+		_, err := New("https://x", bad)
+		if err == nil {
+			t.Fatalf("expected an error for %q", bad)
+		}
+		if strings.Contains(err.Error(), "cret") {
+			t.Fatalf("the error repeats the key: %v", err)
+		}
+	}
+}
+
 func TestSendTextHitsCorrectPath(t *testing.T) {
 	rt := &recordTransport{status: 200, body: `{"messageId":"m1","timestamp":123}`}
 	c := newTestClient(t, rt)
@@ -111,6 +141,93 @@ func TestJIDPathIsReadable(t *testing.T) {
 	}
 }
 
+func TestEmptyAndDotSegmentsRefused(t *testing.T) {
+	var hits int32
+	rt := RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&hits, 1)
+		return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}, Request: req}, nil
+	})
+	c := newTestClient(t, rt)
+	ctx := context.Background()
+
+	refused := map[string]error{
+		`Webhooks.Delete ".."`: c.Webhooks.Delete(ctx, "s1", ".."),
+		`Webhooks.Delete "."`:  c.Webhooks.Delete(ctx, "s1", "."),
+		`Webhooks.Delete ""`:   c.Webhooks.Delete(ctx, "s1", ""),
+		`Do %2E%2e`:            c.Do(ctx, "DELETE", "/api/sessions/s1/labels/%2E%2e", nil, nil, nil),
+		`Do ..`:                c.Do(ctx, "GET", "/api/sessions/s1/..?x=1", nil, nil, nil),
+	}
+	_, err := c.Sessions.Get(ctx, "")
+	refused[`Sessions.Get ""`] = err
+	_, err = c.Messages.Media(ctx, "s1", "..", "m1")
+	refused[`Messages.Media ".."`] = err
+	_, err = c.Status.Media(ctx, "s1", ".")
+	refused[`Status.Media "."`] = err
+	for name, err := range refused {
+		if err == nil || !strings.Contains(err.Error(), "path segment") {
+			t.Errorf("%s: err = %v, want a path segment error", name, err)
+		}
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Fatalf("%d requests sent, want 0", n)
+	}
+
+	// Dots inside an id, a dot-only query value, and a hand-written trailing or
+	// double slash are not refused.
+	for _, id := range []string{"a.b", "...", "628123@c.us"} {
+		if err := c.Webhooks.Delete(ctx, "s1", id); err != nil {
+			t.Errorf("Webhooks.Delete %q: %v", id, err)
+		}
+	}
+	for _, path := range []string{"/api/sessions/", "/api/sessions//x", "/", "/api/labels/a.b?x=/.."} {
+		if err := c.Do(ctx, "GET", path, nil, nil, nil); err != nil {
+			t.Errorf("Do %q: %v", path, err)
+		}
+	}
+	if n := atomic.LoadInt32(&hits); n != 7 {
+		t.Fatalf("%d requests sent, want 7", n)
+	}
+}
+
+// An id is sent as one percent-encoded segment, so "../x" goes out as "..%2Fx". A reverse proxy that
+// decodes %2F before it resolves dot segments (nginx with a URI on proxy_pass) reads that as "../x" and
+// sends the call, API key included, to another route, so a dot part inside a segment is refused too.
+func TestDotPartInsideASegmentRefused(t *testing.T) {
+	var sent []string
+	rt := RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		sent = append(sent, req.URL.EscapedPath())
+		return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}, Request: req}, nil
+	})
+	c := newTestClient(t, rt)
+	ctx := context.Background()
+
+	for name, err := range map[string]error{
+		`Templates.Delete "../../../sessions/V"`: c.Templates.Delete(ctx, "S", "../../../sessions/V"),
+		`Webhooks.Delete "a/./b"`:                c.Webhooks.Delete(ctx, "s1", "a/./b"),
+		`Webhooks.Delete "..\x"`:                 c.Webhooks.Delete(ctx, "s1", `..\x`),
+		`Do ..%2F`:                               c.Do(ctx, "DELETE", "/api/sessions/s1/contacts/..%2Fwebhooks%2Fw1", nil, nil, nil),
+		`Do %2e%2E%2f`:                           c.Do(ctx, "DELETE", "/api/sessions/s1/contacts/%2e%2E%2fx", nil, nil, nil),
+	} {
+		if err == nil || !strings.Contains(err.Error(), "dot path segment") {
+			t.Errorf("%s: err = %v, want a dot path segment error", name, err)
+		}
+	}
+	if len(sent) != 0 {
+		t.Fatalf("sent %v, want nothing", sent)
+	}
+
+	// A slash inside an id with no dot part, as a caller-chosen batch or label id may hold, still goes out.
+	for _, id := range []string{"a/b", "v1.0/x", "a/"} {
+		if err := c.Webhooks.Delete(ctx, "s1", id); err != nil {
+			t.Errorf("Webhooks.Delete %q: %v", id, err)
+		}
+	}
+	want := []string{"/api/sessions/s1/webhooks/a%2Fb", "/api/sessions/s1/webhooks/v1.0%2Fx", "/api/sessions/s1/webhooks/a%2F"}
+	if strings.Join(sent, " ") != strings.Join(want, " ") {
+		t.Fatalf("sent %v, want %v", sent, want)
+	}
+}
+
 func TestListSessionsQueryName(t *testing.T) {
 	rt := &recordTransport{status: 200, body: `[]`}
 	c := newTestClient(t, rt)
@@ -124,12 +241,14 @@ func TestListSessionsQueryName(t *testing.T) {
 }
 
 func TestQueryEncoding(t *testing.T) {
-	rt := &recordTransport{status: 200, body: `{"messages":[],"total":0}`}
+	rt := &recordTransport{status: 200, body: `{"messages":[],"total":0,"unknownTimestampTotal":2}`}
 	c := newTestClient(t, rt)
 
-	_, err := c.Messages.List(context.Background(), "s1", &ListMessagesQuery{
+	page, err := c.Messages.List(context.Background(), "s1", &ListMessagesQuery{
 		ChatID: Ptr("628@c.us"),
 		Limit:  Ptr(10),
+		Since:  Ptr(1789855200000.5), Until: Ptr(1789941600000.0),
+		Direction: Ptr("incoming"), OrderBy: Ptr("timestamp"), Type: Ptr("image"), MessageID: Ptr("M1"),
 	})
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -140,6 +259,14 @@ func TestQueryEncoding(t *testing.T) {
 	}
 	if _, ok := q["offset"]; ok {
 		t.Fatal("nil offset should not appear in query")
+	}
+	for key, expected := range map[string]string{"since": "1789855200000.5", "until": "1789941600000", "direction": "incoming", "orderBy": "timestamp", "type": "image", "messageId": "M1"} {
+		if q.Get(key) != expected {
+			t.Fatalf("%s = %q, want %q", key, q.Get(key), expected)
+		}
+	}
+	if page.UnknownTimestampTotal == nil || *page.UnknownTimestampTotal != 2 {
+		t.Fatalf("unknown time count = %v", page.UnknownTimestampTotal)
 	}
 }
 
@@ -177,6 +304,53 @@ func TestTypedErrors(t *testing.T) {
 	}
 	if apiErr.StatusCode != 409 || apiErr.Kind != "Conflict" || apiErr.Message != "engine not ready" {
 		t.Fatalf("APIError = %+v", apiErr)
+	}
+}
+
+func TestAPIErrorCodeRetryAfterAndHeader(t *testing.T) {
+	fail := func(status int, body string, header http.Header) *APIError {
+		t.Helper()
+		c := newTestClient(t, &recordTransport{status: status, body: body, header: header})
+		_, err := c.Sessions.List(context.Background(), nil)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("errors.As *APIError failed for %v", err)
+		}
+		return apiErr
+	}
+
+	throttled := fail(429, `{"statusCode":429,"message":"ThrottlerException: Too Many Requests"}`, http.Header{"Retry-After": {"7"}})
+	if !errors.Is(throttled, ErrRateLimited) || throttled.RetryAfter != 7*time.Second || throttled.Code != "" {
+		t.Fatalf("throttled = %+v", throttled)
+	}
+	if throttled.Header.Get("Retry-After") != "7" {
+		t.Fatalf("Header = %v", throttled.Header)
+	}
+
+	// Send pacing puts its wait in the body; a header must not shorten it.
+	pacing := `{"statusCode":429,"error":"Too Many Requests","message":"Daily send cap reached","code":"SEND_PACING_LIMITED","retryAfterSeconds":34521}`
+	for _, h := range []http.Header{nil, {"Retry-After": {"1"}}} {
+		e := fail(429, pacing, h)
+		if e.Code != "SEND_PACING_LIMITED" || e.RetryAfter != 34521*time.Second {
+			t.Fatalf("pacing with header %v = %+v", h, e)
+		}
+	}
+
+	dated := fail(503, "", http.Header{"Retry-After": {time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)}})
+	if dated.RetryAfter <= 0 || dated.RetryAfter > 3*time.Second {
+		t.Fatalf("HTTP-date RetryAfter = %v", dated.RetryAfter)
+	}
+	for _, v := range []string{"soon", "-5"} {
+		if e := fail(503, "", http.Header{"Retry-After": {v}}); e.RetryAfter != 0 {
+			t.Fatalf("Retry-After %q gave %v", v, e.RetryAfter)
+		}
+	}
+
+	if e := fail(502, `{"statusCode":502,"message":"x","code":"SESSION_LOGOUT_INCOMPLETE"}`, nil); e.Code != "SESSION_LOGOUT_INCOMPLETE" {
+		t.Fatalf("Code = %q", e.Code)
+	}
+	if e := fail(500, "oops", nil); e.Code != "" || e.RetryAfter != 0 {
+		t.Fatalf("plain-text error = %+v", e)
 	}
 }
 
@@ -247,7 +421,8 @@ func TestRetryPolicy(t *testing.T) {
 		MaxDelay:   5 * time.Millisecond,
 	}))
 
-	res, err := c.Messages.SendText(context.Background(), "s1", SendTextRequest{ChatID: "x", Text: "y"})
+	ctx := WithIdempotencyKey(context.Background(), "order-1")
+	res, err := c.Messages.SendText(ctx, "s1", SendTextRequest{ChatID: "x", Text: "y"})
 	if err != nil {
 		t.Fatalf("SendText with retry: %v", err)
 	}
@@ -265,10 +440,12 @@ func TestRetryPolicy(t *testing.T) {
 	}
 }
 
-// statusTransport always replies with the same status, counting attempts.
+// statusTransport always replies with the same status, counting attempts. A
+// non-empty retryAfter is sent as the Retry-After header.
 type statusTransport struct {
-	status int
-	calls  int32
+	status     int
+	retryAfter string
+	calls      int32
 }
 
 func (t *statusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -276,17 +453,21 @@ func (t *statusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Body != nil {
 		io.Copy(io.Discard, req.Body)
 	}
+	header := http.Header{}
+	if t.retryAfter != "" {
+		header.Set("Retry-After", t.retryAfter)
+	}
 	return &http.Response{
 		StatusCode: t.status,
 		Body:       io.NopCloser(strings.NewReader(`{"statusCode":500,"message":"boom","error":"Internal"}`)),
-		Header:     http.Header{},
+		Header:     header,
 		Request:    req,
 	}, nil
 }
 
 // A 500/502/504 can be returned after the gateway already sent the message, so
-// replaying a POST on those would double-send. Only 429/503 — which prove the
-// server declined before acting — may retry a non-idempotent request.
+// replaying a POST on those would double-send. A non-idempotent request may
+// retry only a 429, or a 503 it carried a key for or that came with Retry-After.
 func TestRetryDoesNotReplayPostOnAmbiguousStatus(t *testing.T) {
 	for _, status := range []int{500, 502, 504} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -325,24 +506,122 @@ func TestRetryStillReplaysIdempotentOnAmbiguousStatus(t *testing.T) {
 	}
 }
 
-// 429/503 mean the server declined before acting, so a POST may still retry.
+// A 429 means the gateway declined before acting, so a POST may retry it. A
+// keyed send may retry a 503 too: the gateway answers a replay of a send that
+// may have gone out with 409 IDEMPOTENCY_OUTCOME_UNKNOWN instead of sending it
+// again, and a 503 with Retry-After was refused before the request was read.
 func TestRetryReplaysPostOnBackpressure(t *testing.T) {
-	for _, status := range []int{429, 503} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
-			rt := &statusTransport{status: status}
+	for _, tc := range []struct {
+		name       string
+		status     int
+		retryAfter string
+		key        string
+	}{
+		{"429", 429, "", ""},
+		{"503 keyed send", 503, "", "order-1"},
+		{"503 with Retry-After", 503, "0", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &statusTransport{status: tc.status, retryAfter: tc.retryAfter}
 			c := newTestClient(t, rt, WithRetry(RetryPolicy{
 				MaxRetries: 2, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond,
 				RetryableStatuses: []int{429, 500, 502, 503, 504},
 			}))
+			ctx := context.Background()
+			if tc.key != "" {
+				ctx = WithIdempotencyKey(ctx, tc.key)
+			}
 
-			_, err := c.Messages.SendText(context.Background(), "s1", SendTextRequest{ChatID: "x", Text: "y"})
+			_, err := c.Messages.SendText(ctx, "s1", SendTextRequest{ChatID: "x", Text: "y"})
 			if err == nil {
 				t.Fatal("expected an error")
 			}
 			if rt.calls != 3 {
-				t.Fatalf("POST on %d is backpressure and should retry: got %d attempts, want 3", status, rt.calls)
+				t.Fatalf("POST on %s should retry: got %d attempts, want 3", tc.name, rt.calls)
 			}
 		})
+	}
+}
+
+// A 503 can answer a write WhatsApp did not confirm (a Baileys send or status
+// post whose query timed out with code 408), so the message may have gone out.
+// Without an Idempotency-Key the gateway cannot tell a replay from a new send,
+// so the POST is issued once. A status post and a route outside the keyed sends
+// carry no header even when the context holds a key.
+func TestRetryDoesNotReplayPostOn503WithoutIdempotencyKey(t *testing.T) {
+	keyed := WithIdempotencyKey(context.Background(), "order-1")
+	for _, tc := range []struct {
+		name string
+		do   func(c *Client) error
+	}{
+		{"send without a key", func(c *Client) error {
+			_, err := c.Messages.SendText(context.Background(), "s1", SendTextRequest{ChatID: "x", Text: "y"})
+			return err
+		}},
+		{"status post", func(c *Client) error {
+			_, err := c.Status.SendText(keyed, "s1", SendTextStatusRequest{Text: "y"})
+			return err
+		}},
+		{"do on another route", func(c *Client) error {
+			return c.Do(keyed, "POST", "/api/sessions/s1/groups", nil, map[string]string{}, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &statusTransport{status: 503}
+			c := newTestClient(t, rt, WithRetry(RetryPolicy{
+				MaxRetries: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond,
+				RetryableStatuses: []int{429, 500, 502, 503, 504},
+			}))
+
+			err := tc.do(c)
+			if !errors.Is(err, ErrServiceUnavailable) {
+				t.Fatalf("expected the 503 back, got %v", err)
+			}
+			if rt.calls != 1 {
+				t.Fatalf("an unkeyed POST answered 503 must be issued once: got %d attempts", rt.calls)
+			}
+		})
+	}
+}
+
+// pacingTransport replies with the gateway's send-pacing refusal: a 429 with no
+// Retry-After whose body carries the real delay, which can be hours.
+type pacingTransport struct{ calls int32 }
+
+func (t *pacingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	atomic.AddInt32(&t.calls, 1)
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+	}
+	return &http.Response{
+		StatusCode: 429,
+		Body: io.NopCloser(strings.NewReader(
+			`{"statusCode":429,"message":"Daily send cap reached","code":"SEND_PACING_LIMITED","retryAfterSeconds":34521}`)),
+		Header:  http.Header{},
+		Request: req,
+	}, nil
+}
+
+// A send-pacing refusal must not be retried before retryAfterSeconds, so the
+// policy returns it after one attempt, with the body intact for the caller.
+func TestRetryDoesNotReplaySendPacingRefusal(t *testing.T) {
+	rt := &pacingTransport{}
+	c := newTestClient(t, rt, WithRetry(RetryPolicy{
+		MaxRetries: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond,
+		RetryableStatuses: []int{429, 500, 502, 503, 504}, RespectRetryAfter: true,
+	}))
+
+	_, err := c.Messages.SendText(context.Background(), "s1", SendTextRequest{ChatID: "x", Text: "y"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected a 429 APIError, got %v", err)
+	}
+	if rt.calls != 1 {
+		t.Fatalf("a SEND_PACING_LIMITED 429 must not be retried: got %d attempts, want 1", rt.calls)
+	}
+	body, _ := apiErr.Body.(map[string]any)
+	if body["code"] != "SEND_PACING_LIMITED" || body["retryAfterSeconds"] != float64(34521) {
+		t.Fatalf("expected the refusal body to reach the caller, got %#v", apiErr.Body)
 	}
 }
 
@@ -418,6 +697,26 @@ func TestRetryHonorsRetryAfter(t *testing.T) {
 	waited := rt.stamps[1].Sub(rt.stamps[0])
 	if waited < 900*time.Millisecond {
 		t.Fatalf("expected to wait ~1s for Retry-After, waited %s", waited)
+	}
+}
+
+// A Retry-After longer than the time left on the request cannot be honored, so
+// the 429 goes back to the caller at once instead of sleeping out the timeout
+// and surfacing as a *TimeoutError that hides the rate limit.
+func TestRetryReturnsResponseWhenRetryAfterOutlastsDeadline(t *testing.T) {
+	rt := &retryAfterTransport{header: "60"}
+	c := newTestClient(t, rt, WithTimeout(500*time.Millisecond), WithRetry(DefaultRetryPolicy()))
+
+	start := time.Now()
+	_, err := c.Messages.SendText(context.Background(), "s1", SendTextRequest{ChatID: "x", Text: "y"})
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected ErrRateLimited, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("expected the 429 back at once, waited %s", elapsed)
+	}
+	if rt.calls != 1 {
+		t.Fatalf("expected 1 attempt, got %d", rt.calls)
 	}
 }
 
@@ -873,8 +1172,8 @@ func TestUpdateGroupSettingsOmitsUnsetFields(t *testing.T) {
 	}
 }
 
-// A 503 is the gateway's answer when the engine never confirmed an operation — a transport failure,
-// and the one sentinel here worth retrying. It used to have none, while the permanent 501 did.
+// A 503 is the gateway's answer when the engine never confirmed an operation: a transport failure,
+// which is worth retrying, as a 429 is. It used to have no sentinel, while the permanent 501 did.
 func TestServiceUnavailableIsRetryableSentinel(t *testing.T) {
 	rt := &recordTransport{
 		status: 503,
@@ -1004,6 +1303,64 @@ func TestRejectCallNotRinging(t *testing.T) {
 	}
 }
 
+// GET /api/webhooks has no session filter, so the shared query's SessionID must
+// not travel as one.
+func TestWebhooksListAllSendsPagingButNoSessionFilter(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `[]`}
+	c := newTestClient(t, rt)
+	session, limit, offset := "s1", 5, 10
+	query := &DeliveryFailureQuery{SessionID: &session, Limit: &limit, Offset: &offset}
+	if _, err := c.Webhooks.ListAll(context.Background(), query); err != nil {
+		t.Fatalf("ListAll: %v", err)
+	}
+	if got := rt.lastReq.URL.RawQuery; got != "limit=5&offset=10" {
+		t.Fatalf("query = %q, want limit=5&offset=10", got)
+	}
+}
+
+// No contract gate reads these keys (a request map, a query key, a nested struct's tags), and the
+// gateway answers an unknown body or query key with 400, so a renamed one would fail every such call.
+func TestMemberLabelSearchMatchAndPreviewImageWireKeys(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("member label body", func(t *testing.T) {
+		rt := &recordTransport{status: 200, body: `{"success":true}`}
+		if _, err := newTestClient(t, rt).Groups.SetMemberLabel(ctx, "s1", "g@g.us", "Lead"); err != nil {
+			t.Fatalf("SetMemberLabel: %v", err)
+		}
+		if got := string(rt.lastRaw); got != `{"label":"Lead"}` {
+			t.Fatalf("body = %s", got)
+		}
+	})
+
+	t.Run("search match query", func(t *testing.T) {
+		rt := &recordTransport{status: 200, body: `{"hits":[],"total":0,"tookMs":1,"provider":"builtin-fts"}`}
+		match := "contains"
+		if _, err := newTestClient(t, rt).Search.Search(ctx, SearchQuery{Q: "voic", Match: &match}); err != nil {
+			t.Fatalf("Search: %v", err)
+		}
+		if got := rt.lastReq.URL.Query().Get("match"); got != "contains" {
+			t.Fatalf("match = %q in %q", got, rt.lastReq.URL.RawQuery)
+		}
+	})
+
+	t.Run("link preview image fields", func(t *testing.T) {
+		rt := &recordTransport{status: 201, body: `{"messageId":"m","timestamp":1}`}
+		preview := &CustomLinkPreview{
+			URL: "https://x.test", Title: "T", ThumbnailURL: "https://x.test/i.png", ThumbnailBase64: "aGk=",
+		}
+		body := SendTextRequest{ChatID: "a@c.us", Text: "https://x.test", CustomLinkPreview: preview}
+		if _, err := newTestClient(t, rt).Messages.SendText(ctx, "s1", body); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		for _, want := range []string{`"thumbnailUrl":"https://x.test/i.png"`, `"thumbnailBase64":"aGk="`} {
+			if got := string(rt.lastRaw); !strings.Contains(got, want) {
+				t.Fatalf("body = %s, want it to contain %s", got, want)
+			}
+		}
+	})
+}
+
 // The Event* constants are the wire values of the server's WEBHOOK_EVENTS
 // catalog — a typo here silently subscribes to nothing.
 func TestWebhookEventWireValues(t *testing.T) {
@@ -1011,6 +1368,7 @@ func TestWebhookEventWireValues(t *testing.T) {
 		EventMessageReceived:      "message.received",
 		EventMessageSent:          "message.sent",
 		EventMessageAck:           "message.ack",
+		EventMessageReceipt:       "message.receipt",
 		EventMessageFailed:        "message.failed",
 		EventMessageRevoked:       "message.revoked",
 		EventMessageReaction:      "message.reaction",
@@ -1022,6 +1380,8 @@ func TestWebhookEventWireValues(t *testing.T) {
 		EventSessionReconnectLoop: "session.reconnect_loop",
 		EventSessionRestriction:   "session.restriction",
 		EventPresenceUpdate:       "presence.update",
+		EventEventResponse:        "event.response",
+		EventPollVote:             "poll.vote",
 		EventCallAccepted:         "call.accepted",
 		EventCallRejected:         "call.rejected",
 		EventCallMissed:           "call.missed",
@@ -1467,5 +1827,596 @@ func TestRequestEnumWireValues(t *testing.T) {
 	}
 	if !strings.Contains(string(pin), `"durationSeconds":86400`) {
 		t.Errorf("durationSeconds did not marshal as a bare number: %s", pin)
+	}
+}
+
+// A Do path that does not begin with "/" would be appended to the base URL's
+// authority, so "@evil.example/x" sends the API key to evil.example.
+func TestDoPathWithoutLeadingSlashRefused(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{}`}
+	c := newTestClient(t, rt)
+	for _, path := range []string{"@evil.example/api/x", ".evil.example/api/x", "api/x", ""} {
+		if err := c.Do(context.Background(), "GET", path, nil, nil, nil); err == nil {
+			t.Errorf("Do %q: want an error", path)
+		}
+	}
+	if rt.lastReq != nil {
+		t.Fatalf("request sent to %s, want none", rt.lastReq.URL.Host)
+	}
+}
+
+// stallServer stalls every request before answering; with flush set it sends
+// the headers first and stalls the body instead. It blocks until the request is
+// cancelled or the test ends.
+func stallServer(t *testing.T, flush bool) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if flush {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("partial"))
+			w.(http.Flusher).Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv
+}
+
+func TestTimeoutReportsTheBudgetThatExpired(t *testing.T) {
+	for _, flush := range []bool{false, true} {
+		srv := stallServer(t, flush)
+
+		// The client timeout fired: the error names it.
+		c, err := New(srv.URL, "k", WithTimeout(100*time.Millisecond))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		_, err = c.Messages.Media(context.Background(), "s1", "c1", "m1")
+		var te *TimeoutError
+		if !errors.As(err, &te) || te.Timeout != 100*time.Millisecond {
+			t.Errorf("flush=%v client timeout: err = %v, want a *TimeoutError after 100ms", flush, err)
+		}
+
+		// The caller's shorter deadline fired: the 30s client timeout is not the
+		// budget that ran out, so the error does not name it.
+		c, err = New(srv.URL, "k")
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		_, err = c.Messages.Media(ctx, "s1", "c1", "m1")
+		cancel()
+		te = nil
+		if !errors.As(err, &te) || te.Timeout != 0 || err.Error() != "openwa: request timed out" {
+			t.Errorf("flush=%v caller deadline: err = %v, want a *TimeoutError without a duration", flush, err)
+		}
+	}
+}
+
+// argsLogger records every logged key-value argument as text.
+type argsLogger struct{ text strings.Builder }
+
+func (l *argsLogger) Log(_ context.Context, _ string, msg string, args ...any) {
+	fmt.Fprintln(&l.text, msg, args)
+}
+
+// A base URL may carry basic-auth credentials for a fronting proxy; the
+// password must not reach the request log.
+func TestRequestLogRedactsBaseURLPassword(t *testing.T) {
+	ok := &recordTransport{status: 200, body: `{}`}
+	failing := RoundTripperFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("refused") })
+	for _, rt := range []http.RoundTripper{ok, failing} {
+		lg := &argsLogger{}
+		c, err := New("https://proxyuser:s3cret@api.example.com", "k", WithTransport(rt), WithLogger(lg))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		_, _ = c.Health.Check(context.Background())
+		if got := lg.text.String(); !strings.Contains(got, "api.example.com") || strings.Contains(got, "s3cret") {
+			t.Errorf("request log = %q, want the URL without the password", got)
+		}
+	}
+
+	// The retry layer logs the URL of every request it replays.
+	lg := &argsLogger{}
+	policy := RetryPolicy{MaxRetries: 1, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+	c, err := New("https://proxyuser:s3cret@api.example.com", "k",
+		WithTransport(&statusTransport{status: 503}), WithLogger(lg), WithRetry(policy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, _ = c.Health.Check(context.Background())
+	if got := lg.text.String(); !strings.Contains(got, "openwa retrying request") || strings.Contains(got, "s3cret") {
+		t.Errorf("retry log = %q, want the retry logged without the password", got)
+	}
+}
+
+// A Do path that already carries a query string keeps it; the query values are appended with "&"
+// rather than a second "?", which the server would read as part of the first value.
+func TestDoPathWithQueryAppendsQueryValues(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"/api/sessions", "name=x&tag=a&tag=b"},
+		{"/api/sessions?limit=5", "limit=5&name=x&tag=a&tag=b"},
+		{"/api/sessions#client", "name=x&tag=a&tag=b"},
+		{"/api/sessions?limit=5#client", "limit=5&name=x&tag=a&tag=b"},
+		{"/api/sessions#client?x=1", "name=x&tag=a&tag=b"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			rt := &recordTransport{status: 200, body: `[]`}
+			c, err := New("https://api.example.com/prefix", "k", WithTransport(rt))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Do(context.Background(), "GET", tc.path, url.Values{"name": {"x"}, "tag": {"a", "b"}}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if got := rt.lastReq.URL.RawQuery; got != tc.want {
+				t.Errorf("query = %q, want %q", got, tc.want)
+			}
+			if got := rt.lastReq.URL.EscapedPath(); got != "/prefix/api/sessions" {
+				t.Errorf("path = %q, want the base URL prefix preserved", got)
+			}
+		})
+	}
+}
+
+// net/http sends the method as written and the gateway answers 400 to a lowercase one, so Do upper-cases
+// it. The idempotency header and the retry policy compare the upper-case names too.
+func TestDoSendsTheMethodInUpperCase(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{}`}
+	c := newTestClient(t, rt)
+	for _, tc := range []struct{ given, want string }{
+		{"get", "GET"}, {"post", "POST"}, {"put", "PUT"}, {"patch", "PATCH"}, {"delete", "DELETE"},
+		{"Patch", "PATCH"}, {"PATCH", "PATCH"},
+	} {
+		rt.lastReq = nil
+		if err := c.Do(context.Background(), tc.given, "/api/x", nil, nil, nil); err != nil {
+			t.Fatalf("Do(%q): %v", tc.given, err)
+		}
+		if got := rt.lastReq.Method; got != tc.want {
+			t.Errorf("Do(%q): the transport saw %q, want %q", tc.given, got, tc.want)
+		}
+	}
+
+	ctx := WithIdempotencyKey(context.Background(), "k1")
+	if err := c.Do(ctx, "post", "/api/sessions/s/messages/send-text", nil, map[string]string{"chatId": "x"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.lastReq.Header.Get("Idempotency-Key"); got != "k1" {
+		t.Errorf("a lowercase post to a send route sent Idempotency-Key %q, want %q", got, "k1")
+	}
+}
+
+func TestSendIdempotencyKey(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{"messageId":"m","timestamp":1}`}
+	c := newTestClient(t, rt, WithHeader("idempotency-key", "default"))
+	for _, segment := range []string{"send-text", "send-image", "send-video", "send-audio", "send-document", "send-sticker", "send-location", "send-contact", "send-template", "send-poll", "reply", "forward"} {
+		ctx := WithIdempotencyKey(context.Background(), segment)
+		if _, err := c.Messages.send(ctx, "s", segment, map[string]string{"chatId": "x"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := rt.lastReq.Header.Values("Idempotency-Key"); len(got) != 1 || got[0] != segment {
+			t.Fatalf("%s: %v", segment, got)
+		}
+		if string(rt.lastRaw) != `{"chatId":"x"}` {
+			t.Fatalf("body changed: %s", rt.lastRaw)
+		}
+	}
+	if _, err := c.Messages.SendText(context.Background(), "s", SendTextRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.lastReq.Header.Get("Idempotency-Key"); got != "default" {
+		t.Fatalf("default mutated: %s", got)
+	}
+	for _, key := range []string{"", "a b", "a\n", "é", strings.Repeat("x", 256)} {
+		rt.lastReq = nil
+		if _, err := c.Messages.SendText(WithIdempotencyKey(context.Background(), key), "s", SendTextRequest{}); err == nil {
+			t.Fatalf("accepted %q", key)
+		}
+		if rt.lastReq != nil {
+			t.Fatalf("transport called for %q", key)
+		}
+	}
+}
+
+// The key is checked against the gateway's own rule: 1 to 255 characters, each a visible ASCII one
+// from '!' to '~'. A boundary moved by one refuses keys the gateway takes, or sends one it refuses.
+func TestIdempotencyKeyBoundaries(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{"messageId":"m","timestamp":1}`}
+	c := newTestClient(t, rt)
+	for _, tc := range []struct {
+		name   string
+		key    string
+		accept bool
+	}{
+		{"first visible character", "!", true},
+		{"last visible character", "~", true},
+		{"one character", "x", true},
+		{"longest key", strings.Repeat("x", 255), true},
+		{"one too long", strings.Repeat("x", 256), false},
+		{"empty", "", false},
+		{"space", " ", false},
+		{"delete", "a\x7fb", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt.lastReq = nil
+			_, err := c.Messages.SendText(WithIdempotencyKey(context.Background(), tc.key), "s", SendTextRequest{})
+			if tc.accept {
+				if err != nil {
+					t.Fatalf("refused %q: %v", tc.key, err)
+				}
+				if got := rt.lastReq.Header.Get("Idempotency-Key"); got != tc.key {
+					t.Fatalf("header = %q, want %q", got, tc.key)
+				}
+				return
+			}
+			if err == nil || rt.lastReq != nil {
+				t.Fatalf("accepted %q (err %v, sent %v)", tc.key, err, rt.lastReq != nil)
+			}
+		})
+	}
+}
+
+// A nil context is the caller's mistake, and net/http names it as an error. The idempotency lookup must
+// not turn it into a panic that takes the calling program down.
+func TestNilContextReturnsAnErrorInsteadOfPanicking(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{}`}
+	c := newTestClient(t, rt)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("a nil context panicked: %v", r)
+		}
+	}()
+	//nolint:staticcheck // the nil context is the point of the test
+	if _, err := c.Messages.SendText(nil, "s", SendTextRequest{}); err == nil {
+		t.Fatal("a nil context was accepted")
+	}
+	if rt.lastReq != nil {
+		t.Fatal("a request was sent with a nil context")
+	}
+}
+
+func TestRedrivePreservesAnEmptyIDsFilter(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{}`}
+	c := newTestClient(t, rt)
+	var zero []string
+	empty := []string{}
+	selected := []string{"f1"}
+	for _, tc := range []struct {
+		name string
+		ids  *[]string
+		want string
+	}{
+		{"omitted", nil, `{}`},
+		{"nil slice", &zero, `{"ids":[]}`},
+		{"empty slice", &empty, `{"ids":[]}`},
+		{"selected rows", &selected, `{"ids":["f1"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &RedriveWebhookDeliveriesRequest{IDs: tc.ids}
+			if _, err := c.Webhooks.RedriveDeliveryFailures(context.Background(), body); err != nil {
+				t.Fatal(err)
+			}
+			if string(rt.lastRaw) != tc.want {
+				t.Fatalf("body = %s, want %s", rt.lastRaw, tc.want)
+			}
+			if body.IDs != tc.ids || zero != nil {
+				t.Fatal("request IDs mutated")
+			}
+		})
+	}
+}
+
+func TestRetryKeepsIdempotencyKey(t *testing.T) {
+	var keys []string
+	rt := RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		keys = append(keys, req.Header.Get("Idempotency-Key"))
+		return &http.Response{StatusCode: 503, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+	})
+	c := newTestClient(t, rt, WithRetry(RetryPolicy{MaxRetries: 2, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond, RetryableStatuses: []int{503}}))
+	_, _ = c.Messages.SendText(WithIdempotencyKey(context.Background(), "stable"), "s", SendTextRequest{})
+	if len(keys) != 3 {
+		t.Fatalf("attempts: %v", keys)
+	}
+	for _, key := range keys {
+		if key != "stable" {
+			t.Fatalf("keys: %v", keys)
+		}
+	}
+}
+
+// The status font ids are the wire values of the Baileys protocol's ExtendedTextMessage.FontType. The
+// constants carry the protocol's names; the first-release names for the same ids stay as deprecated
+// aliases so existing code keeps compiling and sending the same numbers.
+func TestStatusFontConstants(t *testing.T) {
+	cases := []struct {
+		name string
+		got  StatusFont
+		want int
+	}{
+		{"SYSTEM", StatusFontDefault, 0},
+		{"SYSTEM_TEXT", StatusFontSystemText, 1},
+		{"FB_SCRIPT", StatusFontFBScript, 2},
+		{"SYSTEM_BOLD", StatusFontBold, 6},
+		{"MORNINGBREEZE_REGULAR", StatusFontMorningBreezeRegular, 7},
+		{"CALISTOGA_REGULAR", StatusFontCalistogaRegular, 8},
+		{"EXO2_EXTRABOLD", StatusFontExo2ExtraBold, 9},
+		{"COURIERPRIME_BOLD", StatusFontCourierPrimeBold, 10},
+	}
+	for _, c := range cases {
+		if int(c.got) != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+
+	aliases := []struct {
+		name string
+		old  StatusFont
+		want StatusFont
+	}{
+		{"StatusFontSerif", StatusFontSerif, StatusFontSystemText},
+		{"StatusFontNorican", StatusFontNorican, StatusFontFBScript},
+		{"StatusFontOswald", StatusFontOswald, StatusFontMorningBreezeRegular},
+		{"StatusFontDamion", StatusFontDamion, StatusFontCalistogaRegular},
+		{"StatusFontMorningbreeze", StatusFontMorningbreeze, StatusFontExo2ExtraBold},
+		{"StatusFontBryndan", StatusFontBryndan, StatusFontCourierPrimeBold},
+	}
+	for _, a := range aliases {
+		if a.old != a.want {
+			t.Errorf("%s = %d, want the wire value %d it always had", a.name, a.old, a.want)
+		}
+	}
+
+	body, err := json.Marshal(SendTextStatusRequest{Text: "hi", Font: Ptr(StatusFontCourierPrimeBold)})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"font":10`) {
+		t.Errorf("font did not marshal as a bare number: %s", body)
+	}
+}
+
+func TestReservedCharactersStayInTypedPathSegment(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{}`}
+	c := newTestClient(t, rt)
+	if _, err := c.Contacts.Get(context.Background(), "s", "a/b?c#d"); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.lastReq.URL.EscapedPath(); got != "/api/sessions/s/contacts/a%2Fb%3Fc%23d" {
+		t.Errorf("escaped path = %q", got)
+	}
+	if rt.lastReq.URL.RawQuery != "" || rt.lastReq.URL.Fragment != "" {
+		t.Errorf("the ID moved into query or fragment: %s", rt.lastReq.URL)
+	}
+}
+
+func TestNon2xxResponsesDoNotDecodeSuccess(t *testing.T) {
+	for _, status := range []int{101, 199, 200, 204, 299, 300, 503} {
+		for _, kind := range []string{"json", "bytes"} {
+			t.Run(fmt.Sprintf("%d/%s", status, kind), func(t *testing.T) {
+				body := `{"ok":true}`
+				if status == 204 {
+					body = ""
+				}
+				c := newTestClient(t, &recordTransport{status: status, body: body})
+				var parsed map[string]any
+				var raw []byte
+				var out any = &parsed
+				if kind == "bytes" {
+					out = &raw
+				}
+				err := c.Do(context.Background(), "GET", "/api/x", nil, nil, out)
+				if status < 200 || status >= 300 {
+					var apiErr *APIError
+					if !errors.As(err, &apiErr) || apiErr.StatusCode != status {
+						t.Errorf("error = %v, want APIError with status %d", err, status)
+					}
+					if parsed != nil || raw != nil {
+						t.Error("an error response decoded a success body")
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				} else if status == 204 {
+					if parsed != nil || len(raw) != 0 {
+						t.Error("204 should keep an empty body")
+					}
+				} else if kind == "json" && parsed["ok"] != true {
+					t.Errorf("decoded JSON = %v", parsed)
+				} else if kind == "bytes" && string(raw) != body {
+					t.Errorf("decoded bytes = %q, want %q", raw, body)
+				}
+			})
+		}
+	}
+}
+
+func TestRetryAfterDurationBounds(t *testing.T) {
+	const longest = time.Duration(1<<63 - 1)
+	for _, tc := range []struct {
+		name, header string
+		want         time.Duration
+		valid        bool
+	}{
+		{"zero", "0", 0, true},
+		{"small", "2", 2 * time.Second, true},
+		{"positive sign", "+2", 2 * time.Second, true},
+		{"negative zero", "-0", 0, true},
+		{"leading zeroes", strings.Repeat("0", 80) + "2", 2 * time.Second, true},
+		{"last whole second", "9223372036", 9223372036000000000, true},
+		{"overflow boundary", "9223372037", longest, true},
+		{"max integer", "9223372036854775807", longest, true},
+		{"oversized integer", strings.Repeat("9", 80), longest, true},
+		{"oversized positive integer", "+" + strings.Repeat("9", 80), longest, true},
+		{"negative", "-1", 0, false},
+		{"oversized negative integer", "-" + strings.Repeat("9", 80), 0, false},
+		{"fraction", "0.25", 0, false},
+		{"invalid suffix after overflow", strings.Repeat("9", 80) + "x", 0, false},
+		{"invalid", "soon", 0, false},
+		{"sign only", "+", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, valid := retryAfterHeader(http.Header{"Retry-After": {tc.header}})
+			if got != tc.want || valid != tc.valid {
+				t.Errorf("duration = %s, valid = %v; want %s, %v", got, valid, tc.want, tc.valid)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, body string
+		want       time.Duration
+	}{
+		{"small body", `{"retryAfterSeconds":2}`, 2 * time.Second},
+		{"fractional body", `{"retryAfterSeconds":0.25}`, 250 * time.Millisecond},
+		{"zero body overrides header", `{"retryAfterSeconds":0}`, 0},
+		{"negative body uses header", `{"retryAfterSeconds":-1}`, 7 * time.Second},
+		{"missing body delay uses header", `{}`, 7 * time.Second},
+		{"wrong body type uses header", `{"retryAfterSeconds":"2"}`, 7 * time.Second},
+		{"large body overrides header", `{"retryAfterSeconds":1e20}`, longest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseAPIError(429, []byte(tc.body), "GET /x", http.Header{"Retry-After": {"7"}})
+			if got.RetryAfter != tc.want {
+				t.Errorf("RetryAfter = %s, want %s", got.RetryAfter, tc.want)
+			}
+		})
+	}
+}
+
+func TestRetryDoesNotResendBeforeOversizedRetryAfter(t *testing.T) {
+	for _, status := range []int{429, 503} {
+		for _, header := range []string{"9223372037", strings.Repeat("9", 80)} {
+			for _, respect := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%d/%s/respect=%v", status, header, respect), func(t *testing.T) {
+					var calls int32
+					rt := RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+						if atomic.AddInt32(&calls, 1) == 1 {
+							return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {header}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+						}
+						return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+					})
+					c := newTestClient(t, rt, WithTimeout(500*time.Millisecond), WithRetry(RetryPolicy{
+						MaxRetries: 1, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond, RespectRetryAfter: respect,
+					}))
+					err := c.Do(context.Background(), "GET", "/api/x", nil, nil, nil)
+					if !respect {
+						if err != nil || calls != 2 {
+							t.Errorf("disabled Retry-After: error = %v, calls = %d", err, calls)
+						}
+						return
+					}
+					var apiErr *APIError
+					if !errors.As(err, &apiErr) || apiErr.StatusCode != status || apiErr.RetryAfter <= 0 || calls != 1 {
+						t.Errorf("error = %v, calls = %d; want the first response without a retry", err, calls)
+					}
+				})
+			}
+		}
+	}
+}
+
+type responseReadErrorBody struct {
+	reads, closed int
+}
+
+func (b *responseReadErrorBody) Read(p []byte) (int, error) {
+	b.reads++
+	return copy(p, `{"code":`), io.ErrUnexpectedEOF
+}
+
+func (b *responseReadErrorBody) Close() error {
+	b.closed++
+	return nil
+}
+
+func TestRetryPreservesResponseBodyReadError(t *testing.T) {
+	for _, status := range []int{200, 429} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			body := &responseReadErrorBody{}
+			var calls int32
+			c := newTestClient(t, RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				atomic.AddInt32(&calls, 1)
+				return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {"3600"}}, Body: body, Request: req}, nil
+			}), WithTimeout(500*time.Millisecond), WithRetry(DefaultRetryPolicy()))
+			err := c.Do(context.Background(), "GET", "/api/x", nil, nil, nil)
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Errorf("error = %v, want preserved io.ErrUnexpectedEOF", err)
+			}
+			if calls != 1 || body.reads != 1 || body.closed != 1 {
+				t.Errorf("calls = %d, reads = %d, closes = %d; want one each", calls, body.reads, body.closed)
+			}
+		})
+	}
+}
+
+func TestRetryPreservesResponseBodyTimeout(t *testing.T) {
+	for _, status := range []int{200, 429} {
+		for _, callerDeadline := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/caller=%v", status, callerDeadline), func(t *testing.T) {
+				var calls int32
+				started := make(chan struct{}, 1)
+				finished := make(chan struct{}, 1)
+				release := make(chan struct{})
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					atomic.AddInt32(&calls, 1)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"code":`))
+					w.(http.Flusher).Flush()
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					select {
+					case <-r.Context().Done():
+					case <-release:
+					}
+					select {
+					case finished <- struct{}{}:
+					default:
+					}
+				}))
+				t.Cleanup(srv.Close)
+				t.Cleanup(func() { close(release) })
+				ctx := context.Background()
+				wantTimeout := 125 * time.Millisecond
+				opts := []Option{WithRetry(DefaultRetryPolicy())}
+				if callerDeadline {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, wantTimeout)
+					defer cancel()
+					wantTimeout = 0
+				} else {
+					opts = append(opts, WithTimeout(wantTimeout))
+				}
+				c, err := New(srv.URL, "k", opts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = c.Do(ctx, "GET", "/api/x", nil, nil, nil)
+				select {
+				case <-started:
+				default:
+					t.Fatal("the response body was not flushed")
+				}
+				var te *TimeoutError
+				if !errors.As(err, &te) || te.Timeout != wantTimeout {
+					t.Errorf("error = %v, want a TimeoutError with budget %s", err, wantTimeout)
+				}
+				if got := atomic.LoadInt32(&calls); got != 1 {
+					t.Errorf("calls = %d, want one", got)
+				}
+				select {
+				case <-finished:
+				case <-time.After(2 * time.Second):
+					t.Error("cancellation did not release the server handler")
+				}
+			})
+		}
 	}
 }
